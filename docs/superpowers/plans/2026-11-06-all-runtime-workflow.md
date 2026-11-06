@@ -49,7 +49,7 @@
 - [x] Remove three selectors; retain PHP-only profile/publish/tag inputs.
 - [x] Add native Redis matrix jobs, explicit CI dependencies, shared persisted plan and safe publication gating/artifact collection.
 - [x] Update contract tests to execute shared planner; validate workflow syntax, full suite and unchanged Redis local build CLI.
-- [ ] Commit on feature branch, fast-forward/push main per standing request and delete merged feature branch.
+- [x] Commit on feature branch, fast-forward/push main per standing request and delete merged feature branch.
 
 ## Verification record
 
@@ -59,6 +59,7 @@
 - Full suite: 85/85 passed; Bash/POSIX syntax, `git diff --check` and native actionlint 1.7.7 passed (shellcheck is not installed).
 - Final review is inline, per the user's no-other-agent instruction.
 - Additional native Redis 7.4.12/7.2.17 builds passed on both targets: four build/verification/package runs. No GitHub workflow dispatch or Release publication is part of this change.
+- Implementation commit `2fbf04c` was fast-forwarded and pushed to `main`; the merged feature branch was deleted. The merged tree passed 85/85 tests and actionlint again.
 
 ## Implementation decisions
 
