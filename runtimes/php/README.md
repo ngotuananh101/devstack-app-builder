@@ -11,7 +11,7 @@ See [PHP runtime architecture and consumer contract](../../docs/runtimes/php.md)
 ./build.sh php musl minimal 8.3
 ```
 
-`minimal` includes PDO core but no database drivers. `full` includes web/database modules. On glibc/full only `apcu` and `redis` are supported shared-only optional modules, default disabled per SAPI. Musl profiles are fully static/non-toggleable. Opcache remains static; xdebug is not included.
+`full` is the default for local, manual workflow and daily builds, and includes web/database modules. `minimal` remains an explicit opt-in and includes PDO core but no database drivers. On glibc/full only `apcu` and `redis` are supported shared-only optional modules, default disabled per SAPI. Musl profiles are fully static/non-toggleable. Opcache remains static; xdebug is not included.
 
 Outputs: `dist/php/<requested-version>/<target>/<profile>/` and versioned tar.gz/checksum/manifest assets under `dist/assets/`. Existing outputs are never overwritten. Consumer commands live in `bin/php`, `bin/php-fpm`, `bin/php-ext`; raw binaries are in `libexec/`. FPM runs non-root with explicit caller-owned config.
 

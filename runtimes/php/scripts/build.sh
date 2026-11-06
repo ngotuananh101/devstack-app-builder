@@ -7,9 +7,9 @@ REPO_ROOT="$(cd "$PHP_DIR/../.." && pwd)"
 ARG1="${1:-glibc}"; ARG2="${2:-}"; ARG3="${3:-}"
 PHP_VER="${PHP_VERSION:-8.4}"
 if [[ "$ARG1" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
-    PHP_VER="$ARG1"; TARGET="${ARG2:-glibc}"; PROFILE="${ARG3:-minimal}"
+    PHP_VER="$ARG1"; TARGET="${ARG2:-glibc}"; PROFILE="${ARG3:-full}"
 else
-    TARGET="$ARG1"; PROFILE="${ARG2:-minimal}"; PHP_VER="${ARG3:-$PHP_VER}"
+    TARGET="$ARG1"; PROFILE="${ARG2:-full}"; PHP_VER="${ARG3:-$PHP_VER}"
 fi
 # Validation happens before invoking SPC and before deriving user-controlled paths.
 WORK="$(mktemp -d "$PHP_DIR/.build.XXXXXX")"

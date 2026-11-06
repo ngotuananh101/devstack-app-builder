@@ -2,8 +2,11 @@
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -74,6 +77,30 @@ class BuildContracts(unittest.TestCase):
         self.assertRegex(str(result["php_api"]), r"^[0-9]+$")
         self.assertIn("NTS", result["extension_build"])
         self.assertIsInstance(result["static_modules"], list)
+
+    def test_omitted_profile_builds_full_and_explicit_minimal_is_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            php_dir = root / "runtimes/php"
+            (php_dir / "scripts").mkdir(parents=True)
+            for name in ("build.sh", "configure.py"):
+                shutil.copy2(SCRIPTS / name, php_dir / "scripts" / name)
+            shutil.copytree(REPO / "runtimes/php/config", php_dir / "config")
+            spc = root / "spc"
+            spc.write_text(f'#!{sys.executable} -I\nimport pathlib, sys\nsys.stdout.write((pathlib.Path.cwd() / "resolution.json").read_text())\nsys.exit(42)\n')
+            spc.chmod(0o755)
+            provenance = root / "provenance.json"
+            provenance.write_text("{}")
+            env = {**os.environ, "SPC_BIN": str(spc), "SPC_PROVENANCE": str(provenance), "PHP_VERSION": "8.4"}
+            cases = [([], "full"), (["glibc"], "full"), (["8.4"], "full"), (["8.4", "musl"], "full"), (["glibc", "minimal", "8.4"], "minimal"), (["8.4", "musl", "minimal"], "minimal")]
+            for arguments, expected in cases:
+                with self.subTest(arguments=arguments):
+                    result = subprocess.run([str(php_dir / "scripts/build.sh"), *arguments], text=True, capture_output=True, env=env)
+                    self.assertEqual(result.returncode, 42, result.stderr)
+                    resolution = json.loads(result.stdout)
+                    self.assertEqual(resolution["profile"], expected)
+                    if expected == "full" and resolution["target"] == "glibc":
+                        self.assertEqual(resolution["shared"], ["apcu", "redis"])
 
     def test_fresh_build_reuses_prepared_toolchain_path(self):
         with tempfile.TemporaryDirectory() as tmp:

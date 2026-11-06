@@ -7,8 +7,12 @@ from test_build import REPO
 import hashlib
 import io
 import json
+import os
+import re
+import subprocess
 import tarfile
 import tempfile
+import textwrap
 from test_build import load
 
 
@@ -84,6 +88,25 @@ class WorkflowContracts(unittest.TestCase):
                 archive.with_name(archive.name + ".sha256").write_text(hashlib.sha256(archive.read_bytes()).hexdigest() + "  " + archive.name + "\n")
                 with self.assertRaises(ValueError):
                     publisher.validate_assets(root)
+
+    def test_scheduled_and_manual_matrices_default_to_full(self):
+        workflow = (REPO / ".github/workflows/build.yml").read_text()
+        manual = re.search(r"^      profile:\n(?P<config>(?:^        .*\n)+)", workflow, re.MULTILINE)
+        self.assertIsNotNone(manual)
+        manual_default = re.search(r"^        default: (\w+)$", manual["config"], re.MULTILINE)[1]
+        schedule_default = re.search(r"PROFILE_INPUT: \$\{\{ inputs\.profile \|\| '(\w+)' \}\}", workflow)[1]
+        plan = workflow.split("  plan:\n", 1)[1].split("  build-php:\n", 1)[0]
+        command = textwrap.dedent(plan.split("        run: |\n", 1)[1])
+        for event, profile, expected in (("schedule", schedule_default, "full"), ("manual-default", manual_default, "full"), ("manual-minimal", "minimal", "minimal")):
+            with self.subTest(event=event), tempfile.TemporaryDirectory() as tmp:
+                output = Path(tmp) / "output"
+                env = {**os.environ, "PHP_VERSION_INPUT": "all", "TARGET_INPUT": "both", "PROFILE_INPUT": profile, "PUBLISH": "false", "RELEASE_TAG": "", "GITHUB_OUTPUT": str(output)}
+                result = subprocess.run(["bash", "-c", command], env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                matrix = json.loads(output.read_text().removeprefix("matrix="))
+                self.assertEqual(matrix["profile"], [expected])
+                self.assertEqual(matrix["php_version"], ["8.5", "8.4", "8.3", "8.2"])
+                self.assertEqual(matrix["target"], ["glibc", "musl"])
 
     def test_ci_uploads_verified_archives_and_exposes_full(self):
         workflow = (REPO / ".github/workflows/build.yml").read_text()

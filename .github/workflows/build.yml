@@ -2,7 +2,7 @@ name: Build DevStack Runtimes
 
 on:
   schedule:
-    # Schedule stays minimal; use manual full builds for production web workloads.
+    # Daily builds use the full extension profile by default.
     - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
@@ -29,7 +29,7 @@ on:
         required: true
         type: choice
         options: [minimal, full]
-        default: minimal
+        default: full
       publish:
         description: "Publish verified archives to a NEW public Release (explicit opt-in)"
         required: true
@@ -68,7 +68,7 @@ jobs:
         env:
           PHP_VERSION_INPUT: ${{ inputs.php_version || 'all' }}
           TARGET_INPUT: ${{ inputs.target || 'both' }}
-          PROFILE_INPUT: ${{ inputs.profile || 'minimal' }}
+          PROFILE_INPUT: ${{ inputs.profile || 'full' }}
           PUBLISH: ${{ inputs.publish || false }}
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |

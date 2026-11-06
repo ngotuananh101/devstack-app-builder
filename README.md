@@ -14,8 +14,11 @@ Build hosts require PHP >= 8.4.1 with mbstring/zlib, Composer, Python >= 3.12 an
 # Check only; never auto-install dependencies on the development host
 ./runtimes/php/spc doctor --auto-fix=never --no-interaction
 
-./build.sh php glibc minimal 8.4
+# Defaults: PHP 8.4, glibc, full profile
+./build.sh php
 ./build.sh php glibc full 8.4
+# Opt in to the smaller profile
+./build.sh php glibc minimal 8.4
 ./build.sh php musl full 8.3
 # Alternative argument order
 ./build.sh php 8.2 glibc full
@@ -30,8 +33,8 @@ SPC stays on pinned **v3.0.0-alpha1**, not v2 or an unverified floating nightly.
 | glibc | Hybrid, x86_64 glibc >= 2.17; checked ELF baseline | `apcu`, `redis` in **full**, shared-only and disabled by default |
 | musl | Fully static Linux x86_64 | None; selected modules cannot be toggled |
 
-- `minimal`: lean default, **PDO core but no database drivers**.
-- `full`: web/database extension suite; static except explicitly supported shared modules on glibc.
+- `full` (default): web/database extension suite; static except explicitly supported shared modules on glibc.
+- `minimal` (explicit opt-in): lean profile, **PDO core but no database drivers**.
 - Opcache is static in full; xdebug is not packaged. Not every extension can be shared.
 - SPC-required dependencies may be static; actual resolved modes are included in the manifest.
 
@@ -72,7 +75,7 @@ python3 -I -m unittest discover -s tests -v
 
 Build output: `dist/php/<requested-version>/<target>/<profile>/`. Verified archives: `dist/assets/php-<actual-patch>-<target>-<profile>-<arch>-<build-id>.tar.gz` plus SHA-256 and JSON manifest sidecars. Tar preserves executable modes. Manifest includes actual patch/API/TS/modes, relative paths, SPC/source provenance and ELF inventory.
 
-CI runs real CLI/FPM module toggles, actual FastCGI requests, relocation with spaces and dependency/baseline checks before packaging. Daily builds remain **minimal**; manual workflow inputs expose **full**. Push triggers remain disabled.
+CI runs real CLI/FPM module toggles, actual FastCGI requests, relocation with spaces and dependency/baseline checks before packaging. Daily builds and manual workflow inputs default to **full**; **minimal** remains available as an explicit manual choice. Push triggers remain disabled.
 
 Public Release publication is a separate explicit opt-in (`publish=true`, new `runtimes-...` tag) behind the `runtime-releases` environment. It refuses existing tags/assets. Nothing has been published by this change. Consumers use the public Releases API/asset URLs without GitHub credentials and verify checksums before extracting into a new directory.
 
