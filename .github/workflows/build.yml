@@ -2,7 +2,7 @@ name: Build DevStack Runtimes
 
 on:
   schedule:
-    # Daily builds use the full extension profile by default.
+    # Daily checks build/publish only newer or missing full-profile bundles.
     - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
@@ -43,6 +43,11 @@ on:
 permissions:
   contents: read
 
+# Serialize discovery/build/publication across scheduled and manual runs.
+concurrency:
+  group: runtime-build-publication
+  cancel-in-progress: false
+
 jobs:
   contracts:
     runs-on: ubuntu-24.04
@@ -63,29 +68,32 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.set.outputs.matrix }}
+      has_updates: ${{ steps.set.outputs.has_updates }}
+      publish: ${{ steps.set.outputs.publish }}
+      release_tag: ${{ steps.set.outputs.release_tag }}
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - id: set
         env:
+          GH_TOKEN: ${{ github.token }}
           PHP_VERSION_INPUT: ${{ inputs.php_version || 'all' }}
           TARGET_INPUT: ${{ inputs.target || 'both' }}
           PROFILE_INPUT: ${{ inputs.profile || 'full' }}
           PUBLISH: ${{ inputs.publish || false }}
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          python3 -I - <<'PY'
-          import json,os,re
-          versions=['8.5','8.4','8.3','8.2']
-          version=os.environ['PHP_VERSION_INPUT']; target=os.environ['TARGET_INPUT']; profile=os.environ['PROFILE_INPUT']
-          assert version == 'all' or version in versions, 'Invalid PHP series'
-          assert target in ['both','glibc','musl'], 'Invalid target'
-          assert profile in ['minimal','full'], 'Invalid profile'
-          if os.environ['PUBLISH'] == 'true':
-              assert re.fullmatch(r'runtimes-[A-Za-z0-9][A-Za-z0-9._-]{0,79}',os.environ['RELEASE_TAG']), 'Invalid or missing NEW release tag'
-          matrix={'php_version':versions if version=='all' else [version], 'target':['glibc','musl'] if target=='both' else [target], 'profile':[profile]}
-          with open(os.environ['GITHUB_OUTPUT'],'a') as output: output.write('matrix='+json.dumps(matrix)+'\n')
-          PY
+          python3 -I runtimes/php/scripts/updates.py --output dist/plans/php-update-plan.json --github-output "$GITHUB_OUTPUT"
+      - name: Preserve exact-patch publication plan
+        if: steps.set.outputs.has_updates == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: runtime-update-plan
+          path: dist/plans/php-update-plan.json
+          if-no-files-found: error
+          retention-days: 14
 
   build-php:
+    if: needs.plan.outputs.has_updates == 'true'
     needs: [plan, contracts]
     runs-on: ubuntu-24.04
     strategy:
@@ -118,8 +126,8 @@ jobs:
           retention-days: 14
 
   publish:
-    if: github.event_name == 'workflow_dispatch' && inputs.publish
-    needs: build-php
+    if: needs.plan.outputs.publish == 'true'
+    needs: [plan, build-php]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -132,8 +140,13 @@ jobs:
           pattern: php-*
           path: dist/assets/
           merge-multiple: true
-      - name: Validate assets and create NEW Release (never overwrite)
+      - name: Download exact-patch publication plan
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: runtime-update-plan
+          path: dist/plans/
+      - name: Validate planned assets, draft, upload, and publish with release notes
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
-        run: python3 -I runtimes/php/scripts/publish.py dist/assets "$RELEASE_TAG" "$GITHUB_REPOSITORY" "$GITHUB_SHA"
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+        run: python3 -I runtimes/php/scripts/publish.py dist/assets "$RELEASE_TAG" "$GITHUB_REPOSITORY" "$GITHUB_SHA" --plan dist/plans/php-update-plan.json
