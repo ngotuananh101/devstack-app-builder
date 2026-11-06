@@ -2,7 +2,7 @@
 
 A unified build system for creating reproducible, portable, and standalone language runtimes for DevStack environments.
 
-Currently supports **PHP** (8.4, 8.3, 8.2, 8.1) CLI + FPM with dual glibc/musl targets via [StaticPHP CLI](https://github.com/crazywhalecc/static-php-cli), with a modular architecture ready for additional runtimes (Node.js, Python, etc.).
+Currently supports **PHP** (8.5, 8.4, 8.3, 8.2) CLI + FPM with dual glibc/musl targets via [StaticPHP CLI](https://github.com/crazywhalecc/static-php-cli), with a modular architecture ready for additional runtimes (Node.js, Python, etc.).
 
 ---
 
@@ -82,10 +82,10 @@ For complete architectural details, see [PHP Architecture Documentation](docs/ru
 
 ### Supported PHP Versions
 
+- **8.5**
 - **8.4** (Default)
 - **8.3**
 - **8.2**
-- **8.1**
 
 ### Targets
 

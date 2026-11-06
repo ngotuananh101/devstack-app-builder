@@ -1,6 +1,6 @@
 # PHP Runtime Architecture & Specifications
 
-Build reproducible PHP (8.4, 8.3, 8.2, 8.1) x86_64 CLI + FPM distributions using [StaticPHP / SPC](https://github.com/crazywhalecc/static-php-cli).
+Build reproducible PHP (8.5, 8.4, 8.3, 8.2) x86_64 CLI + FPM distributions using [StaticPHP / SPC](https://github.com/crazywhalecc/static-php-cli).
 
 ## Target Libc & Linkage
 

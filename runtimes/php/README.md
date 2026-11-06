@@ -6,10 +6,10 @@ For architecture and full documentation, refer to [PHP Architecture Doc](../../d
 
 ## Supported PHP Versions
 
+- **8.5**
 - **8.4** (Default)
 - **8.3**
 - **8.2**
-- **8.1**
 
 ## Quick Build
 

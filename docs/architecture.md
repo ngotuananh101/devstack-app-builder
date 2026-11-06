@@ -49,7 +49,7 @@ Every runtime directory under `runtimes/<name>` adheres to the following contrac
 
 ## Supported Runtimes
 
-- [PHP (8.1, 8.2, 8.3, 8.4)](runtimes/php.md): Dual-target distribution (GNU/glibc hybrid with dynamic `.so` extension loading, and musl fully static binary) with independent CLI and FPM SAPI support. Custom PHP versions can be specified at build time.
+- [PHP (8.5, 8.4, 8.3, 8.2)](runtimes/php.md): Dual-target distribution (GNU/glibc hybrid with dynamic `.so` extension loading, and musl fully static binary) with independent CLI and FPM SAPI support. Custom PHP versions can be specified at build time.
 
 ## Adding New Runtimes
 
