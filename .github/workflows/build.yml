@@ -1,6 +1,9 @@
 name: Build DevStack Runtimes
 
 on:
+  schedule:
+    # Run daily at 02:00 UTC (09:00 AM UTC+7)
+    - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
       runtime:
@@ -13,8 +16,8 @@ on:
         description: "PHP version (when building PHP)"
         required: true
         type: choice
-        options: ["8.5", "8.4", "8.3", "8.2"]
-        default: "8.4"
+        options: [all, "8.5", "8.4", "8.3", "8.2"]
+        default: all
       target:
         description: "Target libc (PHP)"
         required: true
@@ -25,14 +28,8 @@ on:
         description: "Extension profile (PHP)"
         required: true
         type: choice
-        options: [minimal, laravel, full]
-        default: laravel
-  push:
-    branches: [main]
-    paths:
-      - "runtimes/**"
-      - "scripts/**"
-      - ".github/workflows/build.yml"
+        options: [minimal, full]
+        default: minimal
 
 jobs:
   plan:
@@ -43,12 +40,28 @@ jobs:
       - id: set
         shell: bash
         run: |
+          EVENT="${{ github.event_name }}"
           RUNTIME="${{ inputs.runtime || 'php' }}"
-          PHP_VER="${{ inputs.php_version || '8.4' }}"
+          PHP_VER="${{ inputs.php_version || 'all' }}"
           TARGET="${{ inputs.target || 'both' }}"
-          PROFILE="${{ inputs.profile || 'laravel' }}"
-          if [[ "$TARGET" == "both" ]]; then targets='["glibc","musl"]'; else targets="[\"$TARGET\"]"; fi
-          echo "matrix={\"runtime\":[\"$RUNTIME\"],\"php_version\":[\"$PHP_VER\"],\"target\":$targets,\"profile\":[\"$PROFILE\"]}" >> "$GITHUB_OUTPUT"
+          PROFILE="${{ inputs.profile || 'minimal' }}"
+
+          ALL_PHP_VERSIONS='["8.5","8.4","8.3","8.2"]'
+
+          # When scheduled or when "all" is chosen, build all available PHP versions
+          if [[ "$EVENT" == "schedule" || "$PHP_VER" == "all" ]]; then
+            php_versions="$ALL_PHP_VERSIONS"
+          else
+            php_versions="[\"$PHP_VER\"]"
+          fi
+
+          if [[ "$EVENT" == "schedule" || "$TARGET" == "both" ]]; then
+            targets='["glibc","musl"]'
+          else
+            targets="[\"$TARGET\"]"
+          fi
+
+          echo "matrix={\"runtime\":[\"$RUNTIME\"],\"php_version\":$php_versions,\"target\":$targets,\"profile\":[\"$PROFILE\"]}" >> "$GITHUB_OUTPUT"
 
   build-php:
     needs: plan

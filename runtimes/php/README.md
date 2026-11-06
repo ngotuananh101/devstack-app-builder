@@ -18,27 +18,27 @@ For architecture and full documentation, refer to [PHP Architecture Doc](../../d
 ./runtimes/php/scripts/download-spc.sh
 ./runtimes/php/spc doctor --auto-fix
 
-# 2. Build default version (PHP 8.4):
-./build.sh php glibc laravel
-./build.sh php musl minimal
+# 2. Build default version (PHP 8.4, minimal profile):
+./build.sh php glibc
+./build.sh php musl
 
-# 3. Build specific PHP version (e.g. 8.3, 8.2):
-./build.sh php glibc laravel 8.3
-./build.sh php musl minimal 8.2
+# 3. Build with specific profile and PHP version:
+./build.sh php glibc minimal 8.4
+./build.sh php glibc full 8.3
+./build.sh php musl full 8.2
 # Alternatively:
-./build.sh php 8.3 glibc laravel
-PHP_VERSION=8.1 ./build.sh php glibc minimal
+./build.sh php 8.3 glibc minimal
+PHP_VERSION=8.2 ./build.sh php glibc full
 ```
 
 ## Profiles
 
 Available profiles in `config/profiles/`:
-- `minimal.txt`: Essential core extensions.
-- `laravel.txt`: Extensions recommended for Laravel applications.
-- `full.txt`: Broad extension set for complex enterprise workloads.
+- `minimal.txt`: Essential core extensions (default profile).
+- `full.txt`: Broad extension set for comprehensive workloads (pdo, mysql, pgsql, redis, gd, intl, opcache, zip, etc.).
 
 ## Artifacts
 
 Artifacts are emitted into `dist/php/<version>/<target>/<profile>/`, for example:
-- `dist/php/8.4/glibc/laravel/`
+- `dist/php/8.4/glibc/full/`
 - `dist/php/8.3/musl/minimal/`

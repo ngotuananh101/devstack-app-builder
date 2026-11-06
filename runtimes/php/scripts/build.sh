@@ -14,7 +14,7 @@ ARG3="${3:-}"
 DEFAULT_PHP_VERSION="8.4"
 PHP_VER="${PHP_VERSION:-$DEFAULT_PHP_VERSION}"
 TARGET="glibc"
-PROFILE="laravel"
+PROFILE="minimal"
 
 # Support flexible argument ordering:
 # 1) [glibc|musl] [profile] [php_version]
@@ -22,21 +22,21 @@ PROFILE="laravel"
 if [[ "$ARG1" =~ ^[789]\.[0-9]+(\.[0-9]+)?$ ]]; then
   PHP_VER="$ARG1"
   TARGET="${ARG2:-glibc}"
-  PROFILE="${ARG3:-laravel}"
+  PROFILE="${ARG3:-minimal}"
 elif [[ "$ARG1" == "glibc" || "$ARG1" == "musl" ]]; then
   TARGET="$ARG1"
-  PROFILE="${ARG2:-laravel}"
+  PROFILE="${ARG2:-minimal}"
   if [[ -n "$ARG3" ]]; then
     PHP_VER="$ARG3"
   fi
 elif [[ -z "$ARG1" ]]; then
   TARGET="glibc"
-  PROFILE="laravel"
+  PROFILE="minimal"
 else
   echo "Usage: $0 [glibc|musl] [profile] [php_version]" >&2
   echo "   or: $0 [php_version] [glibc|musl] [profile]" >&2
-  echo "Example: $0 glibc laravel 8.3" >&2
-  echo "         $0 8.4 musl minimal" >&2
+  echo "Example: $0 glibc minimal 8.4" >&2
+  echo "         $0 8.3 musl full" >&2
   exit 2
 fi
 
@@ -74,15 +74,17 @@ case "$TARGET" in
     ;;
 esac
 
-# Ensure shared extensions are included in the selected extension set.
+# Filter shared extensions to only those included in the selected profile.
 if [[ -n "$SHARED" ]]; then
+  ACTUAL_SHARED=()
   IFS=',' read -ra shared_items <<< "$SHARED"
   for ext in "${shared_items[@]}"; do
-    case ",$EXTENSIONS," in *,"$ext",*) ;; *)
-      echo "Shared extension '$ext' is not present in profile '$PROFILE'." >&2
-      exit 1
+    case ",$EXTENSIONS," in *,"$ext",*)
+      ACTUAL_SHARED+=("$ext")
+      ;;
     esac
   done
+  SHARED="$(IFS=,; echo "${ACTUAL_SHARED[*]:-}")"
 fi
 
 cat > "$PHP_DIR/craft.yml" <<EOF

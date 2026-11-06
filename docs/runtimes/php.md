@@ -29,8 +29,7 @@ StaticPHP produces two distinct target variants:
 runtimes/php/
 ├── config/
 │   ├── profiles/
-│   │   ├── minimal.txt       # Lean CLI/worker profile
-│   │   ├── laravel.txt       # Optimized for Laravel/web apps
+│   │   ├── minimal.txt       # Lean CLI/worker profile (default)
 │   │   └── full.txt          # Comprehensive extension set
 │   ├── php.ini               # Base PHP configuration
 │   ├── php-fpm.conf          # Default FPM configuration
@@ -77,13 +76,14 @@ You can pass the PHP version as an argument or via the `PHP_VERSION` environment
 
 ```bash
 # Form 1: [glibc|musl] [profile] [version]
-./build.sh php glibc laravel 8.3
+./build.sh php glibc minimal 8.4
+./build.sh php glibc full 8.3
 
 # Form 2: [version] [glibc|musl] [profile]
-./build.sh php 8.2 musl minimal
+./build.sh php 8.2 musl full
 
 # Form 3: Environment variable
-PHP_VERSION=8.1 ./build.sh php glibc full
+PHP_VERSION=8.3 ./build.sh php glibc minimal
 ```
 
 ## Extension Management (GNU/glibc)
@@ -92,14 +92,14 @@ Use `scripts/ext.sh` to manage dynamic extensions:
 
 ```bash
 # List extensions
-./runtimes/php/scripts/ext.sh list dist/php/8.4/glibc/laravel
+./runtimes/php/scripts/ext.sh list dist/php/8.4/glibc/full
 
 # Enable an extension
-./runtimes/php/scripts/ext.sh enable dist/php/8.4/glibc/laravel redis cli
-./runtimes/php/scripts/ext.sh enable dist/php/8.4/glibc/laravel xdebug fpm
+./runtimes/php/scripts/ext.sh enable dist/php/8.4/glibc/full redis cli
+./runtimes/php/scripts/ext.sh enable dist/php/8.4/glibc/full xdebug fpm
 
 # Disable an extension
-./runtimes/php/scripts/ext.sh disable dist/php/8.4/glibc/laravel redis all
+./runtimes/php/scripts/ext.sh disable dist/php/8.4/glibc/full redis all
 ```
 
 ## ABI & Dependency Rules

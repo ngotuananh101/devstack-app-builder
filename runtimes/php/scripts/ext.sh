@@ -7,9 +7,9 @@ REPO_ROOT="$(cd "$PHP_DIR/../.." && pwd)"
 
 usage() {
   echo "Usage: $0 {list|enable|disable} RUNTIME_DIR [EXTENSION] [cli|fpm|all]" >&2
-  echo "Example: $0 list dist/php/8.4/glibc/laravel" >&2
-  echo "         $0 enable dist/php/8.4/glibc/laravel redis cli" >&2
-  echo "         $0 disable dist/php/8.4/glibc/laravel redis all" >&2
+  echo "Example: $0 list dist/php/8.4/glibc/full" >&2
+  echo "         $0 enable dist/php/8.4/glibc/full redis cli" >&2
+  echo "         $0 disable dist/php/8.4/glibc/full redis all" >&2
   exit 2
 }
 

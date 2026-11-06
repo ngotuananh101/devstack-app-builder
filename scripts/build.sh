@@ -21,9 +21,9 @@ usage() {
   fi
   echo ""
   echo "Examples:"
-  echo "  ./build.sh php glibc laravel 8.4"
-  echo "  ./build.sh php musl minimal 8.3"
-  echo "  ./build.sh php 8.2 glibc full"
+  echo "  ./build.sh php glibc minimal 8.4"
+  echo "  ./build.sh php musl full 8.3"
+  echo "  ./build.sh php 8.2 glibc minimal"
   exit 1
 }
 

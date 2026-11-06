@@ -16,7 +16,7 @@ devstack-runtime-builder/
 ├── runtimes/                     # Isolated runtime modules
 │   └── php/                      # PHP runtime definition
 │       ├── config/
-│       │   ├── profiles/         # Extension profiles (minimal, laravel, full)
+│       │   ├── profiles/         # Extension profiles (minimal, full)
 │       │   ├── php.ini           # Base PHP configuration
 │       │   ├── php-fpm.conf      # Default FPM configuration
 │       │   └── shared-glibc.txt  # Shared extension definitions (.so)
@@ -51,16 +51,17 @@ You can run builds using the root `./build.sh` (or `./scripts/build.sh`):
 # View usage and available runtimes
 ./build.sh --help
 
-# Build PHP default version (8.4) with GNU/glibc and Laravel profile
-./build.sh php glibc laravel
+# Build PHP default version (8.4) with GNU/glibc and minimal profile (default)
+./build.sh php glibc
 
-# Build custom PHP versions (e.g. 8.3, 8.2, 8.1)
-./build.sh php glibc laravel 8.3
-./build.sh php musl minimal 8.2
+# Build with specific target, profile, and version
+./build.sh php glibc minimal 8.4
+./build.sh php glibc full 8.3
+./build.sh php musl full 8.2
 
 # Flexible argument ordering: version first or via environment variable
-./build.sh php 8.3 glibc laravel
-PHP_VERSION=8.1 ./build.sh php musl full
+./build.sh php 8.3 glibc minimal
+PHP_VERSION=8.2 ./build.sh php musl full
 ```
 
 ---
@@ -100,9 +101,8 @@ For complete architectural details, see [PHP Architecture Documentation](docs/ru
 
 Profiles are located in `runtimes/php/config/profiles/`:
 
-- `minimal.txt`: Lean profile for microservices and CLI tools.
-- `laravel.txt`: Curated set of extensions required for modern Laravel applications.
-- `full.txt`: Comprehensive extension suite for legacy or enterprise workloads.
+- `minimal.txt`: Lean profile for microservices and CLI tools (default).
+- `full.txt`: Comprehensive extension suite for web and enterprise workloads (pdo, mysql, pgsql, redis, gd, intl, opcache, zip, etc.).
 
 ### Dynamic Extension Management (glibc)
 
@@ -112,15 +112,15 @@ Manage them using `runtimes/php/scripts/ext.sh`:
 
 ```bash
 # List extensions and their active state per SAPI
-./runtimes/php/scripts/ext.sh list dist/php/8.4/glibc/laravel
+./runtimes/php/scripts/ext.sh list dist/php/8.4/glibc/full
 
 # Enable an extension for CLI, FPM, or both
-./runtimes/php/scripts/ext.sh enable dist/php/8.4/glibc/laravel redis cli
-./runtimes/php/scripts/ext.sh enable dist/php/8.4/glibc/laravel xdebug fpm
-./runtimes/php/scripts/ext.sh enable dist/php/8.4/glibc/laravel opcache all
+./runtimes/php/scripts/ext.sh enable dist/php/8.4/glibc/full redis cli
+./runtimes/php/scripts/ext.sh enable dist/php/8.4/glibc/full xdebug fpm
+./runtimes/php/scripts/ext.sh enable dist/php/8.4/glibc/full opcache all
 
 # Disable an extension
-./runtimes/php/scripts/ext.sh disable dist/php/8.4/glibc/laravel redis all
+./runtimes/php/scripts/ext.sh disable dist/php/8.4/glibc/full redis all
 ```
 
 > **Note:** Static extensions cannot be toggled dynamically. Restart or reload PHP-FPM after changing extensions.
@@ -132,7 +132,7 @@ Emitted under `dist/php/<version>/<target>/<profile>/`:
 ```text
 dist/php/
 └── 8.4/
-    ├── glibc/laravel/
+    ├── glibc/full/
     │   ├── bin/php
     │   ├── bin/php-fpm
     │   ├── lib/php/extensions/
@@ -141,7 +141,7 @@ dist/php/
     │   ├── etc/cli/conf.d/
     │   ├── etc/fpm/conf.d/
     │   └── manifest.txt
-    └── musl/laravel/
+    └── musl/full/
         ├── bin/php
         ├── bin/php-fpm
         ├── etc/php.ini
@@ -174,13 +174,14 @@ DevStack Runtime Builder is structured to easily onboard additional runtimes:
 ## GitHub Actions CI/CD
 
 The workflow in `.github/workflows/build.yml` provides:
-- Automated builds on push to `main` for changes within `runtimes/**` and `scripts/**`.
-- Manual execution via `workflow_dispatch` allowing selection of:
+- **Scheduled Daily Builds**: Runs every day at 02:00 UTC (09:00 AM UTC+7) building **all available PHP versions** (`8.5`, `8.4`, `8.3`, `8.2`) across both libc targets (`glibc` and `musl`).
+- **Manual Trigger (`workflow_dispatch`)**: Build on demand with custom parameters:
   - **Runtime**: `php`
-  - **PHP Version**: `8.4`, `8.3`, `8.2`, or `8.1`
-  - **Target**: `glibc`, `musl`, or `both`
-  - **Profile**: `minimal`, `laravel`, or `full`
-- Artifact publishing with automated retention.
+  - **PHP Version**: `all` (builds all versions in parallel matrix), or specific version (`8.5`, `8.4`, `8.3`, `8.2`)
+  - **Target**: `both` (`glibc` + `musl`), `glibc`, or `musl`
+  - **Profile**: `minimal` (default), or `full`
+- **Push Triggers Disabled**: Does not trigger build automatically on push to save CI minutes and avoid unnecessary builds.
+- **Artifact Retention**: Automatically stages and uploads separate distribution packages for each version/target/profile matrix combination.
 
 ---
 
