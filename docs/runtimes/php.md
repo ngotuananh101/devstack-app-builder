@@ -134,6 +134,8 @@ Packaging is allowed only after real bundle verification passes. Files are `php-
 
 ## Public Release/download contract
 
+Daily checks are scheduled at **21:37 UTC**, or **04:37 Asia/Ho_Chi_Minh on the next calendar day** (`37 21 * * *`). This gives a planned 2-hour-23-minute lead before `dev-stack`'s catalog update at 00:00 UTC / 07:00 Vietnam time. GitHub Actions schedules can be delayed; this is best-effort timing, not a cross-repository dependency or guaranteed completion order.
+
 The daily schedule resolves stable php.net patches for `8.2`–`8.5` and compares numeric versions against the highest public bundle version for each `(PHP series, target, profile, architecture)` across paginated `runtimes-...` releases. Draft/prerelease releases are ignored. A matching schema-v1 `PASSED` manifest must have uploaded archive/checksum companions and consistent identity; malformed relevant metadata or API failures stop planning rather than pretending no bundle exists. Missing combinations or newer patches select a `full`/`x86_64` glibc or musl build. Equal/older versions select nothing. The exact selected patch is passed to SPC, not re-resolved from a minor input. An empty matrix skips build and publication.
 
 Manual runs resolve exact patches but always rebuild their requested versions/targets/profile (`full` default, `minimal` available). Their `publish=false` default is unchanged; `publish=true` requires a NEW `runtimes-...` tag. Scheduled runs automatically publish updates with tag `runtimes-<UTC-date>-<run-id>-<attempt>`. All runs share non-canceling workflow concurrency. GitHub concurrency is not a durable queue: superseded pending runs may be replaced, while a running publication is not canceled.

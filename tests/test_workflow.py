@@ -1,4 +1,5 @@
 """Release/build workflow policy: planned publication and verified archive uploads."""
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 import unittest
 from test_build import REPO
@@ -18,6 +19,19 @@ from test_build import load
 
 
 class WorkflowContracts(unittest.TestCase):
+    def test_daily_schedule_leads_catalog_by_more_than_two_hours(self):
+        workflow = (REPO / ".github/workflows/build.yml").read_text()
+        schedule = workflow.split("  schedule:\n", 1)[1].split("  workflow_dispatch:", 1)[0]
+        registrations = re.findall(r'- cron: [\"\']([^\"\']+)[\"\']', schedule)
+        self.assertEqual(len(registrations), 1)
+        minute, hour, day, month, weekday = registrations[0].split()
+        self.assertEqual((day, month, weekday), ("*", "*", "*"))
+        scheduled_utc = datetime(2026, 11, 6, int(hour), int(minute), tzinfo=timezone.utc)
+        scheduled_local = scheduled_utc.astimezone(timezone(timedelta(hours=7)))
+        self.assertEqual(scheduled_local.time(), time(4, 37))
+        catalog_local = datetime(2026, 11, 7, 7, 0, tzinfo=scheduled_local.tzinfo)
+        self.assertEqual(catalog_local - scheduled_local, timedelta(hours=2, minutes=23))
+
     def test_release_validator_rejects_tampered_or_unverified_archives(self):
         packager = load("package")
         publisher = load("publish")

@@ -2,8 +2,10 @@ name: Build DevStack Runtimes
 
 on:
   schedule:
+    # 21:37 UTC = 04:37 Asia/Ho_Chi_Minh the next day, ahead of dev-stack's 00:00 UTC catalog.
+    # GitHub schedules are best-effort; independent workflows have no ordering guarantee.
     # Daily checks build/publish only newer or missing full-profile bundles.
-    - cron: "0 2 * * *"
+    - cron: "37 21 * * *"
   workflow_dispatch:
     inputs:
       runtime:
