@@ -1,0 +1,23 @@
+#!/bin/sh
+set -eu
+ROOT=$(CDPATH='' cd -P -- "$(dirname -- "$0")/.." && pwd)
+. "$ROOT/libexec/launch.sh"
+if [ "$(id -u)" = 0 ]; then
+    printf '%s\n' 'PHP-FPM launcher refuses root; run as the application user (no sudo/-R).' >&2
+    exit 1
+fi
+explicit=no
+for arg do
+    case "$arg" in
+        -y|--fpm-config|-y?*|--fpm-config=*) explicit=yes ;;
+        -R|--allow-to-run-as-root) printf '%s\n' 'Root override is not supported.' >&2; exit 1 ;;
+    esac
+done
+if [ "$explicit" = no ]; then
+    if [ -z "${DEVSTACK_FPM_CONFIG:-}" ] || [ ! -f "$DEVSTACK_FPM_CONFIG" ]; then
+        printf '%s\n' 'Supply a caller-owned FPM config with -y/--fpm-config or DEVSTACK_FPM_CONFIG.' >&2
+        exit 1
+    fi
+    set -- -y "$DEVSTACK_FPM_CONFIG" "$@"
+fi
+exec "$ROOT/libexec/php-fpm" -c "$ROOT/etc/php.ini" -d "extension_dir=$ROOT/lib/php/extensions" "$@"

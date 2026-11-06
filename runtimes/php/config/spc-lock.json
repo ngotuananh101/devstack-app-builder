@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "commit": "5e913373a08c7c6cf23e45e0b3c2e2caac23af6d",
+  "source_url": "https://github.com/crazywhalecc/static-php-cli/archive/5e913373a08c7c6cf23e45e0b3c2e2caac23af6d.tar.gz",
+  "source_sha256": "75bdd58706d6cf941e1920c800ca0a7b735a6782ed4148360528a4e4b8dff4bf",
+  "composer_lock_sha256": "dfd89d492a270f5087ed4ad67a550b8fe8cb430f7f6f79dedde7de71685c2c3d",
+  "php_build_host": ">=8.4",
+  "strategy": "Verified immutable v3 source archive; Composer dependency references locked by upstream composer.lock. Runtime binaries are never downloaded from floating nightly."
+}

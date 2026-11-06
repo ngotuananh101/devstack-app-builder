@@ -2,7 +2,7 @@ name: Build DevStack Runtimes
 
 on:
   schedule:
-    # Run daily at 02:00 UTC (09:00 AM UTC+7)
+    # Schedule stays minimal; use manual full builds for production web workloads.
     - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
@@ -13,78 +13,127 @@ on:
         options: [php]
         default: php
       php_version:
-        description: "PHP version (when building PHP)"
+        description: "PHP minor series"
         required: true
         type: choice
         options: [all, "8.5", "8.4", "8.3", "8.2"]
         default: all
       target:
-        description: "Target libc (PHP)"
+        description: "Target libc"
         required: true
         type: choice
         options: [both, glibc, musl]
         default: both
       profile:
-        description: "Extension profile (PHP)"
+        description: "Extension profile (full includes optional apcu/redis on glibc)"
         required: true
         type: choice
         options: [minimal, full]
         default: minimal
+      publish:
+        description: "Publish verified archives to a NEW public Release (explicit opt-in)"
+        required: true
+        type: boolean
+        default: false
+      release_tag:
+        description: "New immutable release tag, e.g. runtimes-2026-11-06-1 (required to publish)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
 
 jobs:
+  contracts:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: shivammathur/setup-php@d52fc211a0436f8839a587b3b5b8efddab4744ea # v2
+        with:
+          php-version: "8.4.27"
+          extensions: mbstring, zlib
+          coverage: none
+      - name: Unit and installed contracts
+        run: |
+          python3 -I -m unittest discover -s tests -v
+          bash -n build.sh scripts/build.sh runtimes/php/scripts/*.sh
+          for script in runtimes/php/packaging/*; do sh -n "$script"; done
+
   plan:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.set.outputs.matrix }}
     steps:
       - id: set
-        shell: bash
+        env:
+          PHP_VERSION_INPUT: ${{ inputs.php_version || 'all' }}
+          TARGET_INPUT: ${{ inputs.target || 'both' }}
+          PROFILE_INPUT: ${{ inputs.profile || 'minimal' }}
+          PUBLISH: ${{ inputs.publish || false }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          EVENT="${{ github.event_name }}"
-          RUNTIME="${{ inputs.runtime || 'php' }}"
-          PHP_VER="${{ inputs.php_version || 'all' }}"
-          TARGET="${{ inputs.target || 'both' }}"
-          PROFILE="${{ inputs.profile || 'minimal' }}"
-
-          ALL_PHP_VERSIONS='["8.5","8.4","8.3","8.2"]'
-
-          # When scheduled or when "all" is chosen, build all available PHP versions
-          if [[ "$EVENT" == "schedule" || "$PHP_VER" == "all" ]]; then
-            php_versions="$ALL_PHP_VERSIONS"
-          else
-            php_versions="[\"$PHP_VER\"]"
-          fi
-
-          if [[ "$EVENT" == "schedule" || "$TARGET" == "both" ]]; then
-            targets='["glibc","musl"]'
-          else
-            targets="[\"$TARGET\"]"
-          fi
-
-          echo "matrix={\"runtime\":[\"$RUNTIME\"],\"php_version\":$php_versions,\"target\":$targets,\"profile\":[\"$PROFILE\"]}" >> "$GITHUB_OUTPUT"
+          python3 -I - <<'PY'
+          import json,os,re
+          versions=['8.5','8.4','8.3','8.2']
+          version=os.environ['PHP_VERSION_INPUT']; target=os.environ['TARGET_INPUT']; profile=os.environ['PROFILE_INPUT']
+          assert version == 'all' or version in versions, 'Invalid PHP series'
+          assert target in ['both','glibc','musl'], 'Invalid target'
+          assert profile in ['minimal','full'], 'Invalid profile'
+          if os.environ['PUBLISH'] == 'true':
+              assert re.fullmatch(r'runtimes-[A-Za-z0-9][A-Za-z0-9._-]{0,79}',os.environ['RELEASE_TAG']), 'Invalid or missing NEW release tag'
+          matrix={'php_version':versions if version=='all' else [version], 'target':['glibc','musl'] if target=='both' else [target], 'profile':[profile]}
+          with open(os.environ['GITHUB_OUTPUT'],'a') as output: output.write('matrix='+json.dumps(matrix)+'\n')
+          PY
 
   build-php:
-    needs: plan
+    needs: [plan, contracts]
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Download StaticPHP CLI
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: shivammathur/setup-php@d52fc211a0436f8839a587b3b5b8efddab4744ea # v2
+        with:
+          php-version: "8.4.27"
+          extensions: mbstring, zlib
+          tools: composer:2.8.12
+          coverage: none
+      - name: Bootstrap digest-verified SPC v3
         run: ./runtimes/php/scripts/download-spc.sh
-
-      - name: Install build dependencies
+      - name: Install CI-only build dependencies
         run: ./runtimes/php/spc doctor --auto-fix
-
-      - name: Build runtime
-        run: ./build.sh "${{ matrix.runtime }}" "${{ matrix.target }}" "${{ matrix.profile }}" "${{ matrix.php_version }}"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Build, verify actual CLI/FPM requests, and package
+        env:
+          BUILD_VERSION: ${{ matrix.php_version }}
+          BUILD_TARGET: ${{ matrix.target }}
+          BUILD_PROFILE: ${{ matrix.profile }}
+        run: ./build.sh php "$BUILD_TARGET" "$BUILD_PROFILE" "$BUILD_VERSION"
+      - name: Upload mode-preserving archives and metadata
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: php-${{ matrix.php_version }}-${{ matrix.target }}-${{ matrix.profile }}-x86_64
-          path: dist/${{ matrix.runtime }}/${{ matrix.php_version }}/${{ matrix.target }}/${{ matrix.profile }}/
+          path: dist/assets/
           if-no-files-found: error
           retention-days: 14
+
+  publish:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    needs: build-php
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    # Repository owners can configure required reviewers on this environment.
+    environment: runtime-releases
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: php-*
+          path: dist/assets/
+          merge-multiple: true
+      - name: Validate assets and create NEW Release (never overwrite)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: python3 -I runtimes/php/scripts/publish.py dist/assets "$RELEASE_TAG" "$GITHUB_REPOSITORY" "$GITHUB_SHA"

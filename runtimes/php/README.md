@@ -1,44 +1,20 @@
 # PHP Runtime for DevStack
 
-This folder contains the build configuration, profiles, and scripts for creating standalone, reproducible PHP distributions (CLI + FPM) for DevStack.
+Build configuration and packaging for Linux x86_64 PHP **8.5, 8.4 (default), 8.3, 8.2**.
 
-For architecture and full documentation, refer to [PHP Architecture Doc](../../docs/runtimes/php.md).
-
-## Supported PHP Versions
-
-- **8.5**
-- **8.4** (Default)
-- **8.3**
-- **8.2**
-
-## Quick Build
+See [PHP runtime architecture and consumer contract](../../docs/runtimes/php.md) for bootstrap integrity, installed launchers, FPM configuration, manifest fields, tests and public release downloads.
 
 ```bash
-# 1. Download StaticPHP CLI and install build host dependencies
 ./runtimes/php/scripts/download-spc.sh
-./runtimes/php/spc doctor --auto-fix
-
-# 2. Build default version (PHP 8.4, minimal profile):
-./build.sh php glibc
-./build.sh php musl
-
-# 3. Build with specific profile and PHP version:
-./build.sh php glibc minimal 8.4
-./build.sh php glibc full 8.3
-./build.sh php musl full 8.2
-# Alternatively:
-./build.sh php 8.3 glibc minimal
-PHP_VERSION=8.2 ./build.sh php glibc full
+./runtimes/php/spc doctor --auto-fix=never --no-interaction
+./build.sh php glibc full 8.4
+./build.sh php musl minimal 8.3
 ```
 
-## Profiles
+`minimal` includes PDO core but no database drivers. `full` includes web/database modules. On glibc/full only `apcu` and `redis` are supported shared-only optional modules, default disabled per SAPI. Musl profiles are fully static/non-toggleable. Opcache remains static; xdebug is not included.
 
-Available profiles in `config/profiles/`:
-- `minimal.txt`: Essential core extensions (default profile).
-- `full.txt`: Broad extension set for comprehensive workloads (pdo, mysql, pgsql, redis, gd, intl, opcache, zip, etc.).
+Outputs: `dist/php/<requested-version>/<target>/<profile>/` and versioned tar.gz/checksum/manifest assets under `dist/assets/`. Existing outputs are never overwritten. Consumer commands live in `bin/php`, `bin/php-fpm`, `bin/php-ext`; raw binaries are in `libexec/`. FPM runs non-root with explicit caller-owned config.
 
-## Artifacts
+Bootstrap uses a verified immutable SPC v3 archive and verified Composer dependency bytes. It needs build-host PHP/Composer/Python, not consumer dependencies. Never use plain `spc doctor` as a read-only command: it can auto-fix with a default-yes prompt; use `--auto-fix=never`.
 
-Artifacts are emitted into `dist/php/<version>/<target>/<profile>/`, for example:
-- `dist/php/8.4/glibc/full/`
-- `dist/php/8.3/musl/minimal/`
+The new SPC-built CI matrix and public distribution assets have **not yet been validated/published**. Unit contracts and real tests using preinstalled PHP do not replace those checks.

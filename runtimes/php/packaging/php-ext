@@ -1,0 +1,50 @@
+#!/bin/sh
+set -eu
+ROOT=$(CDPATH='' cd -P -- "$(dirname -- "$0")/.." && pwd)
+fail() { printf '%s\n' "$*" >&2; exit 1; }
+[ $# -ge 1 ] || fail 'Usage: php-ext {list|enable|disable} [module] [cli|fpm|all]'
+action=$1
+ext=${2:-}
+sapi=${3:-all}
+[ $# -le 3 ] || fail 'Too many arguments.'
+case "$sapi" in cli|fpm|all) ;; *) fail 'Invalid SAPI.' ;; esac
+registry="$ROOT/etc/shared-modules.tsv"
+[ -f "$registry" ] || fail 'Missing shared module registry.'
+tab=$(printf '\t')
+if [ "$action" = list ]; then
+    while IFS="$tab" read -r name directive module; do
+        [ -n "$name" ] || continue
+        cli=disabled; fpm=disabled
+        [ ! -f "$ROOT/etc/cli/conf.d/20-$name.ini" ] || cli=enabled
+        [ ! -f "$ROOT/etc/fpm/conf.d/20-$name.ini" ] || fpm=enabled
+        printf '%s\t%s\tcli=%s\tfpm=%s\n' "$name" "$directive" "$cli" "$fpm"
+    done < "$registry"
+    exit 0
+fi
+case "$action" in enable|disable) ;; *) fail 'Invalid action.' ;; esac
+case "$ext" in ''|*[!a-zA-Z0-9_-]*) fail 'Invalid module name.' ;; esac
+found=no
+while IFS="$tab" read -r name directive module; do
+    if [ "$name" = "$ext" ]; then found=yes; break; fi
+done < "$registry"
+[ "$found" = yes ] || fail "Not a packaged shared module: $ext (static/absent modules cannot be toggled)."
+case "$directive" in extension|zend_extension) ;; *) fail 'Invalid module directive in registry.' ;; esac
+case "$module" in "$ext.so") ;; *) fail 'Invalid module filename in registry.' ;; esac
+[ -f "$ROOT/lib/php/extensions/$module" ] || fail "Missing shared module: $module"
+for target in cli fpm; do
+    [ "$sapi" = all ] || [ "$sapi" = "$target" ] || continue
+    directory="$ROOT/etc/$target/conf.d"
+    mkdir -p -- "$directory"
+    ini="$directory/20-$ext.ini"
+    if [ "$action" = enable ]; then
+        # Atomic replacement: FPM never sees a partially written directive.
+        temporary=$(mktemp "$directory/.module.XXXXXX")
+        trap 'rm -f -- "$temporary"' EXIT HUP INT TERM
+        printf '%s=%s\n' "$directive" "$module" > "$temporary"
+        chmod 0644 "$temporary"
+        mv -f -- "$temporary" "$ini"
+        trap - EXIT HUP INT TERM
+    else
+        rm -f -- "$ini"
+    fi
+done

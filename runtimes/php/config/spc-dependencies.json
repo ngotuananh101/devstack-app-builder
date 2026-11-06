@@ -1,0 +1,17 @@
+[
+  {"name":"laravel/serializable-closure","sha256":"403a89643f22a56f5f58d55b6b6da00b435e23a703af293df81450a3f35a8b52"},
+  {"name":"php-di/invoker","sha256":"a6d671bd379053b3a5db6aaf8320ca18d3adcca87dc2461f91d6127bf47c3d4e"},
+  {"name":"php-di/php-di","sha256":"039d923b4b2deff8d716c7fc9f7b5904bed2920324ec0e4ff2752fc7113df6b2"},
+  {"name":"psr/container","sha256":"3111f5b69d3a0f690f5f92d7aeacfb247f5ebd3c175088cce4b098e5d1b06ad7"},
+  {"name":"psr/log","sha256":"1e8dcf2df933fc3440b29146c5ca4e93ece51c5c7a9ac9653d926ec971c90892"},
+  {"name":"symfony/console","sha256":"69828133d3124a5013a6da951e6371d0cc315fc2df1d6250b45b4fbbe240effb"},
+  {"name":"symfony/deprecation-contracts","sha256":"00d637bce4a1530be5720ebccf3e84545e09856f7fc701860b2034fb9a894b6b"},
+  {"name":"symfony/polyfill-ctype","sha256":"922b0c6b24d1bcb6447d051edc1fc4526bcca5f88ddc4a27d885507872ceecc1"},
+  {"name":"symfony/polyfill-intl-grapheme","sha256":"f4e28be599d1b7cd8e51ec5b37fb480ffb45ba1fd3546f9d1271ea868932a98e"},
+  {"name":"symfony/polyfill-intl-normalizer","sha256":"ad6b8ae2e7cfa7838c20bada21e8996ee9a0b3e063a50d7fd2724d1d16c62df3"},
+  {"name":"symfony/polyfill-mbstring","sha256":"36b2903d9d9b319bdcf6ec968604ad4bbfa0aabc1f9088ac18c8f633c6e76d31"},
+  {"name":"symfony/service-contracts","sha256":"8a47808f83089515a4a528100ec1d38ea9dd3af7e7305f1f2fe847bd0ab0f407"},
+  {"name":"symfony/string","sha256":"22c1ad1c1b13e418b0aca32f6ed53130ba2e1cc7409b39b34b471df538b940f8"},
+  {"name":"symfony/yaml","sha256":"ac115cbd7287773b2590b010763caf486dc0052788bd14bad99db9370b92c956"},
+  {"name":"zhamao/logger","sha256":"8add42038510301321ec584c82008d2cdee55a3b442b16b4e6e2b97b7e62e608"}
+]

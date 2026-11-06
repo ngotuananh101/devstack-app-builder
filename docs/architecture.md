@@ -2,7 +2,7 @@
 
 ## Overview
 
-**DevStack Runtime Builder** is an extensible build framework designed to generate isolated, portable, and reproducible language runtimes for DevStack environments.
+**DevStack Runtime Builder** is an extensible build framework designed to generate isolated, portable language runtimes with recorded input provenance. Reproducibility and runtime compatibility require validation of each build's actual toolchain and sources.
 
 Instead of bundling a single runtime, this repository is architected modularly to support multiple runtimes (PHP, Node.js, Python, etc.) under an isolated directory structure while offering a unified command-line interface.
 
@@ -41,11 +41,12 @@ Every runtime directory under `runtimes/<name>` adheres to the following contrac
 1. **`scripts/build.sh`**:
    - An executable script accepting target/profile arguments specific to that runtime.
    - Outputs compiled artifacts into `$REPO_ROOT/dist/<runtime>/...`.
-   - Generates a `manifest.txt` describing the build metadata (version, target libc, architecture, options).
+   - Generates a machine-readable `manifest.json` with actual runtime version, target libc, architecture, resolved module modes and build provenance.
+   - Verifies runtime behavior before generating mode-preserving tar.gz/checksum assets.
 2. **`config/`**:
    - Holds configuration templates, profile definitions, and runtime INI/config files.
 3. **Artifact Isolation**:
-   - Builds do not pollute repository source trees. All generated binaries and libraries are isolated under `dist/<runtime>/`.
+   - Build work/tool downloads use gitignored fresh directories. Installed binaries and libraries are staged under `dist/<runtime>/`, with archive assets under `dist/assets/`.
 
 ## Supported Runtimes
 

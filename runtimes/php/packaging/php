@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+# Resolve from the executable, never from the caller's current directory.
+ROOT=$(CDPATH='' cd -P -- "$(dirname -- "$0")/.." && pwd)
+. "$ROOT/libexec/launch.sh"
+exec "$ROOT/libexec/php" -c "$ROOT/etc/php.ini" -d "extension_dir=$ROOT/lib/php/extensions" "$@"
