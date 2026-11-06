@@ -1,0 +1,1 @@
+bcmath,ctype,curl,fileinfo,filter,iconv,mbstring,openssl,pdo,phar,session,tokenizer,zlib

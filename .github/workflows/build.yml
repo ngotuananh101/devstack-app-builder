@@ -1,0 +1,77 @@
+name: Build DevStack Runtimes
+
+on:
+  workflow_dispatch:
+    inputs:
+      runtime:
+        description: "Runtime to build"
+        required: true
+        type: choice
+        options: [php]
+        default: php
+      php_version:
+        description: "PHP version (when building PHP)"
+        required: true
+        type: choice
+        options: ["8.5", "8.4", "8.3", "8.2"]
+        default: "8.4"
+      target:
+        description: "Target libc (PHP)"
+        required: true
+        type: choice
+        options: [both, glibc, musl]
+        default: both
+      profile:
+        description: "Extension profile (PHP)"
+        required: true
+        type: choice
+        options: [minimal, laravel, full]
+        default: laravel
+  push:
+    branches: [main]
+    paths:
+      - "runtimes/**"
+      - "scripts/**"
+      - ".github/workflows/build.yml"
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - id: set
+        shell: bash
+        run: |
+          RUNTIME="${{ inputs.runtime || 'php' }}"
+          PHP_VER="${{ inputs.php_version || '8.4' }}"
+          TARGET="${{ inputs.target || 'both' }}"
+          PROFILE="${{ inputs.profile || 'laravel' }}"
+          if [[ "$TARGET" == "both" ]]; then targets='["glibc","musl"]'; else targets="[\"$TARGET\"]"; fi
+          echo "matrix={\"runtime\":[\"$RUNTIME\"],\"php_version\":[\"$PHP_VER\"],\"target\":$targets,\"profile\":[\"$PROFILE\"]}" >> "$GITHUB_OUTPUT"
+
+  build-php:
+    needs: plan
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download StaticPHP CLI
+        run: ./runtimes/php/scripts/download-spc.sh
+
+      - name: Install build dependencies
+        run: ./runtimes/php/spc doctor --auto-fix
+
+      - name: Build runtime
+        run: ./build.sh "${{ matrix.runtime }}" "${{ matrix.target }}" "${{ matrix.profile }}" "${{ matrix.php_version }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: php-${{ matrix.php_version }}-${{ matrix.target }}-${{ matrix.profile }}-x86_64
+          path: dist/${{ matrix.runtime }}/${{ matrix.php_version }}/${{ matrix.target }}/${{ matrix.profile }}/
+          if-no-files-found: error
+          retention-days: 14

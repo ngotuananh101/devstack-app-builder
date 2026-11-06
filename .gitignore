@@ -1,0 +1,13 @@
+# Build outputs and tools
+spc
+craft.yml
+buildroot/
+dist/
+.cache/
+*.log
+
+# Temporary and editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
