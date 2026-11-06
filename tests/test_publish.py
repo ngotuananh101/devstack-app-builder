@@ -42,6 +42,58 @@ class PublishContracts(unittest.TestCase):
     def setUp(self):
         self.module = load("publish")
 
+    def test_mixed_plan_requires_every_redis_and_php_bundle(self):
+        redis = {"schema_version": 1, "runtime": "redis", "redis": {"version": "8.10.3", "tls": False},
+                 "target": "musl", "architecture": "x86_64", "build_id": "redisfixture", "verification": "PASSED",
+                 "builder": {"commit": COMMIT}, "libc": {"family": "musl", "minimum_version": None, "static": True}}
+        policy = plan()
+        policy["redis_matrix"] = {"include": [{"redis_version": "8.10.3", "target": "musl", "architecture": "x86_64", "previous_version": None}]}
+        self.module.validate_plan(policy, [metadata(), redis], TAG, REPOSITORY, COMMIT)
+        for defect in ("missing_redis", "missing_php", "redis_patch", "redis_commit", "redis_profile"):
+            data = [metadata(), copy.deepcopy(redis)]
+            if defect == "missing_redis": data.pop()
+            if defect == "missing_php": data.pop(0)
+            if defect == "redis_patch": data[1]["redis"]["version"] = "7.2.17"
+            if defect == "redis_commit": data[1]["builder"]["commit"] = "b" * 40
+            if defect == "redis_profile": data[1]["profile"] = "full"
+            with self.subTest(defect=defect), self.assertRaises(ValueError):
+                self.module.validate_plan(policy, data, TAG, REPOSITORY, COMMIT)
+        policy["matrix"] = {"include": []}
+        self.module.validate_plan(policy, [redis], TAG, REPOSITORY, COMMIT)
+
+    def test_mixed_assets_accept_only_safe_redis_aliases(self):
+        from test_redis import module as redis_module
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            assets = packaged(root)
+            redis = root / "redis-bundle"
+            (redis / "bin").mkdir(parents=True)
+            for name in ("redis-server", "redis-cli", "redis-benchmark"):
+                binary = redis / "bin" / name
+                binary.write_text("#!/bin/sh\nexit 0\n")
+                binary.chmod(0o755)
+            for name in ("redis-sentinel", "redis-check-rdb", "redis-check-aof"):
+                (redis / "bin" / name).symlink_to("redis-server")
+            manifest = {"schema_version": 1, "runtime": "redis", "redis": {"version": "8.10.3"}, "target": "musl", "architecture": "x86_64", "build_id": "redisfixture", "verification": "PASSED", "builder": {"commit": COMMIT}}
+            (redis / "manifest.json").write_text(json.dumps(manifest))
+            packager = redis_module("bundle")
+            packager.package(redis, assets)
+            self.assertEqual(len(self.module.validate_assets(assets)), 6)
+            (redis / "bin/redis-sentinel").unlink()
+            (redis / "bin/redis-sentinel").symlink_to("../../outside")
+            packager.package(redis, root / "bad-assets")
+            with self.assertRaises(ValueError):
+                self.module.validate_assets(root / "bad-assets")
+
+    def test_mixed_notes_do_not_claim_php_glibc_floor_for_redis(self):
+        redis = {"runtime": "redis", "redis": {"version": "8.10.3", "tls": False}, "target": "glibc", "architecture": "x86_64", "build_id": "redisfixture", "libc": {"minimum_version": "2.38", "static": False}}
+        notes = self.module.release_notes([metadata(), redis], REPOSITORY, COMMIT, plan())
+        for expected in ("PHP", "Redis", "8.10.3", "2.38", "redis-server", "redis-cli", "No profiles", "native"):
+            self.assertIn(expected, notes)
+        self.assertIn("PHP", self.module.release_notes([metadata()], REPOSITORY, COMMIT))
+        redis_notes = self.module.release_notes([redis], REPOSITORY, COMMIT)
+        self.assertNotIn("2.17", redis_notes)
+
     def test_notes_describe_actual_bundles_and_workflow(self):
         notes = self.module.release_notes([metadata()], REPOSITORY, COMMIT, plan())
         for expected in ("8.4.10", "8.4.9", "glibc", "full", "x86_64", "fixture", "PDO", "Zend OPcache", "redis", "SHA-256",

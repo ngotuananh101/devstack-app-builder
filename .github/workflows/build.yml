@@ -4,30 +4,12 @@ on:
   schedule:
     # 21:37 UTC = 04:37 Asia/Ho_Chi_Minh the next day, ahead of dev-stack's 00:00 UTC catalog.
     # GitHub schedules are best-effort; independent workflows have no ordering guarantee.
-    # Daily checks build/publish only newer or missing full-profile bundles.
+    # Daily checks build/publish newer or missing PHP full bundles and missing pinned Redis bundles.
     - cron: "37 21 * * *"
   workflow_dispatch:
     inputs:
-      runtime:
-        description: "Runtime to build"
-        required: true
-        type: choice
-        options: [php]
-        default: php
-      php_version:
-        description: "PHP minor series"
-        required: true
-        type: choice
-        options: [all, "8.5", "8.4", "8.3", "8.2"]
-        default: all
-      target:
-        description: "Target libc"
-        required: true
-        type: choice
-        options: [both, glibc, musl]
-        default: both
       profile:
-        description: "Extension profile (full includes optional apcu/redis on glibc)"
+        description: "PHP extension profile only (Redis has no profiles)"
         required: true
         type: choice
         options: [minimal, full]
@@ -63,13 +45,16 @@ jobs:
       - name: Unit and installed contracts
         run: |
           python3 -I -m unittest discover -s tests -v
-          bash -n build.sh scripts/build.sh runtimes/php/scripts/*.sh
+          bash -n build.sh scripts/build.sh runtimes/php/scripts/*.sh runtimes/redis/scripts/*.sh
           for script in runtimes/php/packaging/*; do sh -n "$script"; done
 
   plan:
     runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.set.outputs.matrix }}
+      redis_matrix: ${{ steps.set.outputs.redis_matrix }}
+      has_php_updates: ${{ steps.set.outputs.has_php_updates }}
+      has_redis_updates: ${{ steps.set.outputs.has_redis_updates }}
       has_updates: ${{ steps.set.outputs.has_updates }}
       publish: ${{ steps.set.outputs.publish }}
       release_tag: ${{ steps.set.outputs.release_tag }}
@@ -78,24 +63,22 @@ jobs:
       - id: set
         env:
           GH_TOKEN: ${{ github.token }}
-          PHP_VERSION_INPUT: ${{ inputs.php_version || 'all' }}
-          TARGET_INPUT: ${{ inputs.target || 'both' }}
           PROFILE_INPUT: ${{ inputs.profile || 'full' }}
           PUBLISH: ${{ inputs.publish || false }}
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          python3 -I runtimes/php/scripts/updates.py --output dist/plans/php-update-plan.json --github-output "$GITHUB_OUTPUT"
+          python3 -I scripts/updates.py --output dist/plans/runtime-update-plan.json --github-output "$GITHUB_OUTPUT"
       - name: Preserve exact-patch publication plan
         if: steps.set.outputs.has_updates == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: runtime-update-plan
-          path: dist/plans/php-update-plan.json
+          name: publication-plan
+          path: dist/plans/runtime-update-plan.json
           if-no-files-found: error
           retention-days: 14
 
   build-php:
-    if: needs.plan.outputs.has_updates == 'true'
+    if: needs.plan.outputs.has_php_updates == 'true'
     needs: [plan, contracts]
     runs-on: ubuntu-24.04
     strategy:
@@ -122,14 +105,46 @@ jobs:
       - name: Upload mode-preserving archives and metadata
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: php-${{ matrix.php_version }}-${{ matrix.target }}-${{ matrix.profile }}-x86_64
+          name: runtime-php-${{ matrix.php_version }}-${{ matrix.target }}-${{ matrix.profile }}-x86_64
+          path: dist/assets/
+          if-no-files-found: error
+          retention-days: 14
+
+  build-redis:
+    if: needs.plan.outputs.has_redis_updates == 'true'
+    needs: [plan, contracts]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.redis_matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install CI-only native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential binutils curl musl-tools
+      - name: Build, verify real Redis requests, and package
+        env:
+          BUILD_VERSION: ${{ matrix.redis_version }}
+          BUILD_TARGET: ${{ matrix.target }}
+        run: ./build.sh redis "$BUILD_TARGET" "$BUILD_VERSION"
+      - name: Upload mode-preserving archives and metadata
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: runtime-redis-${{ matrix.redis_version }}-${{ matrix.target }}-x86_64
           path: dist/assets/
           if-no-files-found: error
           retention-days: 14
 
   publish:
-    if: needs.plan.outputs.publish == 'true'
-    needs: [plan, build-php]
+    # An empty runtime matrix is skipped, but a selected failed/cancelled build blocks publication.
+    if: >-
+      ${{ always() && !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.publish == 'true' &&
+          ((needs.plan.outputs.has_php_updates == 'true' && needs.build-php.result == 'success') ||
+           (needs.plan.outputs.has_php_updates == 'false' && needs.build-php.result == 'skipped')) &&
+          ((needs.plan.outputs.has_redis_updates == 'true' && needs.build-redis.result == 'success') ||
+           (needs.plan.outputs.has_redis_updates == 'false' && needs.build-redis.result == 'skipped')) }}
+    needs: [plan, build-php, build-redis]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -139,16 +154,16 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: php-*
+          pattern: runtime-*
           path: dist/assets/
           merge-multiple: true
       - name: Download exact-patch publication plan
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: runtime-update-plan
+          name: publication-plan
           path: dist/plans/
       - name: Validate planned assets, draft, upload, and publish with release notes
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
-        run: python3 -I runtimes/php/scripts/publish.py dist/assets "$RELEASE_TAG" "$GITHUB_REPOSITORY" "$GITHUB_SHA" --plan dist/plans/php-update-plan.json
+        run: python3 -I runtimes/php/scripts/publish.py dist/assets "$RELEASE_TAG" "$GITHUB_REPOSITORY" "$GITHUB_SHA" --plan dist/plans/runtime-update-plan.json

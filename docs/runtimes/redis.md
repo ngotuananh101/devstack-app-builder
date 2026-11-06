@@ -59,7 +59,11 @@ Archives preserve executable modes and relative aliases. Existing bundle/asset s
 
 Redis 7.2 uses BSD-3-Clause; Redis 7.4 offers RSALv2 or SSPLv1; Redis 8 offers RSALv2, SSPLv1 or AGPLv3. Retain the source distribution and upstream/dependency notices and review the chosen license's distribution obligations before publishing. The builder's license does not replace Redis licenses.
 
-This change adds local source builds, not automated Redis release discovery/publication or a Redis CI build matrix. The existing PHP workflow is unchanged.
+The shared workflow always covers PHP 8.2–8.5 and **every pinned Redis version on both glibc and musl**. Manual runs rebuild all combinations; runtime, PHP-series and libc selectors are absent. The remaining `profile` input affects PHP only. The Redis matrix uses native GCC/musl-gcc on Ubuntu 24.04 and explicitly installs `build-essential`, `binutils`, `curl` and `musl-tools` on the disposable CI runner. Local build scripts still never install packages.
+
+Daily planning at 21:37 UTC / 04:37 Vietnam time checks paginated public `runtimes-...` releases. A Redis exact-version/target/architecture combination is current only when its schema-v1 `PASSED` manifest has matching uploaded archive/checksum companions. Drafts and prereleases do not count. Malformed relevant metadata/API failures stop planning. Redis builds only missing pinned combinations, independently of PHP updates; this is **not automatic upstream Redis version discovery**. New Redis releases must first be pinned with a reviewed official SHA-256.
+
+The persisted `runtime-update-plan.json` records both runtime matrices. Publication checks the exact PHP/Redis asset set, builder commit, checksums, manifests, executable modes and the three safe Redis aliases before creating a draft. Every selected build must succeed; empty runtime jobs may be skipped. All assets upload before promotion to a public immutable Release. Scheduled updates publish automatically; manual publication remains opt-in with `publish=true` and a new `runtimes-...` tag. Redis release notes use the actual glibc floor or fully static musl contract, never PHP's glibc baseline. This workflow change has not yet completed a real GitHub Actions matrix run or published Redis assets.
 
 ```bash
 python3 -I -m unittest discover -s tests -v

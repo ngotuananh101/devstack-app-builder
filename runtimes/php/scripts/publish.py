@@ -34,25 +34,40 @@ def validate_assets(directory):
             for member in tar.getmembers():
                 path = Path(member.name)
                 canonical = str(path)
+                redis_alias = (manifest.get("runtime") == "redis" and canonical in {
+                    root + "/bin/redis-sentinel", root + "/bin/redis-check-rdb", root + "/bin/redis-check-aof"}
+                    and member.issym() and member.linkname == "redis-server")
                 if (path.is_absolute() or ".." in path.parts or not path.parts
                         or path.parts[0] != root or member.name.rstrip("/") != canonical
-                        or not (member.isfile() or member.isdir()) or canonical in members):
+                        or not (member.isfile() or member.isdir() or redis_alias) or canonical in members):
                     raise ValueError("Unsafe archive layout")
                 members[canonical] = member
             packaged = members.get(root + "/manifest.json")
             if not packaged or not packaged.isfile() or json.load(tar.extractfile(packaged)) != manifest:
                 raise ValueError("Sidecar and packaged manifest differ")
+            runtime = manifest.get("runtime")
             try:
-                parts = [manifest["php"]["version"], manifest["target"], manifest["profile"], manifest["architecture"], manifest["build_id"]]
+                if runtime == "php":
+                    parts = [manifest["php"]["version"], manifest["target"], manifest["profile"], manifest["architecture"], manifest["build_id"]]
+                    valid = (re.fullmatch(r"8\.[2-5]\.[0-9]+", parts[0]) and parts[2] in {"minimal", "full"} and parts[3] == "x86_64")
+                    executables = ("bin/php", "bin/php-fpm", "bin/php-ext", "libexec/php", "libexec/php-fpm")
+                elif runtime == "redis":
+                    parts = [manifest["redis"]["version"], manifest["target"], manifest["architecture"], manifest["build_id"]]
+                    valid = re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", parts[0]) and parts[2] == "x86_64" and "profile" not in manifest
+                    executables = ("bin/redis-server", "bin/redis-cli", "bin/redis-benchmark")
+                    for name in ("redis-sentinel", "redis-check-rdb", "redis-check-aof"):
+                        candidate = members.get(root + "/bin/" + name)
+                        if not candidate or not candidate.issym() or candidate.linkname != "redis-server":
+                            raise ValueError("Missing/unsafe Redis alias")
+                else:
+                    raise ValueError("Unsupported archive runtime")
             except (KeyError, TypeError) as error:
                 raise ValueError("Missing archive identity") from error
-            if (type(manifest.get("schema_version")) is not int or manifest["schema_version"] != 1 or manifest.get("runtime") != "php"
+            if (type(manifest.get("schema_version")) is not int or manifest["schema_version"] != 1
                     or any(not isinstance(value, str) or not re.fullmatch(r"[a-zA-Z0-9_.-]+", value) for value in parts)
-                    or not re.fullmatch(r"8\.[2-5]\.[0-9]+", parts[0])
-                    or parts[1] not in {"glibc", "musl"} or parts[2] not in {"minimal", "full"}
-                    or parts[3] != "x86_64" or "php-" + "-".join(parts) != root):
+                    or not valid or parts[1] not in {"glibc", "musl"} or runtime + "-" + "-".join(parts) != root):
                 raise ValueError("Invalid archive identity")
-            for executable in ("bin/php", "bin/php-fpm", "bin/php-ext", "libexec/php", "libexec/php-fpm"):
+            for executable in executables:
                 candidate = members.get(root + "/" + executable)
                 if not candidate or not candidate.isfile() or candidate.size == 0 or candidate.mode & 0o111 != 0o111:
                     raise ValueError(f"Archive lost executable file/permissions: {executable}")
@@ -68,7 +83,10 @@ def validate_plan(plan, manifests, tag, repository, commit):
             or not all(isinstance(plan.get(key), str) and re.fullmatch(r"[1-9][0-9]*", plan[key]) for key in ("run_id", "run_attempt"))):
         raise ValueError("Invalid publication plan identity")
     matrix = plan.get("matrix")
-    if not isinstance(matrix, dict) or not isinstance(matrix.get("include"), list) or not matrix["include"]:
+    if not isinstance(matrix, dict) or not isinstance(matrix.get("include"), list):
+        raise ValueError("Empty/invalid publication matrix")
+    redis_matrix = plan.get("redis_matrix", {"include": []})
+    if not isinstance(redis_matrix, dict) or not isinstance(redis_matrix.get("include"), list) or not (matrix["include"] or redis_matrix["include"]):
         raise ValueError("Empty/invalid publication matrix")
     expected = set()
     for row in matrix["include"]:
@@ -83,14 +101,32 @@ def validate_plan(plan, manifests, tag, repository, commit):
         previous = row.get("previous_version")
         if previous is not None and (not isinstance(previous, str) or not re.fullmatch(r"8\.[2-5]\.(?:0|[1-9][0-9]*)", previous) or not previous.startswith(row["php_series"] + ".")):
             raise ValueError("Invalid previous published version")
-        identity = (version, row["target"], row["profile"], row["architecture"])
+        identity = ("php", version, row["target"], row["profile"], row["architecture"])
+        if identity in expected:
+            raise ValueError("Duplicate publication matrix row")
+        expected.add(identity)
+    for row in redis_matrix["include"]:
+        if (not isinstance(row, dict) or not isinstance(row.get("redis_version"), str)
+                or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", row["redis_version"])
+                or row.get("target") not in {"glibc", "musl"} or row.get("architecture") != "x86_64" or "profile" in row):
+            raise ValueError("Invalid Redis publication matrix")
+        previous = row.get("previous_version")
+        if previous is not None and previous != row["redis_version"]:
+            raise ValueError("Invalid previous Redis version")
+        identity = ("redis", row["redis_version"], row["target"], None, row["architecture"])
         if identity in expected:
             raise ValueError("Duplicate publication matrix row")
         expected.add(identity)
     actual = set()
     for manifest in manifests:
         try:
-            identity = (manifest["php"]["version"], manifest["target"], manifest["profile"], manifest["architecture"])
+            runtime = manifest["runtime"]
+            if runtime == "php":
+                identity = (runtime, manifest["php"]["version"], manifest["target"], manifest["profile"], manifest["architecture"])
+            elif runtime == "redis" and "profile" not in manifest:
+                identity = (runtime, manifest["redis"]["version"], manifest["target"], None, manifest["architecture"])
+            else:
+                raise ValueError("Invalid planned runtime")
             builder_commit = manifest["builder"]["commit"]
         except (KeyError, TypeError) as error:
             raise ValueError("Missing planned bundle metadata") from error
@@ -102,6 +138,27 @@ def validate_plan(plan, manifests, tag, repository, commit):
 
 
 def release_notes(manifests, repository, commit, plan=None):
+    php_manifests = [manifest for manifest in manifests if manifest.get("runtime") == "php"]
+    redis_manifests = [manifest for manifest in manifests if manifest.get("runtime") == "redis"]
+    if redis_manifests:
+        lines = ["# DevStack runtime bundles", "", "Verified PHP and/or Redis archives from the exact build plan.", ""]
+        if php_manifests:
+            lines.append(release_notes(php_manifests, repository, commit, plan))
+        lines += ["## Redis native bundles", "", "No profiles; Redis core built with native compilers, without Docker or TLS.", "",
+                  "| Redis | Target | Architecture | Minimum glibc | Build ID |", "| --- | --- | --- | --- | --- |"]
+        for manifest in sorted(redis_manifests, key=lambda m: (tuple(map(int, m["redis"]["version"].split("."))), m["target"])):
+            floor = manifest.get("libc", {}).get("minimum_version") or "Fully static musl"
+            if not isinstance(floor, str) or (manifest["target"] == "glibc" and not re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", floor)):
+                raise ValueError("Invalid Redis libc requirement")
+            lines.append("| " + " | ".join((manifest["redis"]["version"], manifest["target"], manifest["architecture"], floor, manifest["build_id"])) + " |")
+        lines += ["", "- Binaries: `redis-server`, `redis-cli`, `redis-benchmark`, `redis-sentinel`, `redis-check-rdb`, `redis-check-aof`.",
+                  "- Redis glibc compatibility is the actual manifest requirement, not the PHP baseline.",
+                  "- Verify SHA-256 before extraction; retain upstream source archives and license notices.",
+                  "- This release does not configure or start Redis in DevStack.",
+                  f"- Builder commit: https://github.com/{repository}/commit/{commit}"]
+        if plan:
+            lines.append(f'- Workflow: https://github.com/{repository}/actions/runs/{plan["run_id"]} (attempt {plan["run_attempt"]})')
+        return "\n".join(lines) + "\n"
     lines = ["# PHP runtime bundles", "", "Verified PHP CLI/FPM archives built from the selected stable patches.", "",
              "## Included bundles", "", "| PHP | Previous published patch | Target | Profile | Architecture | Build ID |",
              "| --- | --- | --- | --- | --- | --- |"]

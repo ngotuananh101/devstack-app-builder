@@ -5,8 +5,10 @@ import unittest
 from test_build import REPO
 
 
+import fnmatch
 import hashlib
 import io
+import itertools
 import json
 import os
 import re
@@ -19,6 +21,27 @@ from test_build import load
 
 
 class WorkflowContracts(unittest.TestCase):
+    def test_manual_inputs_do_not_allow_runtime_series_or_libc_narrowing(self):
+        workflow = (REPO / ".github/workflows/build.yml").read_text()
+        inputs = workflow.split("    inputs:\n", 1)[1].split("\npermissions:", 1)[0]
+        names = re.findall(r"^      ([a-z_]+):$", inputs, re.MULTILINE)
+        self.assertEqual(set(names), {"profile", "publish", "release_tag"})
+        planner = workflow.split("  plan:\n", 1)[1].split("  build-php:\n", 1)[0]
+        self.assertNotIn("inputs.php_version", planner)
+        self.assertNotIn("inputs.target", planner)
+        self.assertIn("scripts/updates.py", planner)
+        self.assertIn("redis_matrix:", planner)
+        self.assertIn("  build-redis:\n", workflow, "Missing native Redis build job")
+        redis = workflow.split("  build-redis:\n", 1)[1].split("  publish:\n", 1)[0]
+        self.assertIn('./build.sh redis "$BUILD_TARGET" "$BUILD_VERSION"', redis)
+        self.assertNotIn("BUILD_PROFILE", redis)
+        self.assertNotIn("docker", redis.lower())
+        publish = workflow.split("  publish:\n", 1)[1]
+        self.assertIn("needs: [plan, build-php, build-redis]", publish)
+        self.assertIn("always()", publish)
+        self.assertIn("needs.build-redis.result", publish)
+        self.assertIn("pattern: runtime-*", publish)
+
     def test_daily_schedule_leads_catalog_by_more_than_two_hours(self):
         workflow = (REPO / ".github/workflows/build.yml").read_text()
         schedule = workflow.split("  schedule:\n", 1)[1].split("  workflow_dispatch:", 1)[0]
@@ -112,54 +135,93 @@ class WorkflowContracts(unittest.TestCase):
         schedule_default = re.search(r"PROFILE_INPUT: \$\{\{ inputs\.profile \|\| '(\w+)' \}\}", workflow)[1]
         plan_job = workflow.split("  plan:\n", 1)[1].split("  build-php:\n", 1)[0]
         command = textwrap.dedent(plan_job.split("        run: |\n", 1)[1].split("      - name:", 1)[0])
-        planner = load("updates")
+        from test_runtime_updates import load_planner
+        planner = load_planner()
         upstream = {"8.5": "8.5.1", "8.4": "8.4.10", "8.3": "8.3.2", "8.2": "8.2.3"}
         from test_updates import REPOSITORY
-        scenarios = (("schedule", schedule_default, "full", False), ("workflow_dispatch", manual_default, "full", False),
-                     ("workflow_dispatch", "minimal", "minimal", False), ("schedule", schedule_default, "full", True))
-        for event, profile, expected, current in scenarios:
-            with self.subTest(event=event, current=current), tempfile.TemporaryDirectory() as tmp:
+        scenarios = (("schedule", schedule_default, "full", False, False, 8, 6),
+                     ("workflow_dispatch", manual_default, "full", True, True, 8, 6),
+                     ("workflow_dispatch", "minimal", "minimal", False, False, 8, 6),
+                     ("schedule", schedule_default, "full", True, False, 0, 6),
+                     ("schedule", schedule_default, "full", False, True, 8, 0),
+                     ("schedule", schedule_default, "full", True, True, 0, 0))
+        for event, profile, expected, php_current, redis_current, php_count, redis_count in scenarios:
+            with self.subTest(event=event, php_current=php_current, redis_current=redis_current), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 output = root / "output"
-                history = {(series, target, "full", "x86_64"): version for series, version in upstream.items() for target in ("glibc", "musl")} if current else {}
-                env = {**os.environ, "PHP_VERSION_INPUT": "all", "TARGET_INPUT": "both", "PROFILE_INPUT": profile,
-                       "PUBLISH": "false", "RELEASE_TAG": "", "GITHUB_OUTPUT": str(output), "GITHUB_EVENT_NAME": event,
-                       "GITHUB_REPOSITORY": REPOSITORY, "GITHUB_SHA": "a" * 40, "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}
-                # Execute the workflow's real planner entry point with only network I/O controlled.
+                history = {(series, target, "full", "x86_64"): version for series, version in upstream.items() for target in ("glibc", "musl")} if php_current else {}
+                redis_history = {(version, target, "x86_64"): version for version in ("8.10.3", "7.4.12", "7.2.17") for target in ("glibc", "musl")} if redis_current else {}
+                env = {**os.environ, "PROFILE_INPUT": profile, "PUBLISH": "false", "RELEASE_TAG": "",
+                       "GITHUB_OUTPUT": str(output), "GITHUB_EVENT_NAME": event, "GITHUB_REPOSITORY": REPOSITORY,
+                       "GITHUB_SHA": "a" * 40, "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}
+                # Execute the workflow's planner entry point; control only upstream/public network data.
                 args = __import__("shlex").split(command.strip())
-                self.assertEqual(args[:2], ["python3", "-I"])
-                self.assertEqual(args[2], "runtimes/php/scripts/updates.py")
-                with patch.dict(os.environ, env, clear=True), patch("sys.argv", args[2:]), patch.object(planner, "latest_php", side_effect=upstream.__getitem__), patch.object(planner, "published_versions", return_value=history), patch.object(Path, "cwd", return_value=root):
-                    # The CLI's output paths are deliberately rooted in the temporary workspace.
-                    argv = args[2:]
-                    argv[argv.index("--output") + 1] = str(root / "php-update-plan.json")
-                    argv[argv.index("--github-output") + 1] = str(output)
-                    with patch("sys.argv", argv):
-                        planner.main()
-                policy = json.loads((root / "php-update-plan.json").read_text())
+                self.assertEqual(args[:3], ["python3", "-I", "scripts/updates.py"])
+                argv = args[2:]
+                argv[argv.index("--output") + 1] = str(root / "runtime-update-plan.json")
+                argv[argv.index("--github-output") + 1] = str(output)
+                with patch.dict(os.environ, env, clear=True), patch("sys.argv", argv), patch.object(planner.php, "latest_php", side_effect=upstream.__getitem__), patch.object(planner.php, "published_versions", return_value=history), patch.object(planner, "published_redis", return_value=redis_history):
+                    planner.main()
+                policy = json.loads((root / "runtime-update-plan.json").read_text())
                 outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
                 rows = policy["matrix"]["include"]
-                self.assertEqual(outputs["has_updates"], "false" if current else "true")
-                self.assertEqual(outputs["publish"], "true" if event == "schedule" and not current else "false")
+                self.assertEqual(outputs["has_updates"], "true" if php_count or redis_count else "false")
+                self.assertEqual(outputs["has_php_updates"], "true" if php_count else "false")
+                self.assertEqual(outputs["has_redis_updates"], "true" if redis_count else "false")
+                self.assertEqual(outputs["publish"], "true" if event == "schedule" and (php_count or redis_count) else "false")
                 self.assertEqual(json.loads(outputs["matrix"]), policy["matrix"])
-                self.assertEqual(len(rows), 0 if current else 8)
-                if not current:
+                self.assertEqual(json.loads(outputs["redis_matrix"]), policy["redis_matrix"])
+                self.assertEqual(len(rows), php_count)
+                self.assertEqual(len(policy["redis_matrix"]["include"]), redis_count)
+                if rows:
                     self.assertEqual({row["profile"] for row in rows}, {expected})
                     self.assertEqual({row["php_version"] for row in rows}, {"8.5.1", "8.4.10", "8.3.2", "8.2.3"})
                     self.assertEqual({row["target"] for row in rows}, {"glibc", "musl"})
 
     def test_noop_matrix_and_publication_are_gated_by_persisted_plan(self):
         workflow = (REPO / ".github/workflows/build.yml").read_text()
-        build = workflow.split("  build-php:\n", 1)[1].split("  publish:\n", 1)[0]
+        php = workflow.split("  build-php:\n", 1)[1].split("  build-redis:\n", 1)[0]
         publish = workflow.split("  publish:\n", 1)[1]
-        self.assertIn("if: needs.plan.outputs.has_updates == 'true'", build)
-        self.assertIn("needs: [plan, build-php]", publish)
-        self.assertIn("if: needs.plan.outputs.publish == 'true'", publish)
-        self.assertIn("name: runtime-update-plan", publish)
-        self.assertIn("--plan dist/plans/php-update-plan.json", publish)
+        self.assertIn("if: needs.plan.outputs.has_php_updates == 'true'", php)
+        self.assertIn("needs: [plan, build-php, build-redis]", publish)
+        self.assertIn("name: publication-plan", publish)
+        self.assertIn("--plan dist/plans/runtime-update-plan.json", publish)
         self.assertIn("group: runtime-build-publication", workflow)
         self.assertIn("cancel-in-progress: false", workflow)
         self.assertIn("GH_TOKEN: ${{ github.token }}", workflow.split("  plan:\n", 1)[1])
+
+    def test_publish_gate_allows_only_successful_selected_builds(self):
+        workflow = (REPO / ".github/workflows/build.yml").read_text()
+        publish = workflow.split("  publish:\n", 1)[1]
+        match = re.search(r"^    if: >-\n((?:^      .*\n)+)", publish, re.MULTILINE)
+        self.assertIsNotNone(match, "Publication needs an explicit skip-safe success gate")
+        expression = " ".join(line.strip() for line in match[1].splitlines())
+        expression = expression.removeprefix("${{").removesuffix("}}").strip()
+        # Evaluate our emitted boolean expression over the entire small state space.
+        states = ("success", "failure", "cancelled", "skipped")
+        for cancelled, plan_result, publish_enabled, php_selected, redis_selected, php_result, redis_result in itertools.product((False, True), states, (False, True), (False, True), (False, True), states, states):
+            expected = (not cancelled and plan_result == "success" and publish_enabled
+                        and php_result == ("success" if php_selected else "skipped")
+                        and redis_result == ("success" if redis_selected else "skipped"))
+            values = {"needs.plan.result": plan_result, "needs.plan.outputs.publish": str(publish_enabled).lower(),
+                      "needs.plan.outputs.has_php_updates": str(php_selected).lower(),
+                      "needs.plan.outputs.has_redis_updates": str(redis_selected).lower(),
+                      "needs.build-php.result": php_result, "needs.build-redis.result": redis_result}
+            candidate = expression.replace("always()", "True").replace("!cancelled()", repr(not cancelled))
+            for name, value in values.items():
+                candidate = candidate.replace(name, repr(value))
+            candidate = candidate.replace("&&", " and ").replace("||", " or ")
+            self.assertEqual(eval(candidate, {"__builtins__": {}}, {}), expected, values)
+
+    def test_asset_download_pattern_excludes_the_publication_plan(self):
+        workflow = (REPO / ".github/workflows/build.yml").read_text()
+        plan_job = workflow.split("  plan:\n", 1)[1].split("  build-php:\n", 1)[0]
+        publish = workflow.split("  publish:\n", 1)[1]
+        pattern = re.search(r"^          pattern: (.+)$", publish, re.MULTILINE)[1]
+        plan_name = re.search(r"^          name: (.+)$", plan_job, re.MULTILINE)[1]
+        for artifact in ("runtime-php-8.4.10-glibc-full-x86_64", "runtime-redis-8.10.3-musl-x86_64"):
+            self.assertTrue(fnmatch.fnmatchcase(artifact, pattern))
+        self.assertFalse(fnmatch.fnmatchcase(plan_name, pattern), "Plan JSON must not be merged into bundle assets")
 
     def test_ci_uploads_verified_archives_and_exposes_full(self):
         workflow = (REPO / ".github/workflows/build.yml").read_text()
