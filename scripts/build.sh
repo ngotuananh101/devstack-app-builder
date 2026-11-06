@@ -25,6 +25,8 @@ usage() {
   echo "  ./build.sh php glibc full 8.4"
   echo "  ./build.sh php musl full 8.3"
   echo "  ./build.sh php 8.2 glibc minimal"
+  echo "  ./build.sh redis musl 8.10.3"
+  echo "  ./build.sh redis glibc 8.10.3"
   exit 1
 }
 

@@ -7,6 +7,7 @@ dist/
 *.log
 
 # Temporary and editor files
+.claude/
 .DS_Store
 .idea/
 .vscode/

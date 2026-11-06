@@ -1,6 +1,15 @@
 # DevStack Runtime Builder
 
-Build Linux x86_64 standalone PHP CLI/FPM bundles for DevStack. Consumers download versioned archives rather than compiling locally. Supported PHP series: **8.5, 8.4 (default), 8.3, 8.2**.
+Build Linux x86_64 standalone PHP CLI/FPM bundles and native Redis core binaries for DevStack. Consumers download versioned archives rather than compiling locally. Supported PHP series: **8.5, 8.4 (default), 8.3, 8.2**.
+
+Redis source builds support **musl (fully static, default)** and **glibc**, without Docker or profiles:
+
+```bash
+./build.sh redis musl 8.10.3
+./build.sh redis glibc 8.10.3
+```
+
+Native Redis dependencies must already be installed; the builder never installs host packages. See [Redis build contracts](docs/runtimes/redis.md).
 
 > The new SPC-built bundle matrix has not yet passed a real CI run. Local shell contracts and preinstalled PHP tests do not establish production artifact readiness.
 
@@ -83,6 +92,7 @@ Scheduled builds automatically publish after **all selected bundles** pass. The 
 
 ## Documentation
 
+- [Redis native builds and artifact contracts](docs/runtimes/redis.md)
 - [PHP architecture, launcher/manifest/download contracts](docs/runtimes/php.md)
 - [Runtime module](runtimes/php/README.md)
 - [Builder framework](docs/architecture.md)

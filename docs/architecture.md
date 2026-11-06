@@ -50,6 +50,7 @@ Every runtime directory under `runtimes/<name>` adheres to the following contrac
 
 ## Supported Runtimes
 
+- [Redis](runtimes/redis.md): Native Linux x86_64 source builds, fully static musl or native glibc with an actual ELF-derived libc floor; no profiles, Docker or service configuration.
 - [PHP (8.5, 8.4, 8.3, 8.2)](runtimes/php.md): Dual-target distribution (GNU/glibc hybrid with dynamic `.so` extension loading, and musl fully static binary) with independent CLI and FPM SAPI support. Custom PHP versions can be specified at build time.
 
 ## Adding New Runtimes
