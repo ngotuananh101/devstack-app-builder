@@ -236,5 +236,190 @@ class PostgreSQLCLITests(unittest.TestCase):
                 self.assertNotEqual(run.returncode, 0)
 
 
+class PostgreSQLModulesTests(unittest.TestCase):
+    def setUp(self):
+        self.assertTrue((SCRIPTS / "modules.py").is_file(), "PostgreSQL modules module is missing")
+        self.modules = module("modules")
+
+    def test_inventory_separates_kinds_by_what_is_on_disk(self):
+        # fixture install tree: extension/hstore.control + lib/hstore.so  -> sql
+        #                      lib/auto_explain.so only              -> preload
+        #                      lib/utf8_and_euc_jp.so only            -> shared
+        #                      bin/oid2name                           -> cli
+        #                      bin/pg_dump                            -> not a module
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "share/extension").mkdir(parents=True)
+            (root / "lib").mkdir(parents=True)
+            (root / "bin").mkdir(parents=True)
+
+            (root / "share/extension/hstore.control").write_text("default_version = '1.8'\n")
+            (root / "lib/hstore.so").write_bytes(b"\x7fELF")
+            (root / "lib/auto_explain.so").write_bytes(b"\x7fELF")
+            (root / "lib/utf8_and_euc_jp.so").write_bytes(b"\x7fELF")
+            (root / "bin/oid2name").write_bytes(b"\x7fELF")
+            (root / "bin/pg_dump").write_bytes(b"\x7fELF")
+
+            inv = self.modules.inventory(root)
+            self.assertEqual(inv, [
+                {"name": "oid2name", "kind": "cli"},
+                {"name": "auto_explain", "kind": "preload"},
+                {"name": "utf8_and_euc_jp", "kind": "shared"},
+                {"name": "hstore", "kind": "sql"},
+            ])
+
+    def test_inventory_reads_the_staged_tree_the_same_way(self):
+        # the same fixture, restaged: bin/<cmd> are shell launchers and the ELFs
+        # live in libexec/bin/. inventory() must return the identical list, which a
+        # rule keyed on "an ELF in bin/" would not.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "share/extension").mkdir(parents=True)
+            (root / "lib").mkdir(parents=True)
+            (root / "bin").mkdir(parents=True)
+            (root / "libexec/bin").mkdir(parents=True)
+
+            (root / "share/extension/hstore.control").write_text("default_version = '1.8'\n")
+            (root / "lib/hstore.so").write_bytes(b"\x7fELF")
+            (root / "lib/auto_explain.so").write_bytes(b"\x7fELF")
+            (root / "lib/utf8_and_euc_jp.so").write_bytes(b"\x7fELF")
+            (root / "bin/oid2name").write_text("#!/bin/sh\nexec ...\n")
+            (root / "bin/pg_dump").write_text("#!/bin/sh\nexec ...\n")
+            (root / "libexec/bin/oid2name").write_bytes(b"\x7fELF")
+            (root / "libexec/bin/pg_dump").write_bytes(b"\x7fELF")
+
+            inv = self.modules.inventory(root)
+            self.assertEqual(inv, [
+                {"name": "oid2name", "kind": "cli"},
+                {"name": "auto_explain", "kind": "preload"},
+                {"name": "utf8_and_euc_jp", "kind": "shared"},
+                {"name": "hstore", "kind": "sql"},
+            ])
+
+    def test_preload_list_matches_the_servers_own_support_objects(self):
+        # The preload set is closed and explicit; anything else with a .so and no
+        # .control must fall into "shared", never "preload".
+        self.assertEqual(self.modules.PRELOAD_ONLY,
+                         frozenset({"auth_delay", "auto_explain", "basebackup_to_shell",
+                                    "basic_archive", "passwordcheck", "pg_overexplain"}))
+        self.assertEqual(self.modules.CLI_ONLY, frozenset({"oid2name", "vacuumlo"}))
+
+    def test_eighteen_expects_the_modules_the_configure_flags_enable(self):
+        expected = self.modules.load_expected("18")
+        # Gated on configure flags, so their absence would be a silent capability loss.
+        for name in ("pgcrypto", "sslinfo", "uuid-ossp", "xml2", "plpgsql", "hstore", "citext"):
+            with self.subTest(name=name):
+                self.assertIn(name, expected["sql"])
+        # Preload-only modules have no .control and exist in 18 only.
+        self.assertIn("pg_overexplain", expected["preload"])
+        self.assertNotIn("pg_overexplain", expected["sql"])
+
+    def test_compare_reports_both_missing_and_unexpected(self):
+        # compare() must name each discrepancy; an empty list only when equal
+        inventory = [
+            {"name": "hstore", "kind": "sql"},
+            {"name": "surprise", "kind": "shared"},
+            {"name": "auto_explain", "kind": "shared"},
+        ]
+        expected = {
+            "sql": ["hstore", "pgcrypto"],
+            "preload": ["auto_explain"],
+            "shared": [],
+            "cli": [],
+        }
+        diff = self.modules.compare(inventory, expected)
+        self.assertEqual(diff, [
+            "missing sql: pgcrypto",
+            "unexpected shared: surprise",
+            "wrong kind: auto_explain is shared, expected preload",
+        ])
+        matching_inventory = [
+            {"name": "auto_explain", "kind": "preload"},
+            {"name": "hstore", "kind": "sql"},
+        ]
+        matching_expected = {
+            "sql": ["hstore"],
+            "preload": ["auto_explain"],
+            "shared": [],
+            "cli": [],
+        }
+        self.assertEqual(self.modules.compare(matching_inventory, matching_expected), [])
+
+    def test_exclusions_carry_a_reason(self):
+        for name in ("plperl", "plpython3u", "sepgsql"):
+            self.assertIn(name, self.modules.EXCLUSIONS)
+            self.assertTrue(self.modules.EXCLUSIONS[name].strip())
+
+    def test_seventeen_expects_no_pg_overexplain(self):
+        expected17 = self.modules.load_expected("17")
+        self.assertNotIn("pg_overexplain", expected17["preload"])
+        self.assertNotIn("pg_overexplain", expected17["sql"])
+
+    def test_load_expected_rejects_unsupported_majors(self):
+        for major in ("16", "19", "18.6", "", "latest"):
+            with self.subTest(major=major), self.assertRaises(ValueError):
+                self.modules.load_expected(major)
+
+    def test_kinds_constant_order(self):
+        self.assertEqual(self.modules.KINDS, ("sql", "preload", "cli", "shared"))
+
+    def test_inventory_supports_extension_directory_fallback(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "extension").mkdir(parents=True)
+            (root / "extension/hstore.control").write_text("default_version = '1.8'\n")
+            inv = self.modules.inventory(root)
+            self.assertEqual(inv, [{"name": "hstore", "kind": "sql"}])
+
+    def test_compare_accepts_list_shaped_expected(self):
+        inventory = [{"name": "hstore", "kind": "sql"}]
+        expected = [{"name": "hstore", "kind": "sql"}]
+        self.assertEqual(self.modules.compare(inventory, expected), [])
+
+    def test_load_expected_rejects_unsorted_and_invalid_names(self):
+        with tempfile.TemporaryDirectory() as temp:
+            bad_config = Path(temp) / "modules.json"
+            # Unsorted list
+            bad_config.write_text(json.dumps({
+                "18": {
+                    "sql": ["xml2", "amcheck"],
+                    "preload": [],
+                    "shared": [],
+                    "cli": [],
+                }
+            }))
+            old_config = self.modules.CONFIG
+            try:
+                self.modules.CONFIG = bad_config
+                with self.assertRaises(ValueError):
+                    self.modules.load_expected("18")
+
+                # Invalid character (uppercase)
+                bad_config.write_text(json.dumps({
+                    "18": {
+                        "sql": ["BadName"],
+                        "preload": [],
+                        "shared": [],
+                        "cli": [],
+                    }
+                }))
+                with self.assertRaises(ValueError):
+                    self.modules.load_expected("18")
+
+                # Duplicate across kinds
+                bad_config.write_text(json.dumps({
+                    "18": {
+                        "sql": ["hstore"],
+                        "preload": ["hstore"],
+                        "shared": [],
+                        "cli": [],
+                    }
+                }))
+                with self.assertRaises(ValueError):
+                    self.modules.load_expected("18")
+            finally:
+                self.modules.CONFIG = old_config
+
+
 if __name__ == "__main__":
     unittest.main()
