@@ -8,6 +8,7 @@ dist/
 
 # Temporary and editor files
 .claude/
+.local/
 .DS_Store
 .idea/
 .vscode/
