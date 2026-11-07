@@ -3,7 +3,9 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -11,6 +13,67 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "runtimes/postgresql/scripts"
+HOST_LOADER = Path("/lib64/ld-linux-x86-64.so.2")
+
+# Prints its message with raw syscalls only: no libc, no GLIBC_* version
+# requirement, so the glibc host loader can run a binary that carries a musl
+# PT_INTERP. That is what lets these tests exercise the real readelf contract
+# and the loader indirection on a host that has no musl.
+FIXTURE_SOURCE = """\
+#ifndef MSG
+#define MSG "postgres (PostgreSQL) 18.6\\n"
+#endif
+
+static long call(long number, long first, long second, long third)
+{
+\tlong result;
+\t__asm__ volatile ("syscall"
+\t                  : "=a" (result)
+\t                  : "a" (number), "D" (first), "S" (second), "d" (third)
+\t                  : "rcx", "r11", "memory");
+\treturn result;
+}
+
+void _start(void)
+{
+\tstatic const char message[] = MSG;
+\tcall(1, 1, (long) message, (long) (sizeof message - 1));
+\tcall(60, 0, 0, 0);
+\t__builtin_unreachable();
+}
+"""
+
+
+def sha256_file(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def build_elf(root, destination, needed=("libpq.so.5",), search=None, message=None):
+    """Compile a musl-interp executable that needs no libc to run."""
+    source = Path(root) / "fixture.c"
+    if not source.exists():
+        source.write_text(FIXTURE_SOURCE)
+    command = ["cc", "-nostdlib", "-fno-stack-protector",
+               "-Wl,--dynamic-linker=/lib/ld-musl-x86_64.so.1", "-Wl,-e,_start",
+               "-Wl,--no-as-needed"]
+    if message is not None:
+        command.append(f'-DMSG="{message}"')
+    command.extend(["-o", str(destination), str(source)])
+    search = Path(search) if search is not None else destination.parent
+    command.append(f"-L{search}")
+    command.extend(f"-l:{name}" for name in needed)
+    subprocess.run(command, check=True, capture_output=True)
+    return destination
+
+
+def build_library(destination, soname):
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    source = destination.parent / (soname + ".c")
+    source.write_text("int fixture(void) { return 1; }\n")
+    subprocess.run(["cc", "-shared", "-nostdlib", "-fPIC", "-Wl,-soname," + soname,
+                    "-o", str(destination), str(source)], check=True, capture_output=True)
+    return destination
 
 
 def module(name):
@@ -744,6 +807,528 @@ class PostgreSQLToolchainTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.toolchain.write_provenance(path, {"deps_prefix": "/other"})
             self.assertEqual(json.loads(path.read_text()), {"deps_prefix": "/work/deps"})
+
+
+class PostgreSQLBundleTests(unittest.TestCase):
+    """Staging a launcher-wrapped bundle and the manifest that describes it."""
+
+    def setUp(self):
+        self.assertTrue((SCRIPTS / "bundle.py").is_file(), "PostgreSQL bundle module is missing")
+        self.bundle = module("bundle")
+        self.modules = module("modules")
+        self.launchers = module("launchers")
+
+    # -- ELF contract -------------------------------------------------------
+
+    def test_elf_contract_requires_dynamic_musl_without_rpath(self):
+        row = self.bundle.parse_elf(
+            "Class: ELF64\nMachine: Advanced Micro Devices X86-64\n",
+            "[Requesting program interpreter: /lib/ld-musl-x86_64.so.1]",
+            " (NEEDED)  Shared library: [libpq.so.5]\n (NEEDED)  Shared library: [ld-musl-x86_64.so.1]",
+            "")
+        self.assertEqual(row["needed"], ["libpq.so.5", "ld-musl-x86_64.so.1"])
+        self.assertIsNone(row["rpath"])
+        self.assertIsNone(row["runpath"])
+        self.assertIsNone(row["glibc_required"])
+        self.assertEqual(row["interpreter"], "/lib/ld-musl-x86_64.so.1")
+        self.assertEqual(row["machine"], "Advanced Micro Devices X86-64")
+        self.assertNotIn("static", row)
+        self.assertNotIn("profile", row)
+
+    def test_elf_contract_rejects_rpath_glibc_and_static(self):
+        elf64 = "Class: ELF64\nMachine: Advanced Micro Devices X86-64\n"
+        progs = "[Requesting program interpreter: /lib/ld-musl-x86_64.so.1]"
+        needed = " (NEEDED)  Shared library: [libc.so]"
+        for header, program, dynamic, versions in [
+            (elf64, progs, " (RPATH)  Library rpath: [/usr/lib]", ""),
+            (elf64, progs, " (RUNPATH)  Library runpath: [/opt/lib]", ""),
+            (elf64, progs, needed, "GLIBC_2.34"),
+            (elf64, "", needed, ""),                       # static: no interpreter
+            (elf64, progs, "", ""),                        # nothing NEEDED
+            ("Class: ELF64\nMachine: AArch64\n", progs, needed, ""),
+            (elf64, "[Requesting program interpreter: /lib64/ld-linux-x86-64.so.2]", needed, ""),
+        ]:
+            with self.subTest(dynamic=dynamic, versions=versions), self.assertRaises(ValueError):
+                self.bundle.parse_elf(header, program, dynamic, versions)
+
+    def test_elf_runs_readelf_and_reports_the_real_contract(self):
+        if not shutil.which("cc") or not shutil.which("readelf"):
+            self.skipTest("ELF fixture compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            library = build_library(root / "libpq.so.5", "libpq.so.5")
+            binary = build_elf(root, root / "postgres", search=library.parent)
+            row = self.bundle.elf(binary)
+            self.assertEqual(row["interpreter"], "/lib/ld-musl-x86_64.so.1")
+            self.assertEqual(row["needed"], ["libpq.so.5"])
+            self.assertIsNone(row["rpath"])
+            self.assertIsNone(row["runpath"])
+            self.assertIsNone(row["glibc_required"])
+            self.assertIn("X86-64", row["machine"])
+
+            # A host-toolchain binary is not a musl-dynamic one.
+            (root / "glibc.c").write_text("int main(void) { return 0; }\n")
+            subprocess.run(["cc", "-o", str(root / "glibc"), str(root / "glibc.c")],
+                           check=True, capture_output=True)
+            with self.assertRaises(ValueError):
+                self.bundle.elf(root / "glibc")
+
+    def test_elf_reports_an_unreadable_file_instead_of_a_traceback(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaises(ValueError):
+                self.bundle.elf(Path(temp) / "missing")
+
+    # -- version through the loader ----------------------------------------
+
+    def test_binary_version_runs_through_the_loader(self):
+        if not shutil.which("cc") or not HOST_LOADER.is_file():
+            self.skipTest("ELF fixture compiler or host loader is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            build_library(root / "deps/libpq.so.5", "libpq.so.5")
+            stub = build_elf(root, root / "postgres", search=root / "deps",
+                             message="postgres (PostgreSQL) 18.6")
+            # The host's glibc loader stands in for the musl loader: both accept
+            # `--library-path`, so this exercises the indirection without musl.
+            loader = HOST_LOADER
+            self.assertEqual(
+                self.bundle.binary_version(stub, loader, f"{root / 'deps'}:{root}"), "18.6")
+            with self.assertRaises(ValueError):
+                self.bundle.require_version(stub, "17.11", loader, f"{root / 'deps'}:{root}")
+            self.assertEqual(
+                self.bundle.require_version(stub, "18.6", loader, f"{root / 'deps'}:{root}"),
+                "18.6")
+
+    def test_binary_version_never_executes_the_binary_directly(self):
+        # The raw ELF has a musl PT_INTERP and no host loader exists, so a
+        # direct exec would raise ENOENT; only the loader indirection works.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            binary = root / "postgres"
+            binary.write_text("#!/bin/sh\nprintf 'postgres (PostgreSQL) 18.6\\n'\n")
+            binary.chmod(0o755)
+            with self.assertRaises(ValueError):
+                self.bundle.binary_version(binary, Path(temp) / "no-such-loader", "/deps/lib")
+
+    def test_binary_version_rejects_output_without_a_version(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fake = root / "loader"
+            fake.write_text("#!/bin/sh\nprintf 'nothing useful\\n'\n")
+            fake.chmod(0o755)
+            with self.assertRaises(ValueError):
+                self.bundle.binary_version(root / "postgres", fake, "/deps/lib")
+
+    # -- stage -------------------------------------------------------------
+
+    def fixture(self, root):
+        """A synthetic install tree shaped like `install-world-bin` produced it.
+
+        The binaries NEEDED `libcrypto.so.3`, the one shared dependency, because
+        that is what the real build links and what the loader can resolve from
+        the dependency prefix at staging time.
+        """
+        install = root / "inst"
+        for directory in ("bin", "lib", "share/extension", "share/timezone",
+                          "share/tsearch_data", "share/doc/html", "include/server"):
+            (install / directory).mkdir(parents=True, exist_ok=True)
+        build_library(install / "lib/libpq.so.5", "libpq.so.5")
+        (install / "lib/libpq.so").symlink_to("libpq.so.5")
+        build_library(install / "lib/utf8_and_euc_jp.so", "utf8_and_euc_jp.so")
+        for command in ("postgres", "initdb", "pg_ctl", "psql", "pg_config",
+                        "pg_dump", "oid2name", "vacuumlo"):
+            build_elf(root, install / "bin" / command, needed=("libcrypto.so.3",),
+                      search=root / "shared")
+            (install / "bin" / command).chmod(0o755)
+        expected = self.modules.load_expected("18")
+        for name in expected["sql"]:
+            (install / "share/extension" / (name + ".control")).write_text(
+                f"comment = '{name}'\ndefault_version = '1.0'\n")
+        for name in expected["preload"]:
+            build_library(install / "lib" / (name + ".so"), name + ".so")
+        (install / "share/postgres.bki").write_text("# bki\n")
+        for sample in ("postgresql.conf.sample", "pg_hba.conf.sample",
+                       "pg_ident.conf.sample", "pg_service.conf.sample", "psqlrc.sample"):
+            (install / "share" / sample).write_text(f"# {sample}\n")
+        (install / "share/timezone/UTC").write_bytes(b"TZif")
+        (install / "share/doc/html/index.html").write_text("<html></html>\n")
+        (install / "include/server/postgres.h").write_text("/* server */\n")
+        return install
+
+    def provenance(self, root, install):
+        """A synthetic `$work/toolchain.json` plus the files it names."""
+        work = root / "work"
+        deps = work / "deps"
+        (deps / "lib").mkdir(parents=True, exist_ok=True)
+        (deps / "include").mkdir(parents=True, exist_ok=True)
+        # The root the fixture binaries link against; also the prefix the
+        # dependency records name, so staging finds them where the build put them.
+        (root / "shared").mkdir()
+        build_library(root / "shared/libcrypto.so.3", "libcrypto.so.3")
+        shutil.copy2(root / "shared/libcrypto.so.3", deps / "lib/libcrypto.so.3")
+        build_library(deps / "lib/libssl.so.3", "libssl.so.3")
+        (deps / "lib/libssl.so").symlink_to("libssl.so.3")
+        (deps / "lib/libcrypto.so").symlink_to("libcrypto.so.3")
+        (deps / "lib/libz.a").write_bytes(b"!<arch>\n")
+
+        loader_dir = work / "loader"
+        loader_dir.mkdir(parents=True)
+        # A real loader: it honours `--library-path` and can run the fixture
+        # binaries, whose PT_INTERP is the musl path this host does not have.
+        loader = loader_dir / "libc.so"
+        shutil.copy2(HOST_LOADER, loader)
+        loader.chmod(0o755)
+        loader_license = loader_dir / "COPYRIGHT"
+        loader_license.write_text("musl fixture copyright\n")
+
+        dependencies = []
+        for row in [{"name": "zlib", "version": "1.4", "linkage": "static", "spdx": "Zlib"},
+                    {"name": "openssl", "version": "3.6.5", "linkage": "shared", "spdx": "Apache-2.0"},
+                    {"name": "libxml2", "version": "2.15.4", "linkage": "static", "spdx": "MIT"},
+                    {"name": "icu", "version": "79.1", "linkage": "static", "spdx": "Unicode-3.0"},
+                    {"name": "util-linux", "version": "2.42.4", "linkage": "static",
+                     "spdx": "LGPL-2.1-or-later"}]:
+            licence = work / "licenses" / (row["name"] + ".txt")
+            licence.parent.mkdir(parents=True, exist_ok=True)
+            licence.write_text(f"licence for {row['name']}\n")
+            dependencies.append({**row, "sha256": "a" * 64,
+                                 "license": {"path": str(licence), "sha256": sha256_file(licence)}})
+
+        archive = work / "downloads" / "postgresql-18.6.tar.bz2"
+        archive.parent.mkdir(parents=True)
+        with tarfile.open(archive, "w:bz2") as tar:
+            info = tarfile.TarInfo("postgresql-18.6/COPYRIGHT")
+            payload = b"PostgreSQL fixture copyright\n"
+            info.size = len(payload)
+            tar.addfile(info, io.BytesIO(payload))
+
+        record = {
+            "zig": {"version": "0.17.1", "musl_version": "1.2.5",
+                    "sha256": "b" * 64, "license": "MIT"},
+            "deps_prefix": str(deps),
+            "loader": {"path": str(loader), "sha256": sha256_file(loader),
+                       "musl_version": "1.2.5",
+                       "license": {"path": str(loader_license),
+                                   "sha256": sha256_file(loader_license)}},
+            "dependencies": dependencies,
+            "configure_flags": ["--disable-rpath", "--with-ssl=openssl", "--with-icu"],
+            "locale": {"provider": "builtin", "default": "C.UTF-8",
+                       "alternate_18": "PG_UNICODE_FAST"},
+            "icu": {"decision": "with_icu", "reason": "zig c++ compiled ICU 79.1"},
+            "compiler": "zig cc -target x86_64-linux-musl",
+        }
+        (work / "request.json").write_text(json.dumps({
+            "version": "18.6", "major": "18", "target": "musl-dynamic",
+            "architecture": "x86_64",
+            "source": {"version": "18.6", "series": "18",
+                       "sha256": sha256_file(archive), "license": "PostgreSQL",
+                       "url": "https://ftp.postgresql.org/pub/source/v18.6/postgresql-18.6.tar.bz2",
+                       "checksum_source": "https://ftp.postgresql.org"},
+        }, indent=2))
+        return record
+
+    def request(self, root):
+        return json.loads((root / "work/request.json").read_text())
+
+    def stage(self, root, install, record, request):
+        return self.bundle.stage(install, root / "bundle", request, record, ROOT)
+
+    def test_stage_builds_the_documented_layout(self):
+        if not shutil.which("cc") or not shutil.which("readelf"):
+            self.skipTest("ELF fixture compiler is unavailable")
+        with tempfile.TemporaryDirectory(prefix="postgresql stage ") as temp:
+            root = Path(temp)
+            install = self.fixture(root)
+            record = self.provenance(root, install)
+            request = self.request(root)
+            output = root / "bundle"
+            manifest = self.bundle.stage(install, output, request, record, ROOT)
+            for relative in ("bin/postgres", "bin/initdb", "bin/pg_ctl", "bin/psql",
+                             "bin/pg_config", "libexec/bin/postgres",
+                             "libexec/bin/psql", "libexec/launch.sh",
+                             "lib/musl/ld-musl-x86_64.so.1", "lib/libssl.so.3",
+                             "lib/libcrypto.so.3", "lib/libpq.so.5",
+                             "lib/utf8_and_euc_jp.so",
+                             "share/postgres.bki", "share/postgresql.conf.sample",
+                             "share/licenses/builder.txt", "share/licenses/postgresql.txt",
+                             "share/licenses/musl.txt", "share/licenses/zlib.txt",
+                             "share/licenses/openssl.txt", "share/licenses/libxml2.txt",
+                             "share/licenses/icu.txt", "share/licenses/util-linux.txt",
+                             "share/sources/postgresql-18.6.tar.bz2", "manifest.json"):
+                self.assertTrue((output / relative).exists(), relative)
+            # share/doc is the one subtree dropped; include/ and the launcher
+            # scripts are kept.
+            self.assertFalse((output / "share/doc").exists())
+            self.assertTrue((output / "include/server/postgres.h").is_file())
+            self.assertFalse((output / "etc").exists())
+            self.assertEqual((output / "lib/musl/ld-musl-x86_64.so.1").stat().st_mode & 0o777, 0o755)
+            self.assertEqual((output / "libexec/bin/postgres").stat().st_mode & 0o777, 0o755)
+            self.assertEqual(self.launchers.commands(output), [])
+            # The staged loader is the built one, not a host loader.
+            self.assertEqual(sha256_file(output / "lib/musl/ld-musl-x86_64.so.1"),
+                             record["loader"]["sha256"])
+            # so.N symlinks survive so NEEDED names resolve.
+            self.assertTrue((output / "lib/libssl.so").is_symlink())
+
+            self.assertEqual(manifest["runtime"], "postgresql")
+            self.assertEqual(manifest["postgresql"], {"version": "18.6", "major": "18"})
+            self.assertEqual(manifest["target"], "musl-dynamic")
+            self.assertNotIn("profile", manifest)
+            self.assertEqual(manifest["verification"], "NOT_RUN")
+            self.assertEqual(manifest["schema_version"], 1)
+            self.assertEqual(manifest["architecture"], "x86_64")
+            self.assertEqual(manifest["linkage"], "dynamic")
+            self.assertRegex(manifest["build_id"], r"^[a-f0-9]{16}$")
+            self.assertEqual(manifest["loader"], {
+                "path": "lib/musl/ld-musl-x86_64.so.1",
+                "sha256": record["loader"]["sha256"],
+                "musl_version": "1.2.5"})
+            self.assertEqual(manifest["source_archive"],
+                             "share/sources/postgresql-18.6.tar.bz2")
+            self.assertEqual(manifest["licenses"], {
+                "builder": "share/licenses/builder.txt",
+                "postgresql": "share/licenses/postgresql.txt",
+                "musl": "share/licenses/musl.txt"})
+            self.assertEqual(json.loads((output / "manifest.json").read_text()), manifest)
+
+    def test_manifest_records_modules_and_locale_contract(self):
+        if not shutil.which("cc") or not shutil.which("readelf"):
+            self.skipTest("ELF fixture compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            install = self.fixture(root)
+            record = self.provenance(root, install)
+            request = self.request(root)
+            output = root / "bundle"
+            manifest = self.bundle.stage(install, output, request, record, ROOT)
+            kinds = {row["kind"] for row in manifest["modules"]["included"]}
+            self.assertEqual(kinds, {"sql", "preload", "shared", "cli"})
+            self.assertEqual(manifest["locale"],
+                             {"default_provider": "builtin", "default_locale": "C.UTF-8",
+                              "alternate": "PG_UNICODE_FAST"})
+            # The included set covers the expected `sql`, `preload` and `cli`
+            # modules exactly. `shared` is whatever `lib/*.so` turned out to be
+            # (libpq and the vendored OpenSSL libraries among them) and is
+            # reconciled after the real build, per the design.
+            expected = self.modules.load_expected(manifest["postgresql"]["major"])
+            for kind in ("sql", "preload", "cli"):
+                self.assertEqual(
+                    [r["name"] for r in manifest["modules"]["included"] if r["kind"] == kind],
+                    expected[kind], kind)
+            self.assertTrue(manifest["modules"]["included"])
+            self.assertEqual(manifest["modules"]["skipped"],
+                             [{"name": name, "reason": reason}
+                              for name, reason in sorted(self.modules.EXCLUSIONS.items())])
+            self.assertEqual(manifest["modules"]["included"],
+                             self.modules.inventory(output))
+
+    def test_manifest_records_libraries_binaries_and_provenance(self):
+        if not shutil.which("cc") or not shutil.which("readelf"):
+            self.skipTest("ELF fixture compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            install = self.fixture(root)
+            record = self.provenance(root, install)
+            request = self.request(root)
+            output = root / "bundle"
+            manifest = self.bundle.stage(install, output, request, record, ROOT)
+
+            openssl = [row for row in manifest["libraries"] if row["name"] == "openssl"][0]
+            self.assertEqual(openssl, {"name": "openssl", "version": "3.6.5",
+                                       "sha256": "a" * 64, "linkage": "shared",
+                                       "license": "share/licenses/openssl.txt"})
+            self.assertEqual([row["name"] for row in manifest["libraries"]],
+                             ["zlib", "openssl", "libxml2", "icu", "util-linux"])
+
+            binaries = {row["path"]: row for row in manifest["binaries"]}
+            self.assertEqual(sorted(binaries), sorted(
+                "libexec/bin/" + name for name in
+                ("postgres", "initdb", "pg_ctl", "psql", "pg_config", "pg_dump",
+                 "oid2name", "vacuumlo")))
+            for relative, row in binaries.items():
+                self.assertEqual(row["sha256"], sha256_file(output / relative), relative)
+                self.assertEqual(row["interpreter"], "/lib/ld-musl-x86_64.so.1", relative)
+                self.assertEqual(row["needed"], ["libcrypto.so.3"], relative)
+                self.assertIsNone(row["rpath"])
+                self.assertIsNone(row["runpath"])
+                self.assertIsNone(row["glibc_required"])
+                self.assertIn("X86-64", row["machine"])
+
+            self.assertEqual(manifest["provenance"], {
+                "upstream": {"url": request["source"]["url"],
+                             "sha256": request["source"]["sha256"]},
+                "configure_flags": record["configure_flags"],
+                "compiler": record["compiler"],
+                "zig": record["zig"]})
+            self.assertEqual(manifest["icu"], record["icu"])
+            self.assertEqual(manifest["builder"], {
+                "commit": subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+                                         text=True, capture_output=True, check=True).stdout.strip(),
+                "source_sha256": manifest["builder"]["source_sha256"]})
+            self.assertRegex(manifest["builder"]["source_sha256"], r"^[a-f0-9]{64}$")
+
+    def test_build_id_is_stable_for_the_same_inputs(self):
+        if not shutil.which("cc") or not shutil.which("readelf"):
+            self.skipTest("ELF fixture compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            install = self.fixture(root)
+            record = self.provenance(root, install)
+            request = self.request(root)
+            first = self.bundle.stage(install, root / "one", request, record, ROOT)
+            second = self.bundle.stage(install, root / "two", request, record, ROOT)
+            self.assertEqual(first["build_id"], second["build_id"])
+            other = dict(record, icu={"decision": "without_icu", "reason": "fallback"})
+            third = self.bundle.stage(install, root / "three", request, other, ROOT)
+            self.assertNotEqual(first["build_id"], third["build_id"])
+
+    def test_stage_refuses_an_existing_output(self):
+        if not shutil.which("cc") or not shutil.which("readelf"):
+            self.skipTest("ELF fixture compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            install = self.fixture(root)
+            record = self.provenance(root, install)
+            request = self.request(root)
+            (root / "bundle").mkdir()
+            with self.assertRaises(ValueError):
+                self.bundle.stage(install, root / "bundle", request, record, ROOT)
+
+    def test_stage_refuses_a_wrong_patch_before_creating_output(self):
+        if not shutil.which("cc") or not shutil.which("readelf"):
+            self.skipTest("ELF fixture compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            install = self.fixture(root)
+            record = self.provenance(root, install)
+            request = dict(self.request(root))
+            request["version"] = "17.11"
+            request["source"] = dict(request["source"], version="17.11", series="17")
+            with self.assertRaises(ValueError):
+                self.bundle.stage(install, root / "bundle", request, record, ROOT)
+            self.assertFalse((root / "bundle").exists())
+
+    def test_stage_refuses_a_missing_expected_module(self):
+        if not shutil.which("cc") or not shutil.which("readelf"):
+            self.skipTest("ELF fixture compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            install = self.fixture(root)
+            record = self.provenance(root, install)
+            request = self.request(root)
+            (install / "share/extension/hstore.control").unlink()
+            with self.assertRaisesRegex(ValueError, "hstore"):
+                self.bundle.stage(install, root / "bundle", request, record, ROOT)
+
+    def test_stage_refuses_a_changed_loader_or_archive(self):
+        if not shutil.which("cc") or not shutil.which("readelf"):
+            self.skipTest("ELF fixture compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            install = self.fixture(root)
+            record = self.provenance(root, install)
+            request = self.request(root)
+
+            loader = Path(record["loader"]["path"])
+            original = loader.read_bytes()
+            loader.write_bytes(original + b"tampered")
+            with self.assertRaisesRegex(ValueError, "loader"):
+                self.bundle.stage(install, root / "one", request, record, ROOT)
+            self.assertFalse((root / "one").exists())
+            loader.write_bytes(original)
+
+            archive = root / "work/downloads/postgresql-18.6.tar.bz2"
+            changed = archive.read_bytes() + b"tampered"
+            archive.write_bytes(changed)
+            with self.assertRaisesRegex(ValueError, "archive"):
+                self.bundle.stage(install, root / "two", request, record, ROOT)
+            self.assertFalse((root / "two").exists())
+
+    def test_stage_refuses_a_provenance_record_missing_a_key_it_reads(self):
+        # A truncated toolchain.json must name the missing key, not surface a
+        # KeyError from the middle of staging after the output exists.
+        if not shutil.which("cc") or not shutil.which("readelf"):
+            self.skipTest("ELF fixture compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            install = self.fixture(root)
+            record = self.provenance(root, install)
+            request = self.request(root)
+            for key in ("locale", "icu", "configure_flags", "compiler", "zig"):
+                with self.subTest(key=key):
+                    incomplete = {k: v for k, v in record.items() if k != key}
+                    with self.assertRaisesRegex(ValueError, key):
+                        self.bundle.stage(install, root / ("bundle " + key), request,
+                                          incomplete, ROOT)
+                    self.assertFalse((root / ("bundle " + key)).exists())
+
+    def test_stage_refuses_a_needed_library_it_did_not_bundle(self):
+        if not shutil.which("cc") or not shutil.which("readelf"):
+            self.skipTest("ELF fixture compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            install = self.fixture(root)
+            record = self.provenance(root, install)
+            request = self.request(root)
+            build_library(root / "shared/libunbundled.so.9", "libunbundled.so.9")
+            for command in ("postgres", "psql"):
+                build_elf(root, install / "bin" / command,
+                          needed=("libcrypto.so.3", "libunbundled.so.9"), search=root / "shared")
+            with self.assertRaisesRegex(ValueError, "libunbundled.so.9"):
+                self.bundle.stage(install, root / "bundle", request, record, ROOT)
+            self.assertFalse((root / "bundle").exists())
+
+    def test_stage_writes_a_manifest_that_verify_and_publish_can_read(self):
+        if not shutil.which("cc") or not shutil.which("readelf"):
+            self.skipTest("ELF fixture compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            install = self.fixture(root)
+            record = self.provenance(root, install)
+            request = self.request(root)
+            output = root / "bundle"
+            manifest = self.bundle.stage(install, output, request, record, ROOT)
+            self.assertEqual(set(manifest), {
+                "schema_version", "runtime", "postgresql", "target", "architecture",
+                "linkage", "build_id", "verification", "loader", "locale", "libraries",
+                "modules", "binaries", "source_archive", "licenses", "provenance",
+                "icu", "builder"})
+            self.assertEqual(list(manifest["postgresql"]), ["version", "major"])
+
+    def test_stage_cli_runs_end_to_end(self):
+        if not shutil.which("cc") or not shutil.which("readelf"):
+            self.skipTest("ELF fixture compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            install = self.fixture(root)
+            record = self.provenance(root, install)
+            self.request(root)
+            (root / "work/provenance.json").write_text(json.dumps(record, indent=2))
+            # Run the CLI the way build.sh does, with an isolated interpreter.
+            command = ["python3", "-I", str(SCRIPTS / "bundle.py"), "stage", str(install),
+                       str(root / "bundle"), str(root / "work/request.json"),
+                       str(root / "work/provenance.json"), str(ROOT)]
+            environment = {**os.environ, "PYTHONPATH": ""}
+            run = subprocess.run(command, text=True, capture_output=True, env=environment)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            manifest = json.loads((root / "bundle/manifest.json").read_text())
+            self.assertEqual(manifest["runtime"], "postgresql")
+            self.assertEqual(manifest["postgresql"], {"version": "18.6", "major": "18"})
+            # A second stage into the same output is refused, not merged.
+            again = subprocess.run(command, text=True, capture_output=True, env=environment)
+            self.assertNotEqual(again.returncode, 0)
+            self.assertIn("Refusing", again.stderr)
+
+    def test_build_script_stages_after_install_and_checks_provenance(self):
+        text = (SCRIPTS / "build.sh").read_text()
+        install = text.index("install-world-bin")
+        stage = text.index('bundle.py" stage')
+        self.assertLess(install, stage)
+        self.assertIn('"$work/toolchain.json"', text[install:stage])
+        self.assertIn("Staged bundle:", text[stage:])
+        self.assertIn('"$work/inst/usr/local/pgsql"', text[stage:])
+        self.assertIn('"$work/request.json"', text[stage:])
+        self.assertIn('"$REPO_ROOT"', text[stage:])
 
 
 if __name__ == "__main__":

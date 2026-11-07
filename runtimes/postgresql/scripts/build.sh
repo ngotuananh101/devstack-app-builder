@@ -61,4 +61,10 @@ mkdir -p "$work/build"
 )
 env "${environment[@]}" make -C "$work/build" -j "$jobs" world-bin
 env "${environment[@]}" make -C "$work/build" DESTDIR="$work/inst" install-world-bin
+# Task 4 writes this record; a build that skipped the write must say so here
+# rather than fail deep inside staging with a bare FileNotFoundError.
+[[ -f "$work/toolchain.json" ]] || { printf 'Missing provenance record: %s\n' "$work/toolchain.json" >&2; exit 1; }
+python3 -I "$RUNTIME_DIR/scripts/bundle.py" stage \
+  "$work/inst/usr/local/pgsql" "$bundle" "$work/request.json" "$work/toolchain.json" "$REPO_ROOT"
+printf 'Staged bundle: %s\n' "$bundle"
 printf 'PostgreSQL build workspace: %s\n' "$work"
