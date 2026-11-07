@@ -135,8 +135,8 @@ def binary_version(binary, loader, library_path):
 
     The binary's PT_INTERP is /lib/ld-musl-x86_64.so.1, which the build host is
     not required to have, so a direct exec would fail with ENOENT. Executing
-    `<loader> --library-path <deps>/lib:<loader dir> <binary> --version` is the
-    same mechanism the launcher uses, exercised one step before it exists.
+    `<loader> --library-path <install lib>:<deps>/lib:<loader dir> <binary> --version` is
+    the same mechanism the launcher uses, exercised one step before it exists.
     """
     binary = Path(binary)
     command = [str(loader), "--library-path", str(library_path), str(binary), "--version"]
@@ -188,11 +188,17 @@ def _archive_location(provenance, version):
     return Path(provenance["deps_prefix"]).parent / "downloads" / f"postgresql-{version}.tar.bz2"
 
 
-def _library_path(provenance):
-    """The two directories the launcher will search, resolved for this workspace."""
+def _library_path(provenance, install_root):
+    """The directories the shipped launcher will search, for this workspace.
+
+    `install_root/lib` comes first and is not optional: libpq is a shared
+    library of the install tree itself, so a frontend such as clusterdb
+    resolves its PQ* symbols from there. Omitting it fails with
+    "Error loading shared library libpq.so.5: No such file or directory".
+    """
     deps = Path(provenance["deps_prefix"])
     loader_dir = Path(provenance["loader"]["path"]).parent
-    return f"{deps / 'lib'}:{loader_dir}"
+    return f"{Path(install_root) / 'lib'}:{deps / 'lib'}:{loader_dir}"
 
 
 def _archive_member(archive, member, destination):
@@ -314,7 +320,7 @@ def stage(install_root, output, request, provenance, repo_root):
     commands_on_disk = launchers.commands(install_root)
     if not commands_on_disk:
         raise ValueError(f"No executables found under {install_root / 'bin'}")
-    library_path = _library_path(provenance)
+    library_path = _library_path(provenance, install_root)
     for command in commands_on_disk:
         require_version(install_root / "bin" / command, version,
                         loader_record["path"], library_path)

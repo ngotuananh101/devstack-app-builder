@@ -1122,6 +1122,46 @@ class PostgreSQLBundleTests(unittest.TestCase):
             self.assertEqual(manifest["modules"]["included"],
                              self.modules.inventory(output))
 
+    def test_stage_resolves_a_binary_against_the_install_trees_own_libraries(self):
+        # psql, clusterdb and every other frontend NEED libpq.so.5, which lives
+        # in the install tree's lib/, not in the vendored dependency prefix.
+        # Omitting it makes the loader report
+        # "Error loading shared library libpq.so.5: No such file or directory"
+        # and staging aborts on a green build.
+        if not shutil.which("cc") or not shutil.which("readelf"):
+            self.skipTest("ELF fixture compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            install = self.fixture(root)
+            record = self.provenance(root, install)
+            request = self.request(root)
+            for command in ("psql", "clusterdb"):
+                build_elf(root, install / "bin" / command, needed=("libpq.so.5",),
+                          search=install / "lib")
+                (install / "bin" / command).chmod(0o755)
+            manifest = self.bundle.stage(install, root / "bundle", request, record, ROOT)
+            self.assertIn({"path": "libexec/bin/clusterdb"},
+                          [{key: row[key] for key in ("path",)}
+                           for row in manifest["binaries"]])
+
+    def test_stage_refuses_a_binary_the_install_tree_cannot_resolve(self):
+        # The counterpart of the test above: a NEEDED library present in no
+        # searched directory must abort staging rather than be skipped, so the
+        # library path stays the real cause of a failure.
+        if not shutil.which("cc") or not shutil.which("readelf"):
+            self.skipTest("ELF fixture compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            install = self.fixture(root)
+            record = self.provenance(root, install)
+            request = self.request(root)
+            build_library(root / "shared/libnowhere.so.1", "libnowhere.so.1")
+            build_elf(root, install / "bin/orphan", needed=("libnowhere.so.1",),
+                      search=root / "shared")
+            (install / "bin/orphan").chmod(0o755)
+            with self.assertRaisesRegex(ValueError, "libnowhere.so.1"):
+                self.bundle.stage(install, root / "bundle", request, record, ROOT)
+
     def test_manifest_records_libraries_binaries_and_provenance(self):
         if not shutil.which("cc") or not shutil.which("readelf"):
             self.skipTest("ELF fixture compiler is unavailable")
