@@ -421,5 +421,162 @@ class PostgreSQLModulesTests(unittest.TestCase):
                 self.modules.CONFIG = old_config
 
 
+class PostgreSQLToolchainTests(unittest.TestCase):
+    def setUp(self):
+        self.assertTrue((SCRIPTS / "toolchain.py").is_file(), "PostgreSQL toolchain module is missing")
+        self.assertTrue((SCRIPTS.parent / "config/build-options.json").is_file(),
+                        "PostgreSQL build options are missing")
+        self.toolchain = module("toolchain")
+        self.options = self.toolchain.load_options(SCRIPTS.parent / "config/build-options.json")
+
+    def test_require_names_the_first_missing_tool(self):
+        self.toolchain.require(["python3"])
+        with self.assertRaisesRegex(ValueError, "definitely-not-installed"):
+            self.toolchain.require(["python3", "definitely-not-installed", "another-missing-tool"])
+
+    def test_configure_flags_always_disable_rpath_and_select_musl_safe_options(self):
+        flags = self.toolchain.configure_flags(self.options)
+        self.assertIn("--disable-rpath", flags)
+        self.assertIn("--with-ssl=openssl", flags)
+        self.assertNotIn("--enable-rpath", flags)
+        # Exactly one ICU decision, and it is `--with-icu` unless a recorded
+        # fallback changed the config file itself.
+        self.assertEqual(len([f for f in flags if "icu" in f]), 1)
+        self.assertEqual(len(flags), len(set(flags)))
+
+    def test_build_environment_keeps_musl_headers_first(self):
+        env = self.toolchain.build_env(Path("/zig"), Path("/deps"))
+        self.assertEqual(env["CC"], "/zig/zig cc -target x86_64-linux-musl")
+        self.assertEqual(env["CXX"], "/zig/zig c++ -target x86_64-linux-musl")
+        self.assertIn("-idirafter /usr/include", env["CPPFLAGS"])
+        self.assertNotIn("-I/usr/include", env["CPPFLAGS"])
+        self.assertTrue(env["PKG_CONFIG_PATH"].startswith("/deps"))
+        self.assertEqual(env["PKG_CONFIG_LIBDIR"], env["PKG_CONFIG_PATH"])
+
+    def test_build_environment_links_against_the_pinned_prefix_without_rpath(self):
+        env = self.toolchain.build_env(Path("/zig"), Path("/deps"))
+        self.assertEqual(env["PATH"], "/usr/bin:/bin")
+        self.assertEqual(env["LC_ALL"], "C")
+        self.assertEqual(env["SOURCE_DATE_EPOCH"], "0")
+        self.assertIn("-O2 -fPIC", env["CFLAGS"])
+        self.assertIn("-L/deps/lib", env["LDFLAGS"])
+        self.assertIn("-dynamic", env["LDFLAGS"])
+        self.assertNotIn("-static", env["LDFLAGS"])
+        self.assertNotIn("rpath", env["LDFLAGS"])
+
+    def test_zig_pin_is_checked_before_any_configure(self):
+        # A mismatched declared version must raise, not warn.
+        with tempfile.TemporaryDirectory() as temp:
+            zig_dir = Path(temp)
+            binary = zig_dir / "zig"
+            binary.write_text("#!/bin/sh\nprintf '0.14.0\\n'\n")
+            binary.chmod(0o755)
+            with self.assertRaisesRegex(ValueError, "0.17.1"):
+                self.toolchain.zig(zig_dir, self.options)
+            binary.write_text("#!/bin/sh\nprintf '0.17.1\\n'\n")
+            self.assertEqual(self.toolchain.zig(zig_dir, self.options), binary)
+
+    def test_musl_version_reads_the_toolchains_bundled_libc(self):
+        with tempfile.TemporaryDirectory() as temp:
+            zig_dir = Path(temp)
+            header = zig_dir / "lib/libc/musl/src/internal/version.h"
+            header.parent.mkdir(parents=True)
+            header.write_text('#define VERSION "1.2.5"\n')
+            self.assertEqual(self.toolchain.musl_version(zig_dir), "1.2.5")
+            header.write_text('#define VERSION "1.2.4"\n')
+            self.assertNotEqual(self.toolchain.musl_version(zig_dir), self.options["zig"]["musl_version"])
+
+    def test_uuid_and_libxml_select_the_vendored_libraries(self):
+        flags = self.toolchain.configure_flags(self.options)
+        self.assertIn("--with-uuid=e2fs", flags)
+        self.assertIn("--with-libxml", flags)
+        self.assertNotIn("--with-uuid=bsd", flags)
+
+    def test_build_options_hold_only_build_decisions(self):
+        raw = json.loads((SCRIPTS.parent / "config/build-options.json").read_text())
+        self.assertEqual(set(raw), {"zig", "configure", "locale"})
+        self.assertEqual(raw["zig"], {"version": "0.17.1", "musl_version": "1.2.5"})
+        self.assertEqual(raw["configure"]["cppflags"], "-D_GNU_SOURCE -idirafter /usr/include")
+        self.assertEqual(raw["configure"]["make_target"], "world-bin")
+        self.assertEqual(raw["configure"]["install_target"], "install-world-bin")
+        self.assertEqual(raw["locale"], {"provider": "builtin", "default": "C.UTF-8",
+                                          "alternate_18": "PG_UNICODE_FAST"})
+        # Every dependency pin lives in sources.json, never here.
+        for value in raw.values():
+            self.assertNotIn("sha256", json.dumps(value))
+            self.assertNotIn("https://", json.dumps(value))
+
+    def test_build_dependencies_orders_the_stack_and_refuses_a_populated_prefix(self):
+        plan = self.toolchain.dependency_plan(self.options)
+        self.assertEqual([step["name"] for step in plan],
+                         ["zlib", "openssl", "libxml2", "icu", "util-linux"])
+        linkage = {step["name"]: step["linkage"] for step in plan}
+        self.assertEqual(linkage["openssl"], "shared")
+        for name in ("zlib", "libxml2", "icu", "util-linux"):
+            self.assertEqual(linkage[name], "static", name)
+        with tempfile.TemporaryDirectory() as temp:
+            work = Path(temp)
+            (work / "deps").mkdir(parents=True)
+            (work / "deps/lib").mkdir()
+            with self.assertRaises(ValueError):
+                self.toolchain.dependency_plan(self.options, work)
+
+    def test_provenance_records_the_keys_staging_reads(self):
+        pins = module("source").dependencies()
+        licenses = {name: {"path": f"/work/licenses/{name}.txt", "sha256": "c" * 64} for name in pins}
+        record = self.toolchain.provenance(
+            options=self.options,
+            pins=pins,
+            deps_prefix=Path("/work/deps"),
+            loader={"path": "/work/loader/libc.so", "sha256": "a" * 64, "musl_version": "1.2.5",
+                    "license": {"path": "/work/source/COPYRIGHT", "sha256": "b" * 64}},
+            licenses={name: row for name, row in licenses.items() if name != "zig"},
+            icu={"decision": "with_icu", "reason": "zig c++ compiled ICU 79.1"},
+        )
+        self.assertEqual(record["deps_prefix"], "/work/deps")
+        self.assertEqual(record["loader"]["musl_version"], "1.2.5")
+        self.assertEqual(record["loader"]["sha256"], "a" * 64)
+        self.assertEqual(record["zig"]["version"], "0.17.1")
+        self.assertEqual(record["zig"]["sha256"], pins["zig"]["sha256"])
+        self.assertEqual(record["configure_flags"], self.toolchain.configure_flags(self.options))
+        self.assertEqual(record["locale"], self.options["locale"])
+        self.assertEqual(record["icu"], {"decision": "with_icu", "reason": "zig c++ compiled ICU 79.1"})
+        names = [row["name"] for row in record["dependencies"]]
+        self.assertEqual(names, ["zlib", "openssl", "libxml2", "icu", "util-linux"])
+        for row in record["dependencies"]:
+            with self.subTest(name=row["name"]):
+                self.assertEqual(row["version"], pins[row["name"]]["version"])
+                self.assertEqual(row["sha256"], pins[row["name"]]["sha256"])
+                self.assertIn(row["linkage"], ("shared", "static"))
+                self.assertEqual(row["license"], licenses[row["name"]])
+                self.assertTrue(row["spdx"])
+
+    def test_provenance_refuses_a_dependency_without_a_licence_file(self):
+        pins = module("source").dependencies()
+        with self.assertRaises(ValueError):
+            self.toolchain.provenance(
+                options=self.options, pins=pins, deps_prefix=Path("/work/deps"),
+                loader={"path": "/w/libc.so", "sha256": "a" * 64, "musl_version": "1.2.5",
+                        "license": {"path": "/w/COPYRIGHT", "sha256": "b" * 64}},
+                licenses={})
+
+    def test_dependency_archives_never_share_the_source_stage_directory(self):
+        # source.py --download creates <work>/downloads itself and refuses to run
+        # when it exists, so the dependency archives must live elsewhere.
+        with tempfile.TemporaryDirectory() as temp:
+            work = Path(temp)
+            self.assertNotEqual(self.toolchain.archives(work), work / "downloads")
+            self.assertEqual(self.toolchain.archives(work), work / "archives")
+
+    def test_write_provenance_refuses_to_replace_a_different_record(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "toolchain.json"
+            self.toolchain.write_provenance(path, {"deps_prefix": "/work/deps"})
+            self.assertEqual(json.loads(path.read_text()), {"deps_prefix": "/work/deps"})
+            with self.assertRaises(ValueError):
+                self.toolchain.write_provenance(path, {"deps_prefix": "/other"})
+            self.assertEqual(json.loads(path.read_text()), {"deps_prefix": "/work/deps"})
+
+
 if __name__ == "__main__":
     unittest.main()

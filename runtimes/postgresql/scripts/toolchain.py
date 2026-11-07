@@ -1,0 +1,453 @@
+#!/usr/bin/env python3
+"""Materialise the pinned toolchain, build the vendored dependencies and loader.
+
+Every input to the build is either a pin in ``config/sources.json`` or a build
+decision in ``config/build-options.json``; nothing is taken from the host except
+the handful of host tools ``require`` names.  The module is driven by the
+subcommands at the bottom of the file, one per stage of ``build.sh``.
+"""
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import time
+
+RUNTIME_DIR = Path(__file__).resolve().parents[1]
+REPO_ROOT = RUNTIME_DIR.parents[1]
+BUILD_OPTIONS = RUNTIME_DIR / "config/build-options.json"
+SOURCE_MODULE = Path(__file__).with_name("source.py")
+PHP_DIR = REPO_ROOT / "runtimes/php"
+PHP_LOADER_MODULE = PHP_DIR / "scripts/musl_loader.py"
+TARGET = "x86_64-linux-musl"
+HOST_PATH = "/usr/bin:/bin"
+
+
+def _load(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def digest(path):
+    with Path(path).open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def load_options(path=BUILD_OPTIONS):
+    """Read and validate the build decisions; reject anything shaped differently."""
+    data = json.loads(Path(path).read_text())
+    if set(data) != {"zig", "configure", "locale"}:
+        raise ValueError(f"{path} must hold exactly zig, configure and locale")
+    zig = data["zig"]
+    if set(zig) != {"version", "musl_version"}:
+        raise ValueError("zig holds only the pinned version and its bundled musl version")
+    for key in ("version", "musl_version"):
+        if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", str(zig[key])):
+            raise ValueError(f"Invalid zig {key}: {zig[key]!r}")
+    configure = data["configure"]
+    if set(configure) != {"shared", "cppflags", "make_target", "install_target"}:
+        raise ValueError("configure holds only the flags, cppflags and make targets")
+    flags = configure["shared"]
+    if not isinstance(flags, list) or not all(isinstance(f, str) and f.startswith("--") for f in flags):
+        raise ValueError("configure.shared must be a list of long options")
+    if len(flags) != len(set(flags)):
+        raise ValueError("configure.shared repeats an option")
+    icu = [f for f in flags if "icu" in f]
+    if icu not in (["--with-icu"], ["--without-icu"]):
+        raise ValueError("configure.shared must state exactly one ICU decision")
+    if "-idirafter /usr/include" not in configure["cppflags"]:
+        raise ValueError("configure.cppflags must reach host headers only through -idirafter")
+    if "-I/usr/include" in configure["cppflags"]:
+        raise ValueError("configure.cppflags must never put host headers first")
+    locale = data["locale"]
+    if set(locale) != {"provider", "default", "alternate_18"}:
+        raise ValueError("locale holds the provider, default and alternate_18 contract")
+    if locale["provider"] != "builtin" or locale["default"] != "C.UTF-8":
+        raise ValueError("Only the builtin C.UTF-8 locale provider is supported")
+    return data
+
+
+def require(tools):
+    """Fail with the first host tool the build cannot do without."""
+    for tool in tools:
+        if shutil.which(tool) is None:
+            raise ValueError(f"Missing native dependency: {tool}. Install it explicitly, then rerun.")
+
+
+def _confined_extract(archive, destination):
+    """Extract a digest-verified archive into a fresh directory, one root only."""
+    destination.mkdir(parents=True, exist_ok=False)
+    with tarfile.open(archive) as tar:
+        members = tar.getmembers()
+        roots = set()
+        for member in members:
+            name = PurePosixPath(member.name)
+            if name.is_absolute() or ".." in name.parts or not name.parts:
+                raise ValueError(f"Unsafe archive path: {member.name}")
+            if not (member.isfile() or member.isdir()):
+                raise ValueError(f"Archive special files are not allowed: {member.name}")
+            roots.add(name.parts[0])
+        if len(roots) != 1:
+            raise ValueError("Archive must have exactly one root directory")
+        tar.extractall(destination, filter="data", members=members)
+        return destination / roots.pop()
+
+
+def archives(work):
+    """Where the pinned dependency archives live.
+
+    Never ``<work>/downloads``: ``source.py --download`` creates that directory
+    itself and refuses to run when it already exists, so the two stages would
+    break each other if they shared it.
+    """
+    return Path(work) / "archives"
+
+
+def _fetch(pin, downloads):
+    downloads.mkdir(parents=True, exist_ok=True)
+    archive = downloads / PurePosixPath(pin["url"]).name
+    if archive.exists():
+        if digest(archive) != pin["sha256"]:
+            raise ValueError(f"Pinned archive changed on disk: {archive}")
+        return archive
+    temporary = archive.with_name(archive.name + ".part")
+    result = subprocess.run(
+        ["curl", "--fail", "--location", "--proto", "=https", "--proto-redir", "=https",
+         "--max-time", "600", "--output", str(temporary), pin["url"]],
+        text=True, capture_output=True,
+    )
+    if result.returncode != 0:
+        temporary.unlink(missing_ok=True)
+        raise ValueError(f"Cannot download {pin['url']}: {result.stderr.strip()[-1000:]}")
+    if digest(temporary) != pin["sha256"]:
+        temporary.unlink()
+        raise ValueError(f"SHA-256 mismatch for {pin['url']}")
+    temporary.rename(archive)
+    return archive
+
+
+def prepare_zig(work, pins):
+    """Fetch, verify and extract the pinned compiler; never use one from PATH."""
+    # Resolved because build.sh captures this path and later hands it back in a
+    # different working directory; a relative answer would not survive that.
+    work = Path(work).resolve()
+    archive = _fetch(pins["zig"], archives(work))
+    root = _confined_extract(archive, work / "zig")
+    candidates = [root] + sorted(path.parent for path in root.glob("*/zig") if path.is_file())
+    for candidate in candidates:
+        binary = candidate / "zig"
+        if binary.is_file():
+            binary.chmod(0o755)
+            return candidate
+    raise ValueError(f"The pinned Zig archive holds no zig executable: {root}")
+
+
+def zig(zig_dir, options):
+    """Return the pinned compiler after proving it is the version the build declared."""
+    binary = Path(zig_dir) / "zig"
+    if not binary.is_file():
+        raise ValueError(f"Missing pinned compiler: {binary}")
+    result = subprocess.run([str(binary), "version"], text=True, capture_output=True)
+    if result.returncode != 0:
+        raise ValueError(f"Cannot run {binary}: {result.stderr.strip()}")
+    expected = options["zig"]["version"]
+    actual = result.stdout.strip()
+    if actual != expected:
+        raise ValueError(f"Zig {actual} does not match the pinned {expected} in build-options.json")
+    return binary
+
+
+def musl_version(zig_dir):
+    """Read the musl version the compiler ships; the loader must agree with it."""
+    return _load(PHP_LOADER_MODULE, "php_musl_loader").toolchain_musl_version(Path(zig_dir))
+
+
+def configure_flags(options):
+    """The static PostgreSQL configure decisions, in declared order."""
+    return list(options["configure"]["shared"])
+
+
+def build_env(zig_dir, deps_prefix):
+    """A complete build environment: pinned compiler, isolated pkg-config, no host libs."""
+    zig_dir = Path(zig_dir)
+    deps_prefix = Path(deps_prefix)
+    pkgconfig = deps_prefix / "lib/pkgconfig"
+    return {
+        "PATH": HOST_PATH,
+        "LC_ALL": "C",
+        "SOURCE_DATE_EPOCH": "0",
+        "CC": f"{zig_dir}/zig cc -target {TARGET}",
+        "CXX": f"{zig_dir}/zig c++ -target {TARGET}",
+        "CPPFLAGS": load_options()["configure"]["cppflags"],
+        "CFLAGS": "-O2 -fPIC",
+        # Zig links musl statically unless told otherwise; the bundle is musl-dynamic.
+        "LDFLAGS": f"-L{deps_prefix}/lib -dynamic",
+        "PKG_CONFIG_PATH": str(pkgconfig),
+        "PKG_CONFIG_LIBDIR": str(pkgconfig),
+        # Zig needs a writable cache even when the caller's environment is scrubbed;
+        # the prefix's parent is the build workspace, never a shared location.
+        "ZIG_GLOBAL_CACHE_DIR": str(deps_prefix.parent / ".zig-cache"),
+    }
+
+
+def dependency_plan(options, work=None):
+    """The dependency stack in build order, with the linkage each one must have."""
+    if work is not None and (Path(work) / "deps").exists():
+        raise ValueError(f"Dependency prefix already exists: {Path(work) / 'deps'}; builds never reuse one")
+    plan = [
+        {"name": "zlib", "linkage": "static"},
+        {"name": "openssl", "linkage": "shared"},
+        {"name": "libxml2", "linkage": "static"},
+        {"name": "icu", "linkage": "static"},
+        {"name": "util-linux", "linkage": "static"},
+    ]
+    if "--without-icu" in configure_flags(options):
+        plan = [step for step in plan if step["name"] != "icu"]
+    return plan
+
+
+def _call(command, cwd, env, what):
+    # The dependency stack is a tens-of-minutes build with its output captured,
+    # so the log needs a stage boundary on each side to stay diagnosable.
+    print(f"{what}: {cwd}", file=sys.stderr, flush=True)
+    started = time.monotonic()
+    result = subprocess.run(command, cwd=cwd, env=env, text=True, capture_output=True)
+    elapsed = time.monotonic() - started
+    if result.returncode != 0:
+        raise ValueError(f"{what} failed after {elapsed:.0f}s:\n{result.stdout[-4000:]}{result.stderr[-4000:]}")
+    print(f"{what}: ok in {elapsed:.0f}s", file=sys.stderr, flush=True)
+    return result
+
+
+def _zlib(source, build, deps, env):
+    _call([str(source / "configure"), f"--prefix={deps}", "--static"], build, env, "zlib configure")
+    _call(["make", "-j", str(os.cpu_count() or 2)], build, env, "zlib make")
+    _call(["make", "install"], build, env, "zlib install")
+
+
+def _openssl(source, build, deps, env):
+    # OpenSSL 3.6.5 reads _GNU_SOURCE as "glibc: strerror_r returns char *" and
+    # assigns the int musl's POSIX strerror_r returns to a char *. PostgreSQL
+    # needs _GNU_SOURCE; OpenSSL does not, so this one dependency drops it.
+    openssl_env = dict(env)
+    openssl_env["CPPFLAGS"] = " ".join(
+        flag for flag in env["CPPFLAGS"].split() if flag != "-D_GNU_SOURCE")
+    # The target must come first; an absolute --libdir is what puts the .so.N
+    # files where staging looks for them.
+    _call([str(source / "Configure"), "linux-x86_64", "shared", "no-tests", "no-apps",
+           f"--prefix={deps}", f"--libdir={deps}/lib", f"--openssldir={deps}/ssl"],
+          build, openssl_env, "OpenSSL Configure")
+    _call(["make", "-j", str(os.cpu_count() or 2)], build, openssl_env, "OpenSSL make")
+    _call(["make", "install_sw"], build, openssl_env, "OpenSSL install_sw")
+
+
+def _libxml2(source, build, deps, env):
+    _call([str(source / "configure"), f"--prefix={deps}", "--enable-static", "--disable-shared",
+           "--without-python", "--without-readline", "--without-icu", "--without-zlib",
+           "--without-lzma"], build, env, "libxml2 configure")
+    _call(["make", "-j", str(os.cpu_count() or 2)], build, env, "libxml2 make")
+    _call(["make", "install"], build, env, "libxml2 install")
+
+
+def _util_linux(source, build, deps, env):
+    _call([str(source / "configure"), f"--prefix={deps}", "--disable-all-programs",
+           "--enable-libuuid", "--enable-static", "--disable-shared", "--disable-nls",
+           "--without-python", "--disable-asciidoc", "--disable-poman"],
+          build, env, "util-linux configure")
+    _call(["make", "-j", str(os.cpu_count() or 2)], build, env, "util-linux make")
+    _call(["make", "install"], build, env, "util-linux install")
+
+
+def _icu(source, build, deps, env):
+    # ICU keeps its autotools project one level down, under icu/source.
+    configure = source / "source/configure"
+    if not configure.is_file():
+        raise ValueError(f"ICU source layout changed; no source/configure under {source}")
+    try:
+        _call([str(configure), f"--prefix={deps}", "--enable-static", "--disable-shared",
+               "--with-data-packaging=static", "--disable-tests", "--disable-samples",
+               "--disable-extras"], build, env, "ICU configure")
+        _call(["make", "-j", str(os.cpu_count() or 2)], build, env, "ICU make")
+        _call(["make", "install"], build, env, "ICU install")
+    except ValueError as exc:
+        raise ValueError(
+            "ICU 79.1 did not compile with zig c++ -target x86_64-linux-musl; "
+            "switch configure.shared to --without-icu and record the reason in "
+            f"config/build-options.json ({exc})") from exc
+
+
+STEPS = {"zlib": _zlib, "openssl": _openssl, "libxml2": _libxml2, "icu": _icu,
+         "util-linux": _util_linux}
+
+# Each upstream ships its licence under a different name; the first match wins.
+LICENSES = {
+    "zlib": ("LICENSE",),
+    "openssl": ("LICENSE.txt",),
+    "libxml2": ("Copyright",),
+    "icu": ("LICENSE",),
+    "util-linux": ("COPYING",),
+}
+
+
+def _license(source, name):
+    for candidate in LICENSES[name]:
+        path = source / candidate
+        if path.is_file():
+            return {"path": str(path), "sha256": digest(path)}
+    raise ValueError(f"{name} source is missing its licence file: {source}")
+
+
+def build_dependencies(work, pins, zig_dir):
+    """Build the pinned stack into ``<work>/deps`` and return that prefix."""
+    work = Path(work).resolve()
+    zig_dir = Path(zig_dir).resolve()
+    plan = dependency_plan(load_options(), work)
+    deps = work / "deps"
+    deps.mkdir(parents=True, exist_ok=False)
+    env = build_env(zig_dir, deps)
+    licenses = {}
+    for step in plan:
+        name = step["name"]
+        pin = pins.get(name)
+        if pin is None:
+            raise ValueError(f"No pinned {name} in config/sources.json")
+        archive = _fetch(pin, archives(work))
+        source = _confined_extract(archive, work / "sources" / name)
+        licenses[name] = _license(source, name)
+        build = work / "builds" / name
+        build.mkdir(parents=True, exist_ok=False)
+        STEPS[name](source, build, deps, env)
+    (work / "licenses.json").write_text(json.dumps(licenses, indent=2, sort_keys=True) + "\n")
+    return deps
+
+
+def build_loader(work, zig_dir):
+    """Build the pinned musl loader through PHP's module so both runtimes agree."""
+    work = Path(work).resolve()
+    loader_module = _load(PHP_LOADER_MODULE, "php_musl_loader")
+    options = load_options()
+    bundled = loader_module.toolchain_musl_version(Path(zig_dir))
+    if bundled != options["zig"]["musl_version"]:
+        raise ValueError(
+            f"Zig {options['zig']['version']} bundles musl {bundled}, but build-options.json "
+            f"declares {options['zig']['musl_version']}")
+    # musl's own link line pulls compiler_rt, whose memcpy/memset/strlen are
+    # hidden; linking it through zig cc therefore produces a loader without the
+    # exports musl_loader.inspect requires. The host C compiler reproduces the
+    # loader PHP ships byte for byte, so the loader is built exactly as PHP
+    # builds it rather than re-implemented here.
+    libc, metadata = loader_module.build(PHP_DIR, work / "loader", work / "loader.json", Path(zig_dir), "cc")
+    record = metadata["loader"]
+    return {
+        "path": str(libc),
+        "sha256": record["sha256"],
+        "musl_version": record["version"],
+        "license": metadata["license"],
+    }
+
+
+def provenance(options, pins, deps_prefix, loader, licenses, icu=None):
+    """The Task 4 -> Task 5 record: where the dependencies live and what was built."""
+    flags = configure_flags(options)
+    if icu is None:
+        if "--with-icu" in flags:
+            icu = {"decision": "with_icu", "reason": f"zig c++ compiled ICU {pins['icu']['version']}"}
+        else:
+            icu = {"decision": "without_icu",
+                   "reason": "ICU did not compile with zig c++; recorded build-time fallback"}
+    records = []
+    for step in dependency_plan(options):
+        name = step["name"]
+        pin = pins[name]
+        if name not in licenses:
+            raise ValueError(f"No license file recorded for {name}")
+        records.append({"name": name, "version": pin["version"], "sha256": pin["sha256"],
+                        "linkage": step["linkage"], "spdx": pin["license"],
+                        "license": licenses[name]})
+    return {
+        "zig": {"version": options["zig"]["version"],
+                "musl_version": options["zig"]["musl_version"],
+                "sha256": pins["zig"]["sha256"], "license": pins["zig"]["license"]},
+        "deps_prefix": str(deps_prefix),
+        "loader": loader,
+        "dependencies": records,
+        "configure_flags": flags,
+        "locale": options["locale"],
+        "icu": icu,
+        "compiler": f"zig cc -target {TARGET}",
+    }
+
+
+def write_provenance(path, data):
+    """Write the provenance record once; an existing record is never replaced."""
+    path = Path(path)
+    if path.exists():
+        raise ValueError(f"Refusing to replace an existing provenance record: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+
+def _main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    tools = sub.add_parser("require", help="Fail unless every named host tool is installed")
+    tools.add_argument("tools", nargs="+")
+    flags = sub.add_parser("configure-flags", help="Print one PostgreSQL configure flag per line")
+    environment = sub.add_parser("env", help="Print the build environment as VARIABLE=value lines")
+    environment.add_argument("--zig-dir", type=Path, required=True)
+    environment.add_argument("--deps", type=Path, required=True)
+    for name in ("prepare-zig", "build-dependencies", "build-loader"):
+        command = sub.add_parser(name)
+        command.add_argument("--work", type=Path, required=True)
+        command.add_argument("--zig-dir", type=Path)
+    record = sub.add_parser("write-provenance")
+    record.add_argument("--work", type=Path, required=True)
+    record.add_argument("--output", type=Path, required=True)
+    record.add_argument("--icu-reason")
+    args = parser.parse_args()
+
+    pins = _load(SOURCE_MODULE, "pg_source").dependencies()
+    options = load_options()
+    if args.command == "require":
+        require(args.tools)
+    elif args.command == "configure-flags":
+        print("\n".join(configure_flags(options)))
+    elif args.command == "env":
+        for key, value in build_env(args.zig_dir, args.deps).items():
+            print(f"{key}={value}")
+    elif args.command == "prepare-zig":
+        require(["curl", "tar"])
+        print(prepare_zig(args.work, pins))
+    elif args.command == "build-dependencies":
+        require(["make", "curl", "tar", "strip", "readelf"])
+        zig_dir = args.zig_dir
+        zig(zig_dir, options)
+        print(build_dependencies(args.work, pins, zig_dir))
+    elif args.command == "build-loader":
+        require(["make", "curl", "tar", "readelf", "cc"])
+        print(json.dumps(build_loader(args.work, args.zig_dir)))
+    else:
+        metadata = json.loads((args.work / "loader.json").read_text())
+        licenses = json.loads((args.work / "licenses.json").read_text())
+        record_data = provenance(
+            options, pins, args.work / "deps",
+            {"path": metadata["source"], "sha256": metadata["loader"]["sha256"],
+             "musl_version": metadata["loader"]["version"], "license": metadata["license"]},
+            licenses,
+            None if args.icu_reason is None else {
+                "decision": "with_icu" if "--with-icu" in configure_flags(options) else "without_icu",
+                "reason": args.icu_reason})
+        write_provenance(args.output, record_data)
+        print(args.output)
+
+
+if __name__ == "__main__":
+    _main()
