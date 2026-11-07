@@ -48,9 +48,15 @@ def validate_assets(directory):
             runtime = manifest.get("runtime")
             try:
                 if runtime == "php":
-                    parts = [manifest["php"]["version"], manifest["target"], manifest["profile"], manifest["architecture"], manifest["build_id"]]
-                    valid = (re.fullmatch(r"8\.[2-5]\.[0-9]+", parts[0]) and parts[2] in {"minimal", "full"} and parts[3] == "x86_64")
+                    parts = [manifest["php"]["version"], manifest["target"], manifest["architecture"], manifest["build_id"]]
                     executables = ("bin/php", "bin/php-fpm", "bin/php-ext", "libexec/php", "libexec/php-fpm")
+                    valid = (re.fullmatch(r"8\.[2-5]\.[0-9]+", parts[0]) and parts[2] == "x86_64"
+                             and manifest.get("linkage") == "dynamic" and "profile" not in manifest
+                             and isinstance(manifest.get("loader"), dict)
+                             and manifest["loader"].get("path") == "lib/musl/ld-musl-x86_64.so.1")
+                    loader = members.get(root + "/lib/musl/ld-musl-x86_64.so.1")
+                    if not loader or not loader.isfile() or loader.size == 0 or loader.mode & 0o111 != 0o111:
+                        raise ValueError("Archive lost the bundled musl loader")
                 elif runtime == "redis":
                     parts = [manifest["redis"]["version"], manifest["target"], manifest["architecture"], manifest["build_id"]]
                     valid = re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", parts[0]) and parts[2] == "x86_64" and "profile" not in manifest
@@ -65,7 +71,7 @@ def validate_assets(directory):
                 raise ValueError("Missing archive identity") from error
             if (type(manifest.get("schema_version")) is not int or manifest["schema_version"] != 1
                     or any(not isinstance(value, str) or not re.fullmatch(r"[a-zA-Z0-9_.-]+", value) for value in parts)
-                    or not valid or parts[1] not in {"glibc", "musl"} or runtime + "-" + "-".join(parts) != root):
+                    or not valid or runtime + "-" + "-".join(parts) != root):
                 raise ValueError("Invalid archive identity")
             for executable in executables:
                 candidate = members.get(root + "/" + executable)
@@ -95,25 +101,25 @@ def validate_plan(plan, manifests, tag, repository, commit):
         version = row.get("php_version")
         if (not isinstance(version, str) or not re.fullmatch(r"8\.[2-5]\.(?:0|[1-9][0-9]*)", version)
                 or row.get("php_series") != ".".join(version.split(".")[:2])
-                or row.get("target") not in {"glibc", "musl"} or row.get("profile") not in {"full", "minimal"}
-                or row.get("architecture") != "x86_64"):
+                or row.get("target") != "musl-dynamic" or row.get("architecture") != "x86_64"
+                or "profile" in row):
             raise ValueError("Invalid publication matrix version/modes")
         previous = row.get("previous_version")
         if previous is not None and (not isinstance(previous, str) or not re.fullmatch(r"8\.[2-5]\.(?:0|[1-9][0-9]*)", previous) or not previous.startswith(row["php_series"] + ".")):
             raise ValueError("Invalid previous published version")
-        identity = ("php", version, row["target"], row["profile"], row["architecture"])
+        identity = ("php", version, row["target"], row["architecture"])
         if identity in expected:
             raise ValueError("Duplicate publication matrix row")
         expected.add(identity)
     for row in redis_matrix["include"]:
         if (not isinstance(row, dict) or not isinstance(row.get("redis_version"), str)
                 or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", row["redis_version"])
-                or row.get("target") not in {"glibc", "musl"} or row.get("architecture") != "x86_64" or "profile" in row):
+                or row.get("target") != "musl" or row.get("architecture") != "x86_64" or "profile" in row):
             raise ValueError("Invalid Redis publication matrix")
         previous = row.get("previous_version")
         if previous is not None and previous != row["redis_version"]:
             raise ValueError("Invalid previous Redis version")
-        identity = ("redis", row["redis_version"], row["target"], None, row["architecture"])
+        identity = ("redis", row["redis_version"], row["target"], row["architecture"])
         if identity in expected:
             raise ValueError("Duplicate publication matrix row")
         expected.add(identity)
@@ -122,9 +128,11 @@ def validate_plan(plan, manifests, tag, repository, commit):
         try:
             runtime = manifest["runtime"]
             if runtime == "php":
-                identity = (runtime, manifest["php"]["version"], manifest["target"], manifest["profile"], manifest["architecture"])
+                if manifest.get("linkage") != "dynamic" or "profile" in manifest:
+                    raise ValueError("Invalid planned runtime")
+                identity = (runtime, manifest["php"]["version"], manifest["target"], manifest["architecture"])
             elif runtime == "redis" and "profile" not in manifest:
-                identity = (runtime, manifest["redis"]["version"], manifest["target"], None, manifest["architecture"])
+                identity = (runtime, manifest["redis"]["version"], manifest["target"], manifest["architecture"])
             else:
                 raise ValueError("Invalid planned runtime")
             builder_commit = manifest["builder"]["commit"]
@@ -145,14 +153,15 @@ def release_notes(manifests, repository, commit, plan=None):
         if php_manifests:
             lines.append(release_notes(php_manifests, repository, commit, plan))
         lines += ["## Redis native bundles", "", "No profiles; Redis core built with native compilers, without Docker or TLS.", "",
-                  "| Redis | Target | Architecture | Minimum glibc | Build ID |", "| --- | --- | --- | --- | --- |"]
+                  "| Redis | Target | Architecture | Linkage | Build ID |", "| --- | --- | --- | --- | --- |"]
         for manifest in sorted(redis_manifests, key=lambda m: (tuple(map(int, m["redis"]["version"].split("."))), m["target"])):
-            floor = manifest.get("libc", {}).get("minimum_version") or "Fully static musl"
-            if not isinstance(floor, str) or (manifest["target"] == "glibc" and not re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", floor)):
-                raise ValueError("Invalid Redis libc requirement")
-            lines.append("| " + " | ".join((manifest["redis"]["version"], manifest["target"], manifest["architecture"], floor, manifest["build_id"])) + " |")
+            libc = manifest.get("libc", {})
+            static = libc.get("static")
+            if static is not True:
+                raise ValueError("Redis bundles must be fully static musl binaries")
+            lines.append("| " + " | ".join((manifest["redis"]["version"], manifest["target"], manifest["architecture"], "fully static musl", manifest["build_id"])) + " |")
         lines += ["", "- Binaries: `redis-server`, `redis-cli`, `redis-benchmark`, `redis-sentinel`, `redis-check-rdb`, `redis-check-aof`.",
-                  "- Redis glibc compatibility is the actual manifest requirement, not the PHP baseline.",
+                  "- Redis bundles are fully static musl x86_64 binaries; they need no libc on the host.",
                   "- Verify SHA-256 before extraction; retain upstream source archives and license notices.",
                   "- This release does not configure or start Redis in DevStack.",
                   f"- Builder commit: https://github.com/{repository}/commit/{commit}"]
@@ -160,19 +169,19 @@ def release_notes(manifests, repository, commit, plan=None):
             lines.append(f'- Workflow: https://github.com/{repository}/actions/runs/{plan["run_id"]} (attempt {plan["run_attempt"]})')
         return "\n".join(lines) + "\n"
     lines = ["# PHP runtime bundles", "", "Verified PHP CLI/FPM archives built from the selected stable patches.", "",
-             "## Included bundles", "", "| PHP | Previous published patch | Target | Profile | Architecture | Build ID |",
-             "| --- | --- | --- | --- | --- | --- |"]
+             "## Included bundles", "", "| PHP | Previous published patch | Target | Architecture | Build ID |",
+             "| --- | --- | --- | --- | --- |"]
     previous = {}
     if plan:
         for row in plan["matrix"]["include"]:
-            previous[(row["php_version"], row["target"], row["profile"], row["architecture"])] = row.get("previous_version")
-    for manifest in sorted(manifests, key=lambda m: (tuple(map(int, m["php"]["version"].split("."))), m["target"], m["profile"])):
-        identity = (manifest["php"]["version"], manifest["target"], manifest["profile"], manifest["architecture"])
+            previous[(row["php_version"], row["target"], row["architecture"])] = row.get("previous_version")
+    for manifest in sorted(manifests, key=lambda m: (tuple(map(int, m["php"]["version"].split("."))), m["target"])):
+        identity = (manifest["php"]["version"], manifest["target"], manifest["architecture"])
         prior = previous.get(identity) or ("Not previously published" if plan else "Not recorded")
-        lines.append("| " + " | ".join((*identity[:1], prior, *identity[1:], manifest["build_id"])) + " |")
+        lines.append("| " + " | ".join((identity[0], prior, identity[1], identity[2], manifest["build_id"])) + " |")
     lines += ["", "## Extension inventory", ""]
     for manifest in manifests:
-        label = f'{manifest["php"]["version"]} / {manifest["target"]} / {manifest["profile"]}'
+        label = f'{manifest["php"]["version"]} / {manifest["target"]}'
         modules = manifest["php"].get("static_modules")
         if modules is not None and (not isinstance(modules, list) or any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_ .-]+", name) for name in modules)):
             raise ValueError("Invalid static extension inventory")
@@ -197,7 +206,7 @@ def release_notes(manifests, repository, commit, plan=None):
               "- Verify SHA-256 before extracting into a new empty installation directory.",
               "- Use bundled `bin/php`, `bin/php-fpm`, and `bin/php-ext`, not raw `libexec` binaries.",
               "- FPM requires a non-root caller and an explicit caller-owned configuration/socket/pid/log.",
-              "- `glibc` declares a glibc >= 2.17 baseline; `musl` is fully static. Match the manifest to the host.",
+              "- `musl-dynamic` bundles link against musl libc and ship their own loader in `lib/musl/`; launch through `bin/` so the bundled loader is used.",
               "- Publication validates archive checksums, identity, packaged manifests, executable modes, and `verification=PASSED`.",
               "- This does not certify an oldest-host run, distinct-minor coexistence, complete source/toolchain authentication, legal inventory, or independent artifact signing.",
               "", "## Build references", "", f"- Builder commit: https://github.com/{repository}/commit/{commit}"]

@@ -1,0 +1,1 @@
+apcu,bcmath,calendar,dba,exif,gd,intl,mysqli,opcache,pdo_mysql,pdo_pgsql,pdo_sqlite,pcntl,posix,redis,sockets,sodium,sqlite3,xsl,zip

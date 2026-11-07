@@ -8,12 +8,6 @@ on:
     - cron: "37 21 * * *"
   workflow_dispatch:
     inputs:
-      profile:
-        description: "PHP extension profile only (Redis has no profiles)"
-        required: true
-        type: choice
-        options: [minimal, full]
-        default: full
       publish:
         description: "Publish verified archives to a NEW public Release (explicit opt-in)"
         required: true
@@ -63,7 +57,6 @@ jobs:
       - id: set
         env:
           GH_TOKEN: ${{ github.token }}
-          PROFILE_INPUT: ${{ inputs.profile || 'full' }}
           PUBLISH: ${{ inputs.publish || false }}
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
@@ -99,13 +92,14 @@ jobs:
       - name: Build, verify actual CLI/FPM requests, and package
         env:
           BUILD_VERSION: ${{ matrix.php_version }}
-          BUILD_TARGET: ${{ matrix.target }}
-          BUILD_PROFILE: ${{ matrix.profile }}
-        run: ./build.sh php "$BUILD_TARGET" "$BUILD_PROFILE" "$BUILD_VERSION"
+          # SPC resolves some artifact versions through the unauthenticated GitHub
+          # API, which rate-limits shared CI runners. The job token lifts that limit.
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./build.sh php "$BUILD_VERSION"
       - name: Upload mode-preserving archives and metadata
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: runtime-php-${{ matrix.php_version }}-${{ matrix.target }}-${{ matrix.profile }}-x86_64
+          name: runtime-php-${{ matrix.php_version }}-musl-dynamic-x86_64
           path: dist/assets/
           if-no-files-found: error
           retention-days: 14
@@ -126,12 +120,11 @@ jobs:
       - name: Build, verify real Redis requests, and package
         env:
           BUILD_VERSION: ${{ matrix.redis_version }}
-          BUILD_TARGET: ${{ matrix.target }}
-        run: ./build.sh redis "$BUILD_TARGET" "$BUILD_VERSION"
+        run: ./build.sh redis "$BUILD_VERSION"
       - name: Upload mode-preserving archives and metadata
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: runtime-redis-${{ matrix.redis_version }}-${{ matrix.target }}-x86_64
+          name: runtime-redis-${{ matrix.redis_version }}-musl-x86_64
           path: dist/assets/
           if-no-files-found: error
           retention-days: 14

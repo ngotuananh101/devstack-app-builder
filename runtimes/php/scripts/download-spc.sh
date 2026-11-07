@@ -11,7 +11,7 @@ COMMIT="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["co
 SOURCE_PARENT="$PHP_DIR/.cache/spc/$COMMIT"
 mkdir -p "$PHP_DIR/.cache/spc"
 # bootstrap.py requires a fresh directory and checks the archive SHA-256 first.
-SOURCE="$(python3 -I "$SCRIPT_DIR/bootstrap.py" "$PHP_DIR/config/spc-lock.json" "$SOURCE_PARENT" "$PHP_DIR/.cache/spc-provenance.json" "$PHP_DIR/config/spc-dependencies.json")"
+SOURCE="$(python3 -I "$SCRIPT_DIR/bootstrap.py" "$PHP_DIR/config/spc-lock.json" "$SOURCE_PARENT" "$PHP_DIR/.cache/spc-provenance.json" "$PHP_DIR/config/spc-dependencies.json" "$PHP_DIR/config/spc-source-patches.json")"
 # Never cd into extracted upstream code. Disable Composer scripts and plugins.
 # Its lock now points ONLY to local archives whose SHA-256 was verified.
 COMPOSER_CACHE_DIR="$(mktemp -d "$PHP_DIR/.cache/composer.XXXXXX")"

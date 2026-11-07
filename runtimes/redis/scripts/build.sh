@@ -8,7 +8,7 @@ for arg in "$@"; do
   case "$arg" in
     --print-plan) print_plan=1 ;;
     -h|--help)
-      printf '%s\n' 'Usage: ./build.sh redis [musl|glibc] [exact-version] [--print-plan]' 'Defaults: musl 8.10.3. Native toolchain only; no profiles or dependency installation.'
+      printf '%s\n' 'Usage: ./build.sh redis [exact-version] [--print-plan]' 'Defaults: 8.10.3. Musl-only fully static build; no profiles or dependency installation.'
       exit 0 ;;
     *) args+=("$arg") ;;
   esac
@@ -23,13 +23,8 @@ if [[ "$(uname -s)" != Linux || "$(uname -m)" != x86_64 ]]; then
   exit 1
 fi
 read -r version target < <(python3 -I -c 'import json,sys; p=json.load(sys.stdin); print(p["version"],p["target"])' <<< "$plan")
-if [[ "$target" == musl ]]; then
-  compiler="${REDIS_CC:-musl-gcc}"
-  ldflags='-static -no-pie'
-else
-  compiler="${REDIS_CC:-gcc}"
-  ldflags=''
-fi
+compiler="${REDIS_CC:-musl-gcc}"
+ldflags='-static -no-pie'
 for tool in "$compiler" make ar ranlib readelf strip curl; do
   command -v "$tool" >/dev/null || { printf 'Missing native dependency: %s. Install it explicitly, then rerun.\n' "$tool" >&2; exit 1; }
 done
@@ -45,7 +40,7 @@ work="$(mktemp -d "$REPO_ROOT/.cache/redis/build.XXXXXXXX")"
 printf 'Redis native build workspace: %s\n' "$work"
 # The libc probe must pass BEFORE any source download or build.
 python3 -I "$RUNTIME_DIR/scripts/bundle.py" probe "$compiler" "$target" "$work"
-source_dir="$(python3 -I "$RUNTIME_DIR/scripts/source.py" --download "$work" "$target" "$version")"
+source_dir="$(python3 -I "$RUNTIME_DIR/scripts/source.py" --download "$work" "$version")"
 make -C "$source_dir/src" -j "$jobs" CC="$compiler" MALLOC=jemalloc \
   OPTIMIZATION=-O2 USE_SYSTEMD=no BUILD_TLS=no BUILD_COMPRESSION=no LDFLAGS='' REDIS_LDFLAGS="$ldflags" \
   redis-server redis-cli redis-benchmark

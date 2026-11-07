@@ -10,6 +10,7 @@ import subprocess
 import urllib.request
 
 SERIES = ("8.5", "8.4", "8.3", "8.2")
+TARGET = "musl-dynamic"
 MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 MAX_API_BYTES = 8 * 1024 * 1024
 
@@ -110,9 +111,11 @@ def published_versions(repository):
                     roots.add(name[:-len(suffix)])
                     break
         for root in sorted(roots):
-            if re.fullmatch(r"php-8\.[0-9]+\.[0-9]+-(?:glibc|musl)-(?:full|minimal)-[A-Za-z0-9_]+-[A-Za-z0-9_.-]+", root) and not re.fullmatch(r"php-8\.[2-5]\.[0-9]+-(?:glibc|musl)-(?:full|minimal)-x86_64-[A-Za-z0-9_.-]+", root):
+            if re.fullmatch(r"php-8\.[0-9]+\.[0-9]+-(?:glibc|musl)-(?:full|minimal)-[A-Za-z0-9_]+-[A-Za-z0-9_.-]+", root):
+                continue  # Retired static/glibc bundles are never the current target.
+            if re.fullmatch(r"php-8\.[0-9]+\.[0-9]+-" + TARGET + r"-[A-Za-z0-9_]+-[A-Za-z0-9_.-]+", root) and not re.fullmatch(r"php-8\.[2-5]\.[0-9]+-" + TARGET + r"-x86_64-[A-Za-z0-9_.-]+", root):
                 continue  # A different architecture/series is not this builder's baseline.
-            if not re.fullmatch(r"php-8\.[2-5]\.[0-9]+-(?:glibc|musl)-(?:full|minimal)-x86_64-[A-Za-z0-9_.-]+", root):
+            if not re.fullmatch(r"php-8\.[2-5]\.[0-9]+-" + TARGET + r"-x86_64-[A-Za-z0-9_.-]+", root):
                 raise ValueError("Invalid public runtime asset identity")
             names = [root + suffix for suffix in (".tar.gz", ".tar.gz.sha256", ".manifest.json")]
             if any(name not in entries for name in names):
@@ -130,11 +133,15 @@ def published_versions(repository):
                 raise ValueError("Invalid/unverified public runtime manifest")
             try:
                 version = manifest["php"]["version"]
-                parts = [version, manifest["target"], manifest["profile"], manifest["architecture"], manifest["build_id"]]
+                parts = [version, manifest["target"], manifest["architecture"], manifest["build_id"]]
                 version_tuple(version)
                 if any(not isinstance(part, str) for part in parts) or "php-" + "-".join(parts) != root:
                     raise ValueError("Runtime manifest/asset identity mismatch")
-                key = (".".join(version.split(".")[:2]), *parts[1:4])
+                if manifest["target"] != TARGET or manifest.get("linkage") != "dynamic":
+                    raise ValueError("Runtime manifest is not a musl-dynamic bundle")
+                if "profile" in manifest:
+                    raise ValueError("Runtime manifest must not carry a profile")
+                key = (".".join(version.split(".")[:2]), parts[1], parts[2])
             except (KeyError, TypeError) as error:
                 raise ValueError("Missing runtime manifest identity") from error
             if key not in result or version_tuple(version) > version_tuple(result[key]):
@@ -142,9 +149,7 @@ def published_versions(repository):
     return result
 
 
-def plan_updates(latest, published, target, profile, force=False):
-    if target not in {"both", "glibc", "musl"} or profile not in {"full", "minimal"}:
-        raise ValueError("Invalid target/profile")
+def plan_updates(latest, published, force=False):
     rows = []
     for series in SERIES:
         if series not in latest:
@@ -153,34 +158,29 @@ def plan_updates(latest, published, target, profile, force=False):
         version_tuple(version)
         if not version.startswith(series + "."):
             raise ValueError("Mismatched upstream PHP series")
-        for libc in (("glibc", "musl") if target == "both" else (target,)):
-            previous = published.get((series, libc, profile, "x86_64"))
-            if previous is not None:
-                version_tuple(previous)
-                if not previous.startswith(series + "."):
-                    raise ValueError("Mismatched published PHP series")
-            if force or previous is None or version_tuple(version) > version_tuple(previous):
-                rows.append({"php_series": series, "php_version": version, "target": libc,
-                             "profile": profile, "architecture": "x86_64", "previous_version": previous})
+        previous = published.get((series, TARGET, "x86_64"))
+        if previous is not None:
+            version_tuple(previous)
+            if not previous.startswith(series + "."):
+                raise ValueError("Mismatched published PHP series")
+        if force or previous is None or version_tuple(version) > version_tuple(previous):
+            rows.append({"php_series": series, "php_version": version, "target": TARGET,
+                         "architecture": "x86_64", "previous_version": previous})
     if set(latest) - set(SERIES):
         raise ValueError("Unsupported upstream PHP series")
     return rows
 
 
-def make_plan(*, event, repository, commit, run_id, run_attempt, php_version="all", target="both",
-              profile="full", publish=False, release_tag="", now=None):
+def make_plan(*, event, repository, commit, run_id, run_attempt, publish=False, release_tag="", now=None):
     validate_repository(repository)
     if event not in {"schedule", "workflow_dispatch"} or not re.fullmatch(r"[a-f0-9]{40}", commit):
         raise ValueError("Invalid workflow event/commit")
     if not all(isinstance(value, str) and re.fullmatch(r"[1-9][0-9]*", value) for value in (run_id, run_attempt)):
         raise ValueError("Invalid workflow run identity")
-    if php_version != "all" and php_version not in SERIES:
-        raise ValueError("Invalid PHP series")
     if type(publish) is not bool:
         raise ValueError("Invalid publish input")
     scheduled = event == "schedule"
     if scheduled:
-        php_version, target, profile = "all", "both", "full"
         now = now or datetime.datetime.now(datetime.timezone.utc)
         release_tag = f"runtimes-{now.astimezone(datetime.timezone.utc):%Y%m%d}-{run_id}-{run_attempt}"
     if scheduled or publish:
@@ -188,10 +188,9 @@ def make_plan(*, event, repository, commit, run_id, run_attempt, php_version="al
             raise ValueError("Invalid or missing NEW release tag")
     if not scheduled and not publish:
         release_tag = ""  # Unused input must never become an Actions output record.
-    selected = SERIES if php_version == "all" else (php_version,)
-    latest = {series: latest_php(series) for series in selected}
+    latest = {series: latest_php(series) for series in SERIES}
     history = published_versions(repository) if scheduled or publish else {}
-    rows = plan_updates(latest, history, target, profile, force=not scheduled)
+    rows = plan_updates(latest, history, force=not scheduled)
     return {"schema_version": 1, "event": event, "repository": repository, "commit": commit,
             "run_id": run_id, "run_attempt": run_attempt, "release_tag": release_tag,
             "publish": bool(rows) and (scheduled or publish), "has_updates": bool(rows),
@@ -209,8 +208,7 @@ def main():
     try:
         plan = make_plan(event=os.environ["GITHUB_EVENT_NAME"], repository=os.environ["GITHUB_REPOSITORY"],
                          commit=os.environ["GITHUB_SHA"], run_id=os.environ["GITHUB_RUN_ID"],
-                         run_attempt=os.environ["GITHUB_RUN_ATTEMPT"], php_version=os.environ.get("PHP_VERSION_INPUT", "all"),
-                         target=os.environ.get("TARGET_INPUT", "both"), profile=os.environ.get("PROFILE_INPUT", "full"),
+                         run_attempt=os.environ["GITHUB_RUN_ATTEMPT"],
                          publish=publish_input == "true", release_tag=os.environ.get("RELEASE_TAG", ""))
     except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
         parser.error(str(error))

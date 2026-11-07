@@ -13,14 +13,14 @@ REPOSITORY = "ngotuananh101/devstack-app-builder"
 COMMIT = "a" * 40
 
 
-def manifest(version="8.4.9", target="glibc", profile="full"):
+def manifest(version="8.4.9", target="musl-dynamic"):
     return {"schema_version": 1, "runtime": "php", "php": {"version": version},
-            "target": target, "profile": profile, "architecture": "x86_64",
+            "target": target, "architecture": "x86_64", "linkage": "dynamic",
             "build_id": "fixture", "verification": "PASSED"}
 
 
 def assets(data, first_id=10):
-    name = f'php-{data["php"]["version"]}-{data["target"]}-{data["profile"]}-x86_64-fixture'
+    name = f'php-{data["php"]["version"]}-{data["target"]}-x86_64-fixture'
     return [{"id": first_id + i, "name": name + suffix, "size": 123, "state": "uploaded"}
             for i, suffix in enumerate((".tar.gz", ".tar.gz.sha256", ".manifest.json"))]
 
@@ -35,30 +35,30 @@ class UpdateContracts(unittest.TestCase):
         self.module = load("updates")
         self.assertIsNotNone(self.module, "update planner is not implemented")
 
-    def test_numeric_comparison_and_independent_combinations(self):
-        rows = self.module.plan_updates({"8.4": "8.4.10"},
-            {("8.4", "glibc", "full", "x86_64"): "8.4.9"}, "both", "full")
+    def test_numeric_comparison_and_missing_target(self):
+        rows = self.module.plan_updates({"8.4": "8.4.10"}, {("8.4", "musl-dynamic", "x86_64"): "8.4.9"})
         self.assertEqual(rows, [
-            {"php_series": "8.4", "php_version": "8.4.10", "target": "glibc", "profile": "full", "architecture": "x86_64", "previous_version": "8.4.9"},
-            {"php_series": "8.4", "php_version": "8.4.10", "target": "musl", "profile": "full", "architecture": "x86_64", "previous_version": None}])
+            {"php_series": "8.4", "php_version": "8.4.10", "target": "musl-dynamic", "architecture": "x86_64", "previous_version": "8.4.9"}])
         for previous in ("8.4.10", "8.4.11"):
             with self.subTest(previous=previous):
                 self.assertEqual(self.module.plan_updates({"8.4": "8.4.10"},
-                    {("8.4", "glibc", "full", "x86_64"): previous}, "glibc", "full"), [])
-        # Other profiles/architectures cannot make a missing full/x86_64 bundle look present.
+                    {("8.4", "musl-dynamic", "x86_64"): previous}), [])
+        # Other architectures cannot make a missing x86_64 bundle look present.
         self.assertEqual(len(self.module.plan_updates({"8.4": "8.4.10"},
-            {("8.4", "glibc", "minimal", "x86_64"): "8.4.99"}, "glibc", "full")), 1)
+            {("8.4", "musl-dynamic", "aarch64"): "8.4.99"})), 1)
+        # Retired static targets never satisfy the dynamic target.
+        self.assertEqual(len(self.module.plan_updates({"8.4": "8.4.10"},
+            {("8.4", "musl", "x86_64"): "8.4.99"})), 1)
 
     def test_manual_forces_exact_patch_matrix(self):
-        rows = self.module.plan_updates({"8.4": "8.4.10"},
-            {("8.4", "glibc", "minimal", "x86_64"): "8.4.10"}, "glibc", "minimal", force=True)
-        self.assertEqual([(r["php_version"], r["profile"]) for r in rows], [("8.4.10", "minimal")])
+        rows = self.module.plan_updates({"8.4": "8.4.10"}, {("8.4", "musl-dynamic", "x86_64"): "8.4.10"}, force=True)
+        self.assertEqual([(r["php_version"], r["target"]) for r in rows], [("8.4.10", "musl-dynamic")])
         for version in ("8.4.10RC1", "8.1.10", "8.4", "8.4.010"):
             with self.subTest(version=version), self.assertRaises(ValueError):
                 self.module.version_tuple(version)
 
     def test_public_history_uses_all_pages_and_companions(self):
-        older, newer = manifest("8.4.9"), manifest("8.4.10", "musl")
+        older, newer = manifest("8.4.9"), manifest("8.4.10")
         fixtures = {
             f"repos/{REPOSITORY}/releases?per_page=100&page=1": [release(1)] + [release(i, tag_name="other") for i in range(2, 101)],
             f"repos/{REPOSITORY}/releases?per_page=100&page=2": [release(101)],
@@ -75,15 +75,15 @@ class UpdateContracts(unittest.TestCase):
             return json.dumps(fixtures[endpoint])
         with patch.object(self.module.subprocess, "check_output", side_effect=response):
             result = self.module.published_versions(REPOSITORY)
-        self.assertEqual(result, {("8.4", "glibc", "full", "x86_64"): "8.4.9", ("8.4", "musl", "full", "x86_64"): "8.4.10"})
+        self.assertEqual(result, {("8.4", "musl-dynamic", "x86_64"): "8.4.10"})
         self.assertIn(f"repos/{REPOSITORY}/releases?per_page=100&page=2", visited)
         self.assertIn(f"repos/{REPOSITORY}/releases/1/assets?per_page=100&page=2", visited)
 
     def test_latest_compatible_bundle_wins_without_blocking_other_architectures(self):
         old, new = manifest("8.4.9"), manifest("8.4.10")
-        alternate = manifest("8.4.99")
         entries = assets(old) + assets(new, 20)
-        entries += [{"id": 30, "name": "php-8.4.99-glibc-full-aarch64-fixture.tar.gz", "size": 123, "state": "uploaded"}]
+        entries += [{"id": 30, "name": "php-8.4.99-musl-dynamic-aarch64-fixture.tar.gz", "size": 123, "state": "uploaded"},
+                    {"id": 31, "name": "php-8.4.99-glibc-full-x86_64-fixture.tar.gz", "size": 123, "state": "uploaded"}]
         fixtures = {
             f"repos/{REPOSITORY}/releases?per_page=100&page=1": [release(1)],
             f"repos/{REPOSITORY}/releases/1/assets?per_page=100&page=1": entries,
@@ -91,7 +91,16 @@ class UpdateContracts(unittest.TestCase):
             f"repos/{REPOSITORY}/releases/assets/22": new,
         }
         with patch.object(self.module.subprocess, "check_output", side_effect=lambda command, **kwargs: json.dumps(fixtures[command[2]])):
-            self.assertEqual(self.module.published_versions(REPOSITORY), {("8.4", "glibc", "full", "x86_64"): "8.4.10"})
+            self.assertEqual(self.module.published_versions(REPOSITORY), {("8.4", "musl-dynamic", "x86_64"): "8.4.10"})
+
+    def test_retired_static_bundles_are_ignored_not_trusted(self):
+        retired = {"id": 10, "name": "php-8.4.99-musl-full-x86_64-fixture.tar.gz", "size": 123, "state": "uploaded"}
+        fixtures = {
+            f"repos/{REPOSITORY}/releases?per_page=100&page=1": [release(1)],
+            f"repos/{REPOSITORY}/releases/1/assets?per_page=100&page=1": [retired],
+        }
+        with patch.object(self.module.subprocess, "check_output", side_effect=lambda command, **kwargs: json.dumps(fixtures[command[2]])):
+            self.assertEqual(self.module.published_versions(REPOSITORY), {})
 
     def test_drafts_prereleases_and_unrelated_assets_do_not_count(self):
         fixtures = [[release(1, draft=True), release(2, prerelease=True), release(3, tag_name="application-v1")]]
@@ -99,13 +108,15 @@ class UpdateContracts(unittest.TestCase):
             self.assertEqual(self.module.published_versions(REPOSITORY), {})
 
     def test_invalid_manifest_or_api_error_fails_closed(self):
-        for defect in ("missing_companion", "unverified", "wrong_identity", "oversized", "malformed_json", "duplicate_name"):
+        for defect in ("missing_companion", "unverified", "wrong_identity", "retired_target", "profile", "oversized", "malformed_json", "duplicate_name"):
             with self.subTest(defect=defect):
                 data = manifest()
                 entries = assets(data)
                 if defect == "missing_companion": entries.pop(1)
                 if defect == "unverified": data["verification"] = "NOT_RUN"
-                if defect == "wrong_identity": data["target"] = "musl"
+                if defect == "wrong_identity": data["build_id"] = "other"
+                if defect == "retired_target": data["target"] = "musl"
+                if defect == "profile": data["profile"] = "full"
                 if defect == "oversized": entries[2]["size"] = 10_000_000
                 if defect == "duplicate_name": entries.append(entries[0])
                 responses = [json.dumps([release(1)]), json.dumps(entries), "not json" if defect == "malformed_json" else json.dumps(data)]
@@ -125,10 +136,9 @@ class UpdateContracts(unittest.TestCase):
                 self.module.latest_php("8.4")
 
     def test_nonpublishing_manual_tag_cannot_inject_outputs(self):
-        with patch.object(self.module, "latest_php", return_value="8.4.10"):
+        with patch.object(self.module, "latest_php", side_effect=lambda series: {"8.5": "8.5.1", "8.4": "8.4.10", "8.3": "8.3.2", "8.2": "8.2.3"}[series]):
             policy = self.module.make_plan(event="workflow_dispatch", repository=REPOSITORY, commit=COMMIT,
-                run_id="123", run_attempt="1", php_version="8.4", target="glibc", profile="full",
-                publish=False, release_tag="runtimes-X\nhas_updates=false")
+                run_id="123", run_attempt="1", publish=False, release_tag="runtimes-X\nhas_updates=false")
         self.assertEqual(policy["release_tag"], "")
         self.assertTrue(policy["has_updates"])
 
@@ -142,26 +152,28 @@ class UpdateContracts(unittest.TestCase):
 
     def test_empty_plan_and_automatic_tag_outputs(self):
         kwargs = dict(event="schedule", repository=REPOSITORY, commit=COMMIT,
-                      run_id="123", run_attempt="2", php_version="8.4", target="both", profile="full",
-                      publish=False, release_tag="", now=datetime.datetime(2026, 11, 6, tzinfo=datetime.timezone.utc))
+                      run_id="123", run_attempt="2", publish=False, release_tag="",
+                      now=datetime.datetime(2026, 11, 6, tzinfo=datetime.timezone.utc))
         upstream = {"8.5": "8.5.1", "8.4": "8.4.10", "8.3": "8.3.2", "8.2": "8.2.3"}
         with patch.object(self.module, "latest_php", side_effect=upstream.__getitem__), patch.object(self.module, "published_versions", return_value={}):
             plan = self.module.make_plan(**kwargs)
         self.assertEqual(plan["release_tag"], "runtimes-20261106-123-2")
         self.assertTrue(plan["publish"])
         self.assertTrue(plan["has_updates"])
-        self.assertEqual([r["php_version"] for r in plan["matrix"]["include"]], ["8.5.1", "8.5.1", "8.4.10", "8.4.10", "8.3.2", "8.3.2", "8.2.3", "8.2.3"])
-        history = {(series, target, "full", "x86_64"): version for series, version in upstream.items() for target in ("glibc", "musl")}
+        self.assertEqual([r["php_version"] for r in plan["matrix"]["include"]], ["8.5.1", "8.4.10", "8.3.2", "8.2.3"])
+        self.assertEqual({r["target"] for r in plan["matrix"]["include"]}, {"musl-dynamic"})
+        history = {(series, "musl-dynamic", "x86_64"): version for series, version in upstream.items()}
         with patch.object(self.module, "latest_php", side_effect=upstream.__getitem__), patch.object(self.module, "published_versions", return_value=history):
             plan = self.module.make_plan(**kwargs)
         self.assertFalse(plan["has_updates"])
         self.assertFalse(plan["publish"])
         self.assertEqual(plan["matrix"], {"include": []})
-        kwargs.update(event="workflow_dispatch", publish=False, profile="minimal")
-        with patch.object(self.module, "latest_php", return_value="8.4.10"), patch.object(self.module, "published_versions", side_effect=AssertionError("No release lookup for a non-publishing manual build")):
+        kwargs.update(event="workflow_dispatch", publish=False)
+        with patch.object(self.module, "latest_php", side_effect=upstream.__getitem__), patch.object(self.module, "published_versions", side_effect=AssertionError("No release lookup for a non-publishing manual build")):
             plan = self.module.make_plan(**kwargs)
         self.assertFalse(plan["publish"])
-        self.assertEqual(len(plan["matrix"]["include"]), 2)
+        self.assertEqual(len(plan["matrix"]["include"]), 4)
+        self.assertTrue(all("profile" not in row for row in plan["matrix"]["include"]))
 
 
 if __name__ == "__main__":

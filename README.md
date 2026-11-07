@@ -2,20 +2,25 @@
 
 Build Linux x86_64 standalone PHP CLI/FPM bundles and native Redis core binaries for DevStack. Consumers download versioned archives rather than compiling locally. Supported PHP series: **8.5, 8.4 (default), 8.3, 8.2**.
 
-Redis source builds support **musl (fully static, default)** and **glibc**, without Docker or profiles:
+Both runtimes are musl-only and have no profiles:
+
+- **PHP** is a `musl-dynamic` bundle: the main binaries and the fixed static baseline link against musl, and a fixed set of 20 extensions ships as shared modules. The bundle carries its own musl loader (`lib/musl/ld-musl-x86_64.so.1`), which is also `libc.so`, so it needs no host libc and no host interpreter.
+- **Redis** is a fully static musl build: no interpreter, no `NEEDED` entries.
 
 ```bash
-./build.sh redis musl 8.10.3
-./build.sh redis glibc 8.10.3
+./build.sh php            # PHP 8.4, musl-dynamic
+./build.sh php 8.3
+./build.sh redis          # Redis 8.10.3, fully static musl
+./build.sh redis 8.10.3
 ```
 
-Native Redis dependencies must already be installed; the builder never installs host packages. See [Redis build contracts](docs/runtimes/redis.md).
+Native build dependencies must already be installed; the builder never installs host packages and never uses Docker. See [Redis build contracts](docs/runtimes/redis.md) and [PHP build contracts](docs/runtimes/php.md).
 
-> The new SPC-built bundle matrix has not yet passed a real CI run. Local shell contracts and preinstalled PHP tests do not establish production artifact readiness.
+> A native local PHP 8.4.27 musl-dynamic build passed full CLI/FPM verification and functional checks for all 20 shared modules on 2026-11-07, including a fresh archive extraction. The full CI matrix and production input/legal gates remain unvalidated; see [local evidence](docs/runtimes/php.md#local-validation-evidence).
 
 ## Build
 
-Build hosts require PHP >= 8.4.1 with mbstring/zlib, Composer, Python >= 3.12 and native build dependencies. Installed bundles do not require those tools.
+Build hosts require PHP >= 8.4.1 with mbstring/zlib, Composer, Python >= 3.12, a host `cc` and native build dependencies. Installed bundles do not require those tools.
 
 ```bash
 # Digest-verified immutable SPC v3 source and Composer dependencies
@@ -23,29 +28,24 @@ Build hosts require PHP >= 8.4.1 with mbstring/zlib, Composer, Python >= 3.12 an
 # Check only; never auto-install dependencies on the development host
 ./runtimes/php/spc doctor --auto-fix=never --no-interaction
 
-# Defaults: PHP 8.4, glibc, full profile
+# SPC target is always x86_64-linux-musl with dynamic linkage
 ./build.sh php
-./build.sh php glibc full 8.4
-# Opt in to the smaller profile
-./build.sh php glibc minimal 8.4
-./build.sh php musl full 8.3
-# Alternative argument order
-./build.sh php 8.2 glibc full
+./build.sh php 8.4
+./build.sh php 8.3.10
 ```
 
 SPC stays on pinned **v3.0.0-alpha1**, not v2 or an unverified floating nightly. CI installs build dependencies explicitly. Ordinary build scripts refuse to fix the host. Existing staged bundles/archives are not overwritten.
 
-## Profiles and targets
+The musl loader is compiled from the pinned musl release recorded in `runtimes/php/config/musl.json` (version, HTTPS release URL, SHA-256). The build requires the Zig toolchain's bundled musl to be exactly that version, compiles musl out of tree with the host `cc`, and validates the resulting `libc.so` as a shared object with no `NEEDED`, no `RPATH`/`RUNPATH`, an `_dlstart` entry, the exports PHP needs (`memcpy`, `memset`, `__stack_chk_fail`, `__libc_start_main`) and the expected version banner. musl does not set a `SONAME` on its loader; the dynamic linker matches the reserved libc names to itself, so `libc.so` is satisfied without one. Building the loader with `zig cc` instead of the host compiler omits exported `memcpy`/`memset`/`__stack_chk_fail`, which breaks PHP at relocation time.
 
-| Target | Contract | Optional modules |
-| --- | --- | --- |
-| glibc | Hybrid, x86_64 glibc >= 2.17; checked ELF baseline | `apcu`, `redis` in **full**, shared-only and disabled by default |
-| musl | Fully static Linux x86_64 | None; selected modules cannot be toggled |
+## Extension set
 
-- `full` (default): web/database extension suite; static except explicitly supported shared modules on glibc.
-- `minimal` (explicit opt-in): lean profile, **PDO core but no database drivers**.
-- Opcache is static in full; xdebug is not packaged. Not every extension can be shared.
-- SPC-required dependencies may be static; actual resolved modes are included in the manifest.
+One set for every build; there is no `minimal`/`full` profile and no libc selector.
+
+- **Static** (`config/static-extensions.txt`): `ctype, curl, dom, fileinfo, filter, iconv, libxml, mbstring, mbregex, mysqlnd, openssl, pdo, phar, readline, session, simplexml, tokenizer, xml, xmlreader, xmlwriter, zlib`.
+- **Shared** (`config/shared-extensions.txt`, packaged as `.so`): `apcu, bcmath, calendar, dba, exif, gd, intl, mysqli, opcache, pdo_mysql, pdo_pgsql, pdo_sqlite, pcntl, posix, redis, sockets, sodium, sqlite3, xsl, zip`.
+
+Shared modules are **disabled by default in both SAPIs** and are toggled per installation with `bin/php-ext`. `opcache` is a Zend extension and receives `zend_extension=`. Not every extension can be shared: SPC forbids sharing `libxml`, `mbregex`, `readline` and `zlib`, and dependency edges force `xml`, `pdo`, `mysqlnd`, `dom` and related modules to stay static. SPC-required dependencies may also be static; both the requested and the actual resolved modes are recorded in the manifest.
 
 ## Bundle usage
 
@@ -60,12 +60,13 @@ RUNTIME="/home/me/.local/share/devstack/PHP 8.4"
 DEVSTACK_FPM_CONFIG="/absolute/app/config/php-8.4-fpm.conf" "$RUNTIME/bin/php-fpm" -F
 ```
 
-Launchers resolve the current installed root, isolate CLI/FPM INI scan directories and module paths, and preserve user arguments. Paths with spaces and unrelated current directories are supported. Use bundled `bin/` launchers, not raw `libexec/` binaries or external symlinks. FPM refuses root and requires caller configuration; the bundled FPM config is example only.
+Launchers resolve the current installed root, start the real binary through the bundled musl loader (`--library-path "$ROOT/lib/musl"`), drop inherited `LD_PRELOAD`/`LD_LIBRARY_PATH`/`LD_AUDIT`, isolate CLI/FPM INI scan directories and module paths, and preserve user arguments. Paths with spaces and unrelated current directories are supported. Always launch through `bin/`; running a raw `libexec/` binary would fall back to the host interpreter. FPM refuses root and requires caller configuration; the bundled FPM config is example only.
 
 ```text
 bundle/
   bin/{php,php-fpm,php-ext}
   libexec/{php,php-fpm,launch.sh}
+  lib/musl/ld-musl-x86_64.so.1
   lib/php/extensions/*.so
   etc/php.ini
   etc/{cli,fpm}/conf.d/
@@ -73,7 +74,7 @@ bundle/
   etc/php-fpm.conf.example
   manifest.json
   spc-build-manifest.json
-  share/licenses/builder.txt
+  share/licenses/{builder,musl}.txt
 ```
 
 ## Test and distribute
@@ -82,15 +83,15 @@ bundle/
 python3 -I -m unittest discover -s tests -v
 ```
 
-Build output: `dist/php/<requested-version>/<target>/<profile>/`. Verified archives: `dist/assets/php-<actual-patch>-<target>-<profile>-<arch>-<build-id>.tar.gz` plus SHA-256 and JSON manifest sidecars. Tar preserves executable modes. Manifest includes actual patch/API/TS/modes, relative paths, SPC/source provenance and ELF inventory.
+Build output: `dist/php/<requested-version>/musl-dynamic/`. Verified archives: `dist/assets/php-<actual-patch>-musl-dynamic-<arch>-<build-id>.tar.gz` plus SHA-256 and JSON manifest sidecars. Tar preserves executable modes. Manifest includes actual patch/API/TS/modes, the static/shared split, loader provenance, relative paths, SPC/source provenance and ELF inventory.
 
-CI runs real PHP CLI/FPM module toggles, actual FastCGI requests, relocation with spaces and dependency/baseline checks before packaging. The workflow has no runtime, PHP-series or libc selector: manual runs always build PHP **8.2–8.5** and every pinned Redis version (**8.10.3, 7.4.12, 7.2.17**) on **both glibc and musl**, currently 14 bundles. The only build input is the PHP extension `profile` (`full` by default, `minimal` available); Redis has no profile and uses native GCC/musl-gcc, not Docker. Push triggers remain disabled.
+CI runs real PHP CLI/FPM module toggles, actual FastCGI requests, relocation with spaces, loader-digest/version checks, a hostile `LD_*` environment and ELF dependency checks before packaging. The workflow has no runtime, PHP-series, libc or profile input: any run plans PHP **8.2–8.5** on `musl-dynamic` and every pinned Redis version (**8.10.3, 7.4.12, 7.2.17**) on `musl`, currently 7 bundles. Push triggers remain disabled.
 
-The daily planner checks all these combinations. PHP compares each php.net stable patch with the highest public bundle version for the same series/target/full-profile/architecture across paginated runtime releases. Redis selects pinned exact-version/target combinations that are not yet published; it does not discover or approve unpinned upstream releases. Only newer/missing PHP bundles and missing Redis bundles build. Each runtime can independently be a no-op; both being current skips all builds/publication. API or malformed relevant metadata failures fail closed.
+The daily planner covers the same combinations. PHP compares each php.net stable patch with the highest public `musl-dynamic`/x86_64 bundle for the same series across paginated runtime releases; retired static `glibc`/`musl` archives are recognised and ignored. Redis selects pinned exact-version bundles that are not yet published; it does not discover or approve unpinned upstream releases. Only newer/missing PHP bundles and missing Redis bundles build. Each runtime can independently be a no-op; both being current skips all builds/publication. API or malformed relevant metadata failures fail closed.
 
-Scheduled builds automatically publish after **all selected PHP/Redis bundles** pass, including a Redis-only or PHP-only update. The shared exact-patch plan is preserved as `runtime-update-plan.json`; skipped empty matrices are allowed, but a failed or cancelled required build blocks publication. The `runtime-releases` job has `contents: write` and retains its environment (required reviewers, if configured, delay automation). Tags are unique `runtimes-<UTC-date>-<run-id>-<attempt>`. Publication checks the persisted plan, creates a draft, uploads archive/checksum/manifest sets, and only then makes the Release public; failures leave a draft and never overwrite assets. English notes describe actual PHP/Redis versions, PHP module inventories, Redis binary/libc requirements, checksums and build/workflow links. Drafts/prereleases are not a version baseline. Manual publication remains opt-in (`publish=true`, a new `runtimes-...` tag). No Release has been published during implementation. Consumers use the public Releases API/asset URLs without GitHub credentials and verify checksums before extracting into a new directory.
+Scheduled builds automatically publish after **all selected PHP/Redis bundles** pass, including a Redis-only or PHP-only update. The shared exact-patch plan is preserved as `runtime-update-plan.json`; skipped empty matrices are allowed, but a failed or cancelled required build blocks publication. The `runtime-releases` job has `contents: write` and retains its environment (required reviewers, if configured, delay automation). Tags are unique `runtimes-<UTC-date>-<run-id>-<attempt>`. Publication checks the persisted plan, creates a draft, uploads archive/checksum/manifest sets, and only then makes the Release public; failures leave a draft and never overwrite assets. English notes describe actual PHP/Redis versions, PHP module inventories, Redis static-musl requirements, checksums and build/workflow links. Drafts/prereleases are not a version baseline. Manual publication remains opt-in (`publish=true`, a new `runtimes-...` tag). No Release has been published during implementation. Consumers use the public Releases API/asset URLs without GitHub credentials and verify checksums before extracting into a new directory.
 
-**Remaining production gates:** actual CI full matrix and optional apcu/redis artifacts, oldest glibc host, simultaneous distinct PHP minors, a reviewed pre-extraction version/URL/SHA-256 policy for libraries/extensions and the exact toolchain, complete prepared-toolchain provenance, and third-party legal notices. Stable PHP has upstream php.net checksum validation, not a repository-pinned exact-patch lock. SPDX/signing/attestation are not supplied. Post-build source hashing is not pre-build authentication; do not approve production builds/releases until these input gates are in place.
+**Remaining production gates:** a real CI run of the full musl-dynamic extension set, simultaneous distinct PHP minors, a reviewed pre-extraction version/URL/SHA-256 policy for libraries/extensions and the exact toolchain, complete prepared-toolchain provenance, and third-party legal notices. Stable PHP has upstream php.net checksum validation, not a repository-pinned exact-patch lock. SPDX/signing/attestation are not supplied. Post-build source hashing is not pre-build authentication; do not approve production builds/releases until these input gates are in place.
 
 ## Documentation
 

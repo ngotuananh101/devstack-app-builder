@@ -15,15 +15,16 @@ devstack-runtime-builder/
 │   └── build.sh              # Unified build dispatcher
 ├── runtimes/                 # Modular runtime definitions
 │   ├── php/                  # PHP runtime builder
-│   │   ├── config/           # Profiles and runtime configuration
+│   │   ├── config/           # Extension lists, pins and runtime configuration
 │   │   ├── scripts/          # Build and management scripts
 │   │   └── README.md
 │   └── <runtime>/            # Future runtimes (e.g. nodejs, python)
 ├── dist/                     # Build output artifacts (gitignored)
 │   ├── php/
 │   │   └── <version>/
-│   │       ├── glibc/<profile>/
-│   │       └── musl/<profile>/
+│   │       └── musl-dynamic/
+│   ├── redis/
+│   │   └── <version>/musl/
 │   └── <runtime>/
 ├── docs/                     # Documentation and architecture guides
 │   ├── architecture.md
@@ -39,19 +40,19 @@ devstack-runtime-builder/
 Every runtime directory under `runtimes/<name>` adheres to the following contract:
 
 1. **`scripts/build.sh`**:
-   - An executable script accepting target/profile arguments specific to that runtime.
+   - An executable script accepting runtime arguments specific to that runtime (an optional exact version; no target or profile selectors).
    - Outputs compiled artifacts into `$REPO_ROOT/dist/<runtime>/...`.
    - Generates a machine-readable `manifest.json` with actual runtime version, target libc, architecture, resolved module modes and build provenance.
    - Verifies runtime behavior before generating mode-preserving tar.gz/checksum assets.
 2. **`config/`**:
-   - Holds configuration templates, profile definitions, and runtime INI/config files.
+   - Holds configuration templates, pinned source/toolchain metadata, and runtime INI/config files.
 3. **Artifact Isolation**:
    - Build work/tool downloads use gitignored fresh directories. Installed binaries and libraries are staged under `dist/<runtime>/`, with archive assets under `dist/assets/`.
 
 ## Supported Runtimes
 
-- [Redis](runtimes/redis.md): Native Linux x86_64 source builds, fully static musl or native glibc with an actual ELF-derived libc floor; no profiles, Docker or service configuration.
-- [PHP (8.5, 8.4, 8.3, 8.2)](runtimes/php.md): Dual-target distribution (GNU/glibc hybrid with dynamic `.so` extension loading, and musl fully static binary) with independent CLI and FPM SAPI support. Custom PHP versions can be specified at build time.
+- [Redis](runtimes/redis.md): Native Linux x86_64 source builds, fully static musl only; no profiles, Docker or service configuration.
+- [PHP (8.5, 8.4, 8.3, 8.2)](runtimes/php.md): Single `musl-dynamic` target — musl-linked binaries with a fixed static baseline, 20 shared `.so` extensions, and a bundled musl loader — with independent CLI and FPM SAPI support. Custom PHP versions can be specified at build time.
 
 ## Adding New Runtimes
 

@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "strategy": "Reviewed exact-text replacements applied to the pinned SPC v3 source after its archive digest is verified. Each patch pins the digest of the whole file before and after, so a changed upstream file fails instead of being silently rewritten.",
+  "patches": [
+    {
+      "file": "src/globals/scripts/zig-cc.sh",
+      "reason": "Duplicate clang_rt.crtbegin/crtend objects break every shared C++ extension link under Zig; the wrapper must not append a second copy when the caller already passes one.",
+      "before_sha256": "b2e4d09cf63ee7eb75c70ac32636db4392bc43b49def5ad11c9180c9fd7a7bc7",
+      "after_sha256": "80902a97e3091f2e704edaf24e974439389ca843a33c66c0c0e67ab250e1f17f",
+      "replace": {
+        "old": "    if [[ $NEED_CRT -eq 1 && -f \"$RT_DIR/clang_rt.crtbegin.o\" && -f \"$RT_DIR/clang_rt.crtend.o\" ]]; then\n        PARSED_ARGS+=(\"-x\" \"none\" \"$RT_DIR/clang_rt.crtbegin.o\" \"$RT_DIR/clang_rt.crtend.o\")\n    fi",
+        "new": "    if [[ $NEED_CRT -eq 1 && -f \"$RT_DIR/clang_rt.crtbegin.o\" && -f \"$RT_DIR/clang_rt.crtend.o\" ]]; then\n        # libtool's C++ tag records whatever objects this compiler adds to a -shared probe in\n        # postdep_objects and passes them on every later link. Appending a second copy here\n        # duplicates __dso_handle and __EH_FRAME_LIST_END__, so ld.lld aborts the link\n        # (\"duplicate symbol: __dso_handle\" while linking ext/intl). Inject only when absent.\n        HAVE_CRT=0\n        for _arg in \"${PARSED_ARGS[@]}\"; do\n            case \"$_arg\" in\n                *clang_rt.crtbegin.o|*clang_rt.crtend.o) HAVE_CRT=1 ;;\n            esac\n        done\n        [[ $HAVE_CRT -eq 0 ]] && PARSED_ARGS+=(\"-x\" \"none\" \"$RT_DIR/clang_rt.crtbegin.o\" \"$RT_DIR/clang_rt.crtend.o\")\n    fi"
+      }
+    },
+    {
+      "file": "src/StaticPHP/Package/PhpExtensionPackage.php",
+      "reason": "phpize omits the configure LIBS environment from final module links, leaving unwind, C++ and libzip transitive symbols unresolved. Append the resolved non-PHP static dependency closure to each module's SHARED_LIBADD, with archive grouping, before make.",
+      "before_sha256": "d0dacb8b2ce2496a8620d867e11984ff059767a8088e83e0f919dc1543433d8d",
+      "after_sha256": "8d6057cf567fb71de4b61a3085157054ed4ac465913750b91f738a740d23604a",
+      "replace": {
+        "old": "    public function makeForUnix(array $env, PhpExtensionPackage $package, PackageBuilder $builder): void\n    {\n        $makeArgs = implode(' ', $package->re2cMakeVars());\n        shell()->cd($package->getSourceRoot())\n            ->setEnv($env)\n            ->exec('make clean')\n            ->exec(\"make -j{$builder->concurrency} {$makeArgs}\")\n            ->exec(\"make install {$makeArgs}\")\n            // distclean after install: phpize build residues (.lo/.libs/config.status) would\n            // poison a later static in-tree build sharing this source dir (php-src's make\n            // clean uses find, which does not follow the ext symlink)\n            ->exec('make distclean');\n    }",
+        "new": "    public function makeForUnix(array $env, PhpExtensionPackage $package, PackageBuilder $builder): void\n    {\n        $makeArgs = implode(' ', $package->re2cMakeVars());\n        // phpize links modules with <EXT>_SHARED_LIBADD, not the configure LIBS env.\n        // Carry the resolved static dependency closure onto that final link without\n        // embedding libphp. Group archives for transitive/cyclic dependencies and\n        // include the toolchain's unwind/C++ runtime even for extensions like opcache.\n        $linkConfig = (new SPCConfigUtil(['no_php' => true, 'libs_only_deps' => true]))\n            ->configForResolvedBuild([$package->getName()], $package->getInstaller());\n        $linkLibs = $linkConfig['libs'];\n        if (PHP_OS_FAMILY !== 'Darwin') {\n            $linkLibs = clean_spaces(\"-Wl,--start-group {$linkLibs} -Wl,--end-group\");\n        }\n        $sharedLibadd = strtoupper($package->getExtensionName()) . '_SHARED_LIBADD';\n        file_put_contents($package->getSourceRoot() . '/Makefile', \"\\n{$sharedLibadd} += {$linkLibs}\\n\", FILE_APPEND);\n        shell()->cd($package->getSourceRoot())\n            ->setEnv($env)\n            ->exec('make clean')\n            ->exec(\"make -j{$builder->concurrency} {$makeArgs}\")\n            ->exec(\"make install {$makeArgs}\")\n            // distclean after install: phpize build residues (.lo/.libs/config.status) would\n            // poison a later static in-tree build sharing this source dir (php-src's make\n            // clean uses find, which does not follow the ext symlink)\n            ->exec('make distclean');\n    }"
+      }
+    }
+  ]
+}

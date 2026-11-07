@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan all supported PHP and pinned Redis bundles on both libc targets."""
+"""Plan all supported PHP bundles and pinned static-musl Redis bundles."""
 import argparse
 import importlib.util
 import json
@@ -9,6 +9,7 @@ import re
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
+REDIS_TARGET = "musl"
 
 
 def load(path, name):
@@ -50,12 +51,14 @@ def published_redis(repository):
                         roots.add(name[:-len(suffix)])
                         break
         for root in sorted(roots):
-            match = re.fullmatch(r"redis-([0-9]+\.[0-9]+\.[0-9]+)-(glibc|musl)-([A-Za-z0-9_]+)-([A-Za-z0-9_.-]+)", root)
+            match = re.fullmatch(r"redis-([0-9]+\.[0-9]+\.[0-9]+)-(?:glibc|musl)-([A-Za-z0-9_]+)-([A-Za-z0-9_.-]+)", root)
             if not match:
                 raise ValueError("Invalid public Redis asset identity")
-            version, target, architecture, build_id = match.groups()
+            version, architecture, build_id = match.groups()
             if architecture != "x86_64":
                 continue
+            if f"redis-{version}-{REDIS_TARGET}-{architecture}-{build_id}" != root:
+                continue  # Retired glibc bundles are never the current target.
             names = [root + suffix for suffix in (".tar.gz", ".tar.gz.sha256", ".manifest.json")]
             if any(name not in entries for name in names):
                 raise ValueError("Incomplete public Redis asset group")
@@ -74,25 +77,24 @@ def published_redis(repository):
                 raise ValueError("Invalid/unverified public Redis manifest")
             try:
                 parts = [manifest["redis"]["version"], manifest["target"], manifest["architecture"], manifest["build_id"]]
-                if parts != [version, target, architecture, build_id] or "profile" in manifest:
+                if parts != [version, REDIS_TARGET, architecture, build_id] or "profile" in manifest:
                     raise ValueError("Redis manifest/asset identity mismatch")
             except (KeyError, TypeError) as error:
                 raise ValueError("Missing Redis manifest identity") from error
-            result[(version, target, architecture)] = version
+            result[(version, REDIS_TARGET, architecture)] = version
     return result
 
 
-def make_plan(*, event, repository, commit, run_id, run_attempt, profile="full", publish=False, release_tag=""):
+def make_plan(*, event, repository, commit, run_id, run_attempt, publish=False, release_tag=""):
     policy = php.make_plan(event=event, repository=repository, commit=commit, run_id=run_id,
-                           run_attempt=run_attempt, php_version="all", target="both", profile=profile,
-                           publish=publish, release_tag=release_tag)
+                           run_attempt=run_attempt, publish=publish, release_tag=release_tag)
     scheduled = event == "schedule"
     history = published_redis(repository) if scheduled or publish else {}
     config = json.loads(redis.CONFIG.read_text())
     rows = []
     for version in config["versions"]:
         redis.load_source(version)  # Never plan unpinned/unvalidated sources.
-        for target in ("glibc", "musl"):
+        for target in (REDIS_TARGET,):
             previous = history.get((version, target, "x86_64"))
             if not scheduled or previous is None:
                 rows.append({"redis_version": version, "target": target, "architecture": "x86_64", "previous_version": previous})
@@ -124,7 +126,7 @@ def main():
     try:
         policy = make_plan(event=os.environ["GITHUB_EVENT_NAME"], repository=os.environ["GITHUB_REPOSITORY"],
                            commit=os.environ["GITHUB_SHA"], run_id=os.environ["GITHUB_RUN_ID"],
-                           run_attempt=os.environ["GITHUB_RUN_ATTEMPT"], profile=os.environ.get("PROFILE_INPUT", "full"),
+                           run_attempt=os.environ["GITHUB_RUN_ATTEMPT"],
                            publish=publish == "true", release_tag=os.environ.get("RELEASE_TAG", ""))
     except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
         parser.error(str(error))

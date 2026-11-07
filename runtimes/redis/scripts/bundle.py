@@ -32,30 +32,15 @@ def run(arguments, **kwargs):
 def parse_elf(header, program, dynamic, versions, target):
     if "ELF64" not in header or "Advanced Micro Devices X86-64" not in header:
         raise ValueError("Expected Linux x86_64 ELF64 executable")
+    if target != "musl":
+        raise ValueError("Redis supports only the fully static musl target")
     needed = re.findall(r"\(NEEDED\).*?\[([^\]]+)\]", dynamic)
     glibc_tokens = set(re.findall(r"GLIBC_[a-zA-Z0-9_.]+", versions))
-    glibc_versions = re.findall(r"GLIBC_([0-9]+(?:\.[0-9]+)+)", versions)
-    unknown = {token for token in glibc_tokens if not re.fullmatch(r"GLIBC_[0-9]+(?:\.[0-9]+)+", token) and token != "GLIBC_ABI_DT_RELR"}
-    if unknown:
-        raise ValueError("Unknown glibc ABI requirements: " + ", ".join(sorted(unknown)))
-    if "GLIBC_ABI_DT_RELR" in glibc_tokens or "(RELR)" in dynamic or "(RELRSZ)" in dynamic:
-        glibc_versions.append("2.36")
     interpreter = re.search(r"Requesting program interpreter: ([^\]]+)", program)
     static = "INTERP" not in program and interpreter is None and "(NEEDED)" not in dynamic
-    floor = max(glibc_versions, key=lambda value: tuple(map(int, value.split(".")))) if glibc_versions else None
-    if target == "musl":
-        if not static or glibc_versions:
-            raise ValueError("musl binaries must be fully static, with no GLIBC symbols")
-    elif target == "glibc":
-        allowed = {"libc.so.6", "libm.so.6", "libpthread.so.0", "libdl.so.2", "librt.so.1", "libgcc_s.so.1"}
-        if not interpreter or "ld-linux" not in interpreter.group(1) or not floor or "libc.so.6" not in needed:
-            raise ValueError("Expected a dynamically linked glibc executable")
-        if set(needed) - allowed:
-            raise ValueError("Unexpected shared dependencies: " + ", ".join(sorted(set(needed) - allowed)))
-    else:
-        raise ValueError("Unknown libc target")
-    return {"static": static, "interpreter": interpreter.group(1) if interpreter else None,
-            "needed": needed, "glibc_required": floor}
+    if not static or glibc_tokens:
+        raise ValueError("musl binaries must be fully static, with no GLIBC symbols")
+    return {"static": static, "interpreter": None, "needed": needed, "glibc_required": None}
 
 
 def elf(binary, target):
@@ -65,7 +50,7 @@ def elf(binary, target):
 
 def libc_notice(target, notice=None):
     if target != "musl":
-        return None
+        raise ValueError("Redis supports only the fully static musl target")
     if notice is None:
         candidates = [Path(os.environ["REDIS_MUSL_LICENSE"])] if os.environ.get("REDIS_MUSL_LICENSE") else [
             Path("/usr/share/licenses/musl-libc/COPYRIGHT"), Path("/usr/share/licenses/musl/COPYRIGHT"),
@@ -77,18 +62,18 @@ def libc_notice(target, notice=None):
 
 
 def probe(compiler, target, work):
+    if target != "musl":
+        raise ValueError("Redis supports only the fully static musl target")
     executable = shutil.which(compiler)
     if executable is None:
         raise ValueError("Native compiler is missing: " + compiler)
     macros = run([compiler, "-dM", "-E", "-include", "features.h", "-x", "c", "/dev/null"])
-    is_glibc = "#define __GLIBC__ " in macros
-    if is_glibc != (target == "glibc"):
-        raise ValueError("Compiler headers do not match the requested libc")
+    if "#define __GLIBC__ " in macros:
+        raise ValueError("Compiler headers are glibc; a musl-cross compiler is required")
     source = work / "libc-probe.c"
     source.write_text('#include <stdio.h>\nint main(void) { puts("native-libc-probe"); return 0; }\n')
     binary = work / "libc-probe"
-    flags = ["-static", "-no-pie"] if target == "musl" else []
-    subprocess.run([compiler, *flags, str(source), "-o", str(binary)], check=True, timeout=60)
+    subprocess.run([compiler, "-static", "-no-pie", str(source), "-o", str(binary)], check=True, timeout=60)
     metadata = elf(binary, target)
     if run([str(binary)]).strip() != "native-libc-probe":
         raise ValueError("Native libc probe did not execute successfully")
@@ -144,11 +129,10 @@ def stage(source, output, request, provenance, repo_root):
     if not (licenses / "redis").exists():
         raise ValueError("Redis source license notices are missing")
     shutil.copy2(repo_root / "LICENSE", licenses / "builder.txt")
-    if request["target"] == "musl":
-        notice = provenance.get("libc_license")
-        if not notice or digest(Path(notice["path"])) != notice["sha256"]:
-            raise ValueError("musl license notice missing or changed")
-        shutil.copy2(notice["path"], licenses / "musl.txt")
+    notice = provenance.get("libc_license")
+    if not notice or digest(Path(notice["path"])) != notice["sha256"]:
+        raise ValueError("musl license notice missing or changed")
+    shutil.copy2(notice["path"], licenses / "musl.txt")
     archive = source.parent.parent / "downloads" / ("redis-" + version + ".tar.gz")
     if digest(archive) != request["source"]["sha256"]:
         raise ValueError("Authenticated source archive changed after build")
@@ -161,11 +145,9 @@ def stage(source, output, request, provenance, repo_root):
             builder_hash.update(str(path.relative_to(repo_root)).encode())
             builder_hash.update(bytes.fromhex(digest(path)))
     build_id = hashlib.sha256((json.dumps(inventory, sort_keys=True) + json.dumps(provenance, sort_keys=True) + builder_hash.hexdigest()).encode()).hexdigest()[:16]
-    floors = [row["glibc_required"] for row in inventory if row["glibc_required"]]
-    floor = max(floors, key=lambda value: tuple(map(int, value.split(".")))) if floors else None
     manifest = {"schema_version": 1, "runtime": "redis", "build_id": build_id,
                 "architecture": "x86_64", "target": request["target"],
-                "libc": {"family": request["target"], "minimum_version": floor, "static": request["target"] == "musl"},
+                "libc": {"family": "musl", "minimum_version": None, "static": True},
                 "redis": {"version": version, "allocator": "jemalloc", "tls": False, "bundled_modules": []},
                 "requested": request, "paths": {name.replace("redis-", "").replace("-", "_"): "bin/" + name for name in (*BINARIES, *ALIASES)},
                 "binaries": inventory, "source_inputs": [request["source"]],
@@ -284,7 +266,7 @@ if __name__ == "__main__":
     sub = parser.add_subparsers(dest="action", required=True)
     p = sub.add_parser("probe")
     p.add_argument("compiler")
-    p.add_argument("target", choices=("musl", "glibc"))
+    p.add_argument("target", choices=("musl",))
     p.add_argument("work", type=Path)
     p = sub.add_parser("stage")
     for name in ("source", "output", "request", "provenance", "repo_root"):

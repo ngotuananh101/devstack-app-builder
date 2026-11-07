@@ -86,15 +86,14 @@ def extract_source(archive, destination):
 def plan(arguments):
     config = json.loads(CONFIG.read_text())
     selected = {"version": config["default"], "target": "musl", "architecture": "x86_64"}
-    seen = set()
-    for value in arguments:
-        key = "target" if value in ("glibc", "musl") else "version"
-        if key in seen:
-            raise ValueError("Duplicate Redis argument: " + key)
-        seen.add(key)
-        if key == "version":
-            load_source(value)
-        selected[key] = value
+    if len(arguments) > 1:
+        raise ValueError("Expected at most one Redis version argument.")
+    if arguments:
+        value = arguments[0]
+        if value in ("glibc", "musl"):
+            raise ValueError("Redis is built for musl only; the libc target is not selectable.")
+        load_source(value)
+        selected["version"] = value
     selected["source"] = load_source(selected["version"])
     return selected
 

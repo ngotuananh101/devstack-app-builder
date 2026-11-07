@@ -10,31 +10,34 @@ from test_build import load, REPO
 
 
 class VerifyContracts(unittest.TestCase):
-    def test_elf_rejects_newer_glibc_and_missing_dependencies(self):
+    def test_only_the_loader_is_an_allowed_runtime_dependency(self):
         module = load("verify")
         self.assertIsNotNone(module, "runtime verifier is not implemented")
-        self.assertEqual(module.parse_needed(' 0x000 (NEEDED) Shared library: [libc.so.6]\n'), ["libc.so.6"])
-        with self.assertRaisesRegex(ValueError, "GLIBC_2.34"):
-            module.check_glibc_versions("Name: GLIBC_2.17\nName: GLIBC_2.34")
-        module.check_glibc_versions("Name: GLIBC_2.2.5\nName: GLIBC_2.17")
+        self.assertEqual(module.parse_needed(' 0x000 (NEEDED) Shared library: [libc.so]\n'), ["libc.so"])
+        module.check_dependencies([], "musl-dynamic")
+        module.check_dependencies(["libc.so"], "musl-dynamic")
         with self.assertRaisesRegex(ValueError, "libssl"):
-            module.check_dependencies(["libc.so.6", "libssl.so.3"], "glibc")
-        with self.assertRaises(ValueError):
-            module.check_dependencies(["libc.so.6"], "musl")
+            module.check_dependencies(["libc.so", "libssl.so.3"], "musl-dynamic")
+        for target in ("glibc", "musl"):
+            with self.assertRaises(ValueError):
+                module.check_dependencies([], target)
 
-    def test_unknown_glibc_abi_tokens_are_rejected(self):
+    def test_glibc_abi_tokens_are_rejected(self):
         module = load("verify")
-        for token in ("GLIBC_ABI_DT_RELR", "GLIBC_FUTURE_ABI"):
+        self.assertEqual(module.check_abi("Name: musl\n"), [])
+        for token in ("GLIBC_2.17", "GLIBC_ABI_DT_RELR", "GLIBC_FUTURE_ABI"):
             with self.subTest(token=token), self.assertRaisesRegex(ValueError, token):
-                module.check_glibc_versions(f"Name: GLIBC_2.2.5\nName: {token}")
+                module.check_abi(f"Name: {token}")
 
     @unittest.skipUnless(shutil.which("cc") and shutil.which("readelf"), "ELF fixture compiler is unavailable")
-    def test_packed_relative_relocations_fail_elf_inventory(self):
+    def test_foreign_dynamic_binary_fails_elf_inventory(self):
         module = load("verify")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "libexec").mkdir()
+            (root / "lib/musl").mkdir(parents=True)
             (root / "lib/php/extensions").mkdir(parents=True)
+            (root / "lib/musl/ld-musl-x86_64.so.1").write_bytes(b"loader fixture")
             source = root / "fixture.c"
             source.write_text('extern int puts(const char *); static int value; int *pointer = &value; int probe(void) { return puts("fixture") + *pointer; }\n')
             binary = root / "libexec/php"
@@ -42,8 +45,20 @@ class VerifyContracts(unittest.TestCase):
             shutil.copy2(binary, root / "libexec/php-fpm")
             dynamic = subprocess.check_output(["readelf", "-d", str(binary)], text=True)
             self.assertIn("(RELR)", dynamic)
-            with self.assertRaisesRegex(ValueError, "RELR"):
-                module.elf_inventory(root, "glibc")
+            # A host-toolchain binary requests glibc and must never be accepted as musl.
+            with self.assertRaisesRegex(ValueError, "Unbundled runtime dependencies"):
+                module.elf_inventory(root, "musl-dynamic")
+
+    def test_elf_inventory_requires_the_bundled_loader(self):
+        module = load("verify")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "libexec").mkdir()
+            (root / "lib/php/extensions").mkdir(parents=True)
+            shutil.copy2("/usr/bin/php", root / "libexec/php")
+            shutil.copy2("/usr/bin/php", root / "libexec/php-fpm")
+            with self.assertRaisesRegex(ValueError, "loader"):
+                module.elf_inventory(root, "musl-dynamic")
 
     def test_fastcgi_record_framing(self):
         module = load("verify")
@@ -53,7 +68,7 @@ class VerifyContracts(unittest.TestCase):
         self.assertEqual(record[8:], b"12345678")
 
     @unittest.skipUnless(Path("/usr/bin/php").is_file(), "system PHP CLI is unavailable")
-    def test_empty_shared_profile_cli_map_is_an_object(self):
+    def test_empty_shared_set_cli_map_is_an_object(self):
         module = load("verify")
         self.assertIsNotNone(module)
         with tempfile.TemporaryDirectory() as tmp:
@@ -102,14 +117,14 @@ class VerifyContracts(unittest.TestCase):
             shutil.copy2("/opt/remi/php84/root/usr/lib64/php/modules/opcache.so", root / "lib/php/extensions/opcache.so")
             (root / "etc/php.ini").write_text("opcache.enable_cli=1\n")
             (root / "etc/shared-modules.tsv").write_text("opcache\tzend_extension\topcache.so\n")
-            # PHP's runtime name differs from the SPC/INI module basename.
-            names = ["Zend OPcache"]
-            self.assertEqual(module.cli_modules(root, names, no_ini=True), {"Zend OPcache": False})
+            # The production verifier receives manifest/INI basenames, not PHP's display name.
+            names = ["opcache"]
+            self.assertEqual(module.cli_modules(root, names, no_ini=True), {"opcache": False})
             for enabled in (True, False):
                 action = "enable" if enabled else "disable"
                 subprocess.run([str(root / "bin/php-ext"), action, "opcache", "all"], check=True)
-                self.assertEqual(module.cli_modules(root, names), {"Zend OPcache": enabled})
-                self.assertEqual(module.fpm_probe(root, names, Path(tmp))["modules"], {"Zend OPcache": enabled})
+                self.assertEqual(module.cli_modules(root, names), {"opcache": enabled})
+                self.assertEqual(module.fpm_probe(root, names, Path(tmp))["modules"], {"opcache": enabled})
 
     @unittest.skipUnless(Path("/opt/remi/php84/root/usr/sbin/php-fpm").is_file() and os.getuid() != 0, "preinstalled non-root FPM is unavailable")
     def test_real_fpm_serves_request_as_caller(self):

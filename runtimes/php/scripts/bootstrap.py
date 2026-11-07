@@ -46,6 +46,35 @@ def prepare_dependencies(source, registry, directory):
     return provenance
 
 
+def apply_source_patches(source, registry):
+    """Apply reviewed exact-text patches to verified upstream source.
+
+    The archive digest proves which upstream commit we extracted; this rewrites the few
+    files we must change. Both the pre-image and post-image digests are pinned, so drift
+    in either direction fails loudly instead of silently producing a differently behaving
+    builder.
+    """
+    applied = []
+    for patch in registry["patches"]:
+        path = source / patch["file"]
+        current = hashlib.sha256(path.read_bytes()).hexdigest()
+        if current == patch["after_sha256"]:
+            applied.append({"file": patch["file"], "status": "already-applied", "sha256": current, "reason": patch["reason"]})
+            continue
+        if current != patch["before_sha256"]:
+            raise ValueError(f"Pinned source file changed: {patch['file']}")
+        text = path.read_text()
+        old, new = patch["replace"]["old"], patch["replace"]["new"]
+        if text.count(old) != 1:
+            raise ValueError(f"Patch anchor is not unique in {patch['file']}")
+        path.write_text(text.replace(old, new))
+        result = hashlib.sha256(path.read_bytes()).hexdigest()
+        if result != patch["after_sha256"]:
+            raise ValueError(f"Patch result digest mismatch: {patch['file']}")
+        applied.append({"file": patch["file"], "status": "applied", "sha256": result, "reason": patch["reason"]})
+    return applied
+
+
 def extract_verified(archive, destination, expected):
     with archive.open("rb") as stream:
         actual = hashlib.file_digest(stream, "sha256").hexdigest()
@@ -70,6 +99,7 @@ if __name__ == "__main__":
     parser.add_argument("destination", type=Path)
     parser.add_argument("provenance", type=Path)
     parser.add_argument("dependency_registry", type=Path)
+    parser.add_argument("source_patches", type=Path)
     args = parser.parse_args()
     lock = json.loads(args.lock.read_text())
     args.destination.parent.mkdir(parents=True, exist_ok=True)
@@ -82,6 +112,8 @@ if __name__ == "__main__":
     actual = hashlib.sha256((source / "composer.lock").read_bytes()).hexdigest()
     if actual != lock["composer_lock_sha256"]:
         raise ValueError("SPC Composer lock digest mismatch")
+    # Reviewed patches land only after the immutable archive proved its identity.
+    lock["source_patches"] = apply_source_patches(source, json.loads(args.source_patches.read_text()))
     # The dependency directory is fresh, outside upstream source and scripts.
     lock["composer_packages"] = prepare_dependencies(source, json.loads(args.dependency_registry.read_text()), args.destination.parent / (args.destination.name + "-dependencies"))
     args.provenance.write_text(json.dumps(lock, indent=2) + "\n")

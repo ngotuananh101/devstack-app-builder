@@ -12,47 +12,65 @@ import subprocess
 import tempfile
 import time
 
-GLIBC_SYSTEM = {"libc.so.6", "libm.so.6", "libdl.so.2", "libpthread.so.0", "librt.so.1", "libresolv.so.2", "libutil.so.1", "ld-linux-x86-64.so.2"}
+LOADER_INTERPRETER = "ld-musl-x86_64.so.1"
+# musl's loader is also libc, so PHP's only runtime dependency is satisfied by it.
+MUSL_ALLOWED_NEEDED = {"libc.so"}
+# Preserve manifest/INI basenames in results; PHP registers this Zend module differently.
+MODULE_RUNTIME_NAMES = {"opcache": "Zend OPcache"}
 
 
 def parse_needed(output):
     return re.findall(r"\(NEEDED\).*?\[([^\]]+)\]", output)
 
 
-def check_glibc_versions(output):
-    versions = set()
-    for token in set(re.findall(r"\bGLIBC_[A-Za-z0-9_.]+\b", output)):
-        match = re.fullmatch(r"GLIBC_([0-9]+(?:\.[0-9]+)+)", token)
-        if not match:
-            raise ValueError(f"Unsupported glibc ABI dependency: {token}")
-        version = match.group(1)
-        if tuple(map(int, version.split("."))) > (2, 17):
-            raise ValueError(f"Required GLIBC_{version} exceeds glibc 2.17 baseline")
-        versions.add(version)
-    return sorted(versions, key=lambda value: tuple(map(int, value.split("."))))
+def parse_loader(output):
+    match = re.search(r"Requesting program interpreter: \[?([^\]\n]+)\]?", output)
+    return match[1] if match else None
 
 
 def check_dependencies(needed, target):
-    unexpected = set(needed) - (GLIBC_SYSTEM if target == "glibc" else set())
+    if target != "musl-dynamic":
+        raise ValueError(f"Unsupported target: {target}")
+    unexpected = set(needed) - MUSL_ALLOWED_NEEDED
     if unexpected:
         raise ValueError(f"Unbundled runtime dependencies: {sorted(unexpected)}")
 
 
+def check_abi(versions):
+    # A glibc symbol in a musl bundle means the wrong toolchain or runtime.
+    tokens = set(re.findall(r"\bGLIBC_[A-Za-z0-9_.]+\b", versions))
+    if tokens:
+        raise ValueError(f"glibc ABI tokens in a musl bundle: {sorted(tokens)}")
+    return []
+
+
 def elf_inventory(bundle, target):
+    if target != "musl-dynamic":
+        raise ValueError(f"Unsupported target: {target}")
+    loader = bundle / "lib/musl" / LOADER_INTERPRETER
+    if not loader.is_file():
+        raise ValueError(f"Bundle does not ship its musl loader: {loader}")
     inventory = []
-    for binary in [bundle / "libexec/php", bundle / "libexec/php-fpm", *sorted((bundle / "lib/php/extensions").glob("*.so"))]:
-        dynamic = subprocess.check_output(["readelf", "-d", str(binary)], text=True)
+    binaries = [bundle / "libexec/php", bundle / "libexec/php-fpm", *sorted((bundle / "lib/php/extensions").glob("*.so"))]
+    for binary in binaries:
+        dynamic = subprocess.check_output(["readelf", "-dW", str(binary)], text=True)
         versions = subprocess.check_output(["readelf", "--version-info", str(binary)], text=True)
+        program = subprocess.check_output(["readelf", "-lW", str(binary)], text=True)
         needed = parse_needed(dynamic)
         check_dependencies(needed, target)
-        if target == "glibc" and re.search(r"\((?:RELR|RELRSZ|RELRENT)\)", dynamic):
-            raise ValueError("Packed RELR relocations exceed glibc 2.17 baseline")
-        glibc_versions = check_glibc_versions(versions)
+        abi = check_abi(versions)
+        interpreter = parse_loader(program)
+        if binary.parent.name == "libexec" and not interpreter:
+            raise ValueError(f"Binary does not request a dynamic loader: {binary}")
+        if interpreter and Path(interpreter).name != LOADER_INTERPRETER:
+            raise ValueError(f"Binary requests a different interpreter: {interpreter}")
         # A checkout RPATH must never leak into a relocated bundle.
         for path in re.findall(r"\((?:RUNPATH|RPATH)\).*?\[([^\]]+)\]", dynamic):
             if any(part and not part.startswith("$ORIGIN") for part in path.split(":")):
                 raise ValueError(f"Non-relocatable ELF RPATH: {path}")
-        inventory.append({"path": str(binary.relative_to(bundle)), "needed": needed, "glibc_versions": glibc_versions})
+        inventory.append({"path": str(binary.relative_to(bundle)), "needed": needed,
+                          "interpreter": interpreter, "glibc_versions": abi})
+    inventory.append({"path": str(loader.relative_to(bundle)), "role": "musl_loader_libc"})
     return inventory
 
 
@@ -115,8 +133,8 @@ def fpm_probe(bundle, modules, workspace):
         if len(os.fsencode(sock)) >= 104:
             raise ValueError("FPM verification socket path too long; use a short /tmp workspace")
         script = root / "probe.php"
-        names = json.dumps(modules)
-        script.write_text('<?php $names=json_decode(' + json.dumps(names) + ',true); $modules=[]; foreach($names as $name){$modules[$name]=extension_loaded($name);} preg_match("/^Uid:\\s+(\\d+)/m",file_get_contents("/proc/self/status"),$uid); echo json_encode(["modules"=>(object)$modules,"uid"=>(int)$uid[1],"memory_limit"=>ini_get("memory_limit"),"extension_dir"=>ini_get("extension_dir")]);')
+        names = json.dumps({name: MODULE_RUNTIME_NAMES.get(name, name) for name in modules})
+        script.write_text('<?php $names=json_decode(' + json.dumps(names) + ',true); $modules=[]; foreach($names as $name=>$runtime){$modules[$name]=extension_loaded($runtime);} preg_match("/^Uid:\\s+(\\d+)/m",file_get_contents("/proc/self/status"),$uid); echo json_encode(["modules"=>(object)$modules,"uid"=>(int)$uid[1],"memory_limit"=>ini_get("memory_limit"),"extension_dir"=>ini_get("extension_dir")]);')
         config = root / "fpm.conf"
         config.write_text('[global]\ndaemonize=no\nerror_log=/dev/stderr\npid="' + str(root / 'fpm.pid') + '"\n[probe]\nlisten="' + str(sock) + '"\npm=static\npm.max_children=1\nclear_env=no\ncatch_workers_output=yes\n')
         command = [str(bundle / "bin/php-fpm"), "-y", str(config)]
@@ -146,7 +164,8 @@ def fpm_probe(bundle, modules, workspace):
 
 
 def cli_modules(bundle, names, no_ini=False):
-    expression = '$names=json_decode(' + json.dumps(json.dumps(names)) + ',true);$result=[];foreach($names as $name){$result[$name]=extension_loaded($name);}echo json_encode((object)$result);'
+    runtime_names = {name: MODULE_RUNTIME_NAMES.get(name, name) for name in names}
+    expression = '$names=json_decode(' + json.dumps(json.dumps(runtime_names)) + ',true);$result=[];foreach($names as $name=>$runtime){$result[$name]=extension_loaded($runtime);}echo json_encode((object)$result);'
     command = [str(bundle / "bin/php")]
     if no_ini:
         command.append("-n")
@@ -156,15 +175,40 @@ def cli_modules(bundle, names, no_ini=False):
     return json.loads(output.stdout)
 
 
+def check_loader_integrity(bundle, record):
+    """The shipped loader must be the recorded bytes and must satisfy PHP at run time."""
+    import hashlib
+    path = bundle / record.get("path", "lib/musl/" + LOADER_INTERPRETER)
+    actual = hashlib.sha256(path.read_bytes()).hexdigest()
+    if actual != record.get("sha256"):
+        raise ValueError("Staged musl loader does not match the manifest digest")
+    banner = subprocess.run([str(path)], text=True, capture_output=True)
+    expected = re.search(r"^Version ([0-9]+\.[0-9]+\.[0-9]+)$", banner.stderr, re.MULTILINE)
+    if not expected or expected[1] != record.get("version"):
+        raise ValueError("Staged musl loader reports a different version than the manifest")
+    hostile = {**os.environ, "LD_PRELOAD": "/nonexistent/preload.so",
+               "LD_LIBRARY_PATH": "/nonexistent/libs", "LD_AUDIT": "/nonexistent/audit.so"}
+    result = subprocess.run([str(bundle / "bin/php"), "-n", "-r", "echo PHP_VERSION;"],
+                            text=True, capture_output=True, env=hostile)
+    if result.returncode != 0:
+        raise ValueError(f"Bundle launcher failed with inherited loader settings: {result.stderr.strip()}")
+    return {"path": record.get("path"), "sha256": actual, "version": expected[1], "hostile_env_exit_code": 0}
+
+
 def verify(bundle):
     bundle = bundle.resolve()
     manifest = json.loads((bundle / "manifest.json").read_text())
     manifest["verification"] = "NOT_RUN"
     (bundle / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    if manifest.get("target") != "musl-dynamic" or manifest.get("linkage") != "dynamic":
+        raise ValueError("Verifier only accepts musl-dynamic bundles")
     names = [row["name"] for row in manifest["shared_modules"]]
     for row in manifest["shared_modules"]:
         if not (bundle / row["path"]).is_file():
             raise ValueError(f"Missing requested shared module: {row['name']}")
+    loader = manifest.get("loader") or {}
+    if not (bundle / loader.get("path", "lib/musl/" + LOADER_INTERPRETER)).is_file():
+        raise ValueError("Manifest does not describe a staged musl loader")
     inventory = elf_inventory(bundle, manifest["target"])
     with tempfile.TemporaryDirectory(prefix="ds-verify-") as tmp:
         workspace = Path(tmp)
@@ -192,6 +236,10 @@ def verify(bundle):
         # The original and relocated installations must not cross-load INIs.
         if cli_modules(bundle, names) != expected_disabled:
             raise ValueError("Relocated installation changed original bundle")
+        mapped = subprocess.check_output([str(relocated / "bin/php"), "-r", 'echo file_get_contents("/proc/self/maps");'], text=True)
+        for line in mapped.splitlines():
+            if ".so" in line and str(relocated) not in line:
+                raise ValueError(f"Loaded a shared object outside the bundle: {line}")
         for name in names:
             subprocess.run([str(helper), "disable", name, "all"], check=True)
         if cli_modules(relocated, names) != expected_disabled:
@@ -199,8 +247,13 @@ def verify(bundle):
         if fpm_probe(relocated, names, workspace)["modules"] not in (expected_disabled, []):
             raise ValueError("FPM disable failed")
     manifest["elf_inventory"] = inventory
+    manifest["loader_check"] = check_loader_integrity(bundle, loader)
     manifest["verification"] = "PASSED"
-    manifest["verification_checks"] = ["elf_dependency_closure", "glibc_symbol_baseline", "cli_baseline", "cli_toggle", "fpm_config", "fpm_request_toggle", "non_root_fpm", "relocation_spaces", "installation_isolation"]
+    manifest["verification_checks"] = ["musl_interpreter", "musl_dependency_closure", "no_glibc_abi_tokens",
+                                       "bundled_loader_execution", "cli_baseline", "cli_toggle", "fpm_config",
+                                       "fpm_request_toggle", "non_root_fpm", "relocation_spaces",
+                                       "installation_isolation", "no_host_shared_objects",
+                                       "loader_digest", "loader_version", "hostile_ld_env"]
     (bundle / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return manifest
 
@@ -210,4 +263,4 @@ if __name__ == "__main__":
     parser.add_argument("bundle", type=Path)
     args = parser.parse_args()
     verify(args.bundle)
-    print("PASS: real CLI/FPM requests, module toggles, relocation and ELF contracts")
+    print("PASS: real CLI/FPM requests, module toggles, relocation and musl-dynamic ELF contracts")

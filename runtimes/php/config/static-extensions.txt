@@ -1,0 +1,1 @@
+ctype,curl,dom,fileinfo,filter,iconv,libxml,mbstring,mbregex,mysqlnd,openssl,pdo,phar,readline,session,simplexml,tokenizer,xml,xmlreader,xmlwriter,zlib

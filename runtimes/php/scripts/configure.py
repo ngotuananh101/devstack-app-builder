@@ -1,54 +1,82 @@
 #!/usr/bin/env python3
-"""Resolve requested modes; SPC may add REQUIRED static dependencies later."""
+"""Resolve the PHP extension set for the single supported musl-dynamic target."""
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 
 SUPPORTED = {"8.2", "8.3", "8.4", "8.5"}
+TARGET = "musl-dynamic"
+SPC_TARGET = "x86_64-linux-musl -dynamic"
+# Defaults match a healthy CI runner. A build host on a network that drops
+# concurrent connections can lower the parallelism (and raise retries) instead of
+# patching the crafted file. Fetch settings do not affect the produced binaries.
+DEFAULT_PARALLEL = 8
+DEFAULT_RETRY = 3
 
 
-def resolve(php_dir, target, profile, version):
-    if target not in {"glibc", "musl"} or profile not in {"minimal", "full"}:
-        raise ValueError("Unsupported target/profile")
+def download_parallel():
+    return _bounded_int("SPC_DOWNLOAD_PARALLEL", DEFAULT_PARALLEL, minimum=1)
+
+
+def download_retry():
+    return _bounded_int("SPC_DOWNLOAD_RETRY", DEFAULT_RETRY, minimum=0)
+
+
+def _bounded_int(name, default, minimum):
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    if not re.fullmatch(r"[0-9]+", raw) or int(raw) < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}")
+    return int(raw)
+
+
+def resolve(php_dir, version):
     if not re.fullmatch(r"8\.[2-5](?:\.[0-9]+)?", version) or ".".join(version.split(".")[:2]) not in SUPPORTED:
         raise ValueError("Unsupported PHP version")
-    def names(path):
-        result = path.read_text().strip().split(",")
-        if len(result) != len(set(result)) or any(not re.fullmatch(r"[a-z][a-z0-9_]*", name) for name in result):
-            raise ValueError(f"Invalid extension profile: {path}")
-        return result
-    selected = names(Path(php_dir) / "config/profiles" / f"{profile}.txt")
-    supported_shared = names(Path(php_dir) / "config/shared-glibc.txt") if target == "glibc" else []
-    shared = [name for name in selected if name in supported_shared]
-    static = [name for name in selected if name not in shared]
-    assert not set(static) & set(shared)
-    return {"version": version, "target": target, "profile": profile, "selected": selected, "static": static, "shared": shared}
+    config = Path(php_dir) / "config"
+
+    def names(name):
+        result = (config / name).read_text().strip()
+        names = result.split(",")
+        if len(names) != len(set(names)) or any(not re.fullmatch(r"[a-z][a-z0-9_]*", item) for item in names):
+            raise ValueError(f"Invalid extension list: {config / name}")
+        return names
+
+    static = names("static-extensions.txt")
+    shared = names("shared-extensions.txt")
+    overlap = set(static) & set(shared)
+    if overlap:
+        raise ValueError(f"Extensions cannot be both static and shared: {sorted(overlap)}")
+    return {"version": version, "target": TARGET, "spc_target": SPC_TARGET, "static": static, "shared": shared}
 
 
-def craft(resolution):
+def craft(resolution, parallel=None, retry=None):
     # SPC v3 handles shared-extensions separately from extensions. No duplicated
     # build-shared override: CraftCommand constructs that option itself.
+    parallel = download_parallel() if parallel is None else parallel
+    retry = download_retry() if retry is None else retry
     return (f'php-version: "{resolution["version"]}"\n'
             f'extensions: "{",".join(resolution["static"])}"\n'
             f'shared-extensions: "{",".join(resolution["shared"])}"\n'
             'sapi: [cli, fpm]\ndebug: false\nbuild-options:\n  no-strip: false\n'
-            'download-options:\n  parallel: 8\n  retry: 3\n'
+            f'download-options:\n  parallel: {parallel}\n  retry: {retry}\n'
             'craft-options:\n  doctor: false\n')
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("php_dir", type=Path)
-    parser.add_argument("target")
-    parser.add_argument("profile")
     parser.add_argument("version")
     parser.add_argument("craft_path", type=Path)
     parser.add_argument("resolution_path", type=Path)
     args = parser.parse_args()
     try:
-        resolution = resolve(args.php_dir, args.target, args.profile, args.version)
+        resolution = resolve(args.php_dir, args.version)
+        parallel, retry = download_parallel(), download_retry()
     except ValueError as exc:
         parser.error(str(exc))
-    args.craft_path.write_text(craft(resolution))
+    args.craft_path.write_text(craft(resolution, parallel, retry))
     args.resolution_path.write_text(json.dumps(resolution, indent=2) + "\n")

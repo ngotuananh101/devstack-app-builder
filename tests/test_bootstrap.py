@@ -83,6 +83,53 @@ class BootstrapContracts(unittest.TestCase):
             self.assertEqual(provenance[0]["sha256"], registry[0]["sha256"])
             self.assertNotEqual(result["packages"][0]["dist"]["url"], archive.as_uri())
 
+    def test_source_patches_are_digest_pinned_and_idempotent(self):
+        module = load("bootstrap")
+        self.assertIsNotNone(getattr(module, "apply_source_patches", None), "reviewed source patch gate is not implemented")
+        before, new = "append crt\n", "append crt once\n"
+        original = f"#!/usr/bin/env bash\n{before}"
+        patch = {
+            "file": "src/globals/scripts/zig-cc.sh",
+            "reason": "fixture",
+            "before_sha256": hashlib.sha256(original.encode()).hexdigest(),
+            "after_sha256": hashlib.sha256(f"#!/usr/bin/env bash\n{new}".encode()).hexdigest(),
+            "replace": {"old": before, "new": new},
+        }
+        registry = {"schema_version": 1, "patches": [patch]}
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp)
+            target = source / patch["file"]
+            target.parent.mkdir(parents=True)
+            target.write_text(original)
+            self.assertEqual(module.apply_source_patches(source, registry)[0]["status"], "applied")
+            self.assertEqual(target.read_text(), f"#!/usr/bin/env bash\n{new}")
+            # A second run over the patched tree must be a no-op, not a re-application.
+            self.assertEqual(module.apply_source_patches(source, registry)[0]["status"], "already-applied")
+            self.assertEqual(target.read_text(), f"#!/usr/bin/env bash\n{new}")
+            # The registry pins the digest of the whole reviewed file, so a fixture with the
+            # anchor text but different bytes must fail rather than be patched.
+            target.write_text(f"#!/usr/bin/env bash\n{before}\n")
+            with self.assertRaisesRegex(ValueError, "Pinned source file changed"):
+                module.apply_source_patches(source, registry)
+            # A patch whose result does not match the pinned post-image is refused.
+            registry["patches"][0]["before_sha256"] = hashlib.sha256(target.read_bytes()).hexdigest()
+            with self.assertRaisesRegex(ValueError, "Patch result digest mismatch"):
+                module.apply_source_patches(source, registry)
+
+    def test_source_patch_registry_matches_the_pinned_upstream_file(self):
+        registry = json.loads((REPO / "runtimes/php/config/spc-source-patches.json").read_text())
+        self.assertEqual(registry["schema_version"], 1)
+        for patch in registry["patches"]:
+            self.assertRegex(patch["before_sha256"], r"^[a-f0-9]{64}$")
+            self.assertRegex(patch["after_sha256"], r"^[a-f0-9]{64}$")
+            self.assertNotEqual(patch["before_sha256"], patch["after_sha256"])
+            self.assertTrue(patch["replace"]["old"])
+            self.assertNotEqual(patch["replace"]["old"], patch["replace"]["new"])
+            self.assertTrue(patch["reason"])
+        crt = next(row for row in registry["patches"] if row["file"] == "src/globals/scripts/zig-cc.sh")
+        self.assertIn("crtbegin", crt["replace"]["old"])
+        self.assertIn("HAVE_CRT", crt["replace"]["new"])
+
     def test_locked_dependency_digests_are_valid(self):
         registry = json.loads((REPO / "runtimes/php/config/spc-dependencies.json").read_text())
         self.assertEqual(len(registry), 15)
@@ -91,7 +138,7 @@ class BootstrapContracts(unittest.TestCase):
             self.assertRegex(row["sha256"], r"^[a-f0-9]{64}$")
 
     def test_invalid_build_version_fails_before_spc(self):
-        result = subprocess.run([str(REPO / "build.sh"), "php", "glibc", "full", "8.1"], text=True, capture_output=True)
+        result = subprocess.run([str(REPO / "build.sh"), "php", "8.1"], text=True, capture_output=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Unsupported PHP version", result.stderr)
 

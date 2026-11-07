@@ -90,12 +90,12 @@ class RedisSourceTests(unittest.TestCase):
 
 class RedisCLITests(unittest.TestCase):
     def test_dispatcher_plan_and_exact_version(self):
-        for args, target in [([], "musl"), (["8.10.3"], "musl"), (["glibc", "8.10.3"], "glibc"), (["8.10.3", "musl"], "musl")]:
+        for args in ([], ["8.10.3"]):
             with self.subTest(args=args):
                 run = subprocess.run([str(ROOT / "build.sh"), "redis", *args, "--print-plan"], text=True, capture_output=True)
                 self.assertEqual(run.returncode, 0, run.stderr)
                 plan = json.loads(run.stdout)
-                self.assertEqual((plan["version"], plan["target"]), ("8.10.3", target))
+                self.assertEqual((plan["version"], plan["target"]), ("8.10.3", "musl"))
                 self.assertNotIn("profile", plan)
                 self.assertNotIn("tls", plan)
         run = subprocess.run([str(ROOT / "build.sh"), "redis", "7.2.17", "--print-plan"], text=True, capture_output=True)
@@ -104,7 +104,7 @@ class RedisCLITests(unittest.TestCase):
 
     def test_invalid_arguments_fail_before_build(self):
         self.assertTrue((SCRIPTS / "build.sh").is_file(), "Redis CLI is missing")
-        for args in [["other"], ["8.12-rc2"], ["glibc", "musl"], ["full"], ["minimal"], ["--docker"], ["8.10.3", "7.2.17"], ["--bad"], ["../../tmp"]]:
+        for args in [["other"], ["8.12-rc2"], ["glibc"], ["musl"], ["glibc", "musl"], ["full"], ["minimal"], ["--docker"], ["8.10.3", "7.2.17"], ["--bad"], ["../../tmp"]]:
             with self.subTest(args=args):
                 run = subprocess.run([str(ROOT / "build.sh"), "redis", *args, "--print-plan"], text=True, capture_output=True)
                 self.assertNotEqual(run.returncode, 0)
@@ -120,28 +120,18 @@ class RedisBundleTests(unittest.TestCase):
         header = "Class: ELF64\nMachine: Advanced Micro Devices X86-64\n"
         result = self.bundle.parse_elf(header, "", "There is no dynamic section", "", "musl")
         self.assertTrue(result["static"])
+        self.assertIsNone(result["interpreter"])
+        self.assertIsNone(result["glibc_required"])
         for h, p, d, v in [(header, "INTERP", "", ""), (header, "", "(NEEDED) libc.so", ""), (header, "", "", "GLIBC_2.17"), ("Class: ELF64\nMachine: AArch64", "", "", "")]:
             with self.subTest(h=h, p=p, d=d, v=v), self.assertRaises(ValueError):
                 self.bundle.parse_elf(h, p, d, v, "musl")
 
-    def test_glibc_floor_comes_from_actual_symbols(self):
-        result = self.bundle.parse_elf("Class: ELF64\nMachine: Advanced Micro Devices X86-64", "[Requesting program interpreter: /lib64/ld-linux-x86-64.so.2]", "(NEEDED) Shared library: [libc.so.6]\n(NEEDED) Shared library: [libm.so.6]", "GLIBC_2.3 GLIBC_2.34 GLIBC_2.17", "glibc")
-        self.assertFalse(result["static"])
-        self.assertEqual(result["glibc_required"], "2.34")
-        self.assertEqual(result["needed"], ["libc.so.6", "libm.so.6"])
-        with self.assertRaises(ValueError):
-            self.bundle.parse_elf("Class: ELF64\nMachine: Advanced Micro Devices X86-64", "ld-linux", "(NEEDED) Shared library: [libssl.so.3]", "GLIBC_2.17", "glibc")
-
-    def test_glibc_unknown_abi_tags_are_rejected_and_relr_floor_is_recorded(self):
+    def test_only_the_static_musl_target_is_accepted(self):
         header = "Class: ELF64\nMachine: Advanced Micro Devices X86-64"
-        program = "[Requesting program interpreter: /lib64/ld-linux-x86-64.so.2]"
-        dynamic = "(NEEDED) Shared library: [libc.so.6]"
-        with self.assertRaises(ValueError):
-            self.bundle.parse_elf(header, program, dynamic, "GLIBC_2.17 GLIBC_ABI_FUTURE", "glibc")
-        result = self.bundle.parse_elf(header, program, dynamic + "\n(RELR)", "GLIBC_2.17 GLIBC_ABI_DT_RELR", "glibc")
-        self.assertEqual(result["glibc_required"], "2.36")
+        with self.assertRaisesRegex(ValueError, "musl"):
+            self.bundle.parse_elf(header, "[Requesting program interpreter: /lib64/ld-linux-x86-64.so.2]", "(NEEDED) Shared library: [libc.so.6]", "GLIBC_2.34", "glibc")
 
-    def test_static_musl_license_notice_is_required_and_recorded(self):
+    def test_musl_license_notice_is_required_and_recorded(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             notice = root / "COPYRIGHT"
@@ -150,9 +140,10 @@ class RedisBundleTests(unittest.TestCase):
             self.assertEqual(result["sha256"], hashlib.sha256(notice.read_bytes()).hexdigest())
             with self.assertRaises(FileNotFoundError):
                 self.bundle.libc_notice("musl", root / "missing")
-            self.assertIsNone(self.bundle.libc_notice("glibc", root / "missing"))
+            with self.assertRaisesRegex(ValueError, "musl"):
+                self.bundle.libc_notice("glibc", root / "missing")
 
-    def test_native_probe_rejects_wrong_libc_before_source_build(self):
+    def test_native_probe_requires_musl_headers_before_source_build(self):
         import shutil
         if not shutil.which("gcc") or not shutil.which("readelf"):
             self.skipTest("Native GCC/binutils not installed")
@@ -161,9 +152,8 @@ class RedisBundleTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.bundle.probe("gcc", "musl", work)
             self.assertFalse((work / "toolchain.json").exists())
-            metadata = self.bundle.probe("gcc", "glibc", work)
-            self.assertFalse(metadata["libc_probe"]["static"])
-            self.assertTrue((work / "toolchain.json").is_file())
+            with self.assertRaisesRegex(ValueError, "musl"):
+                self.bundle.probe("gcc", "glibc", work)
         if shutil.which("musl-gcc"):
             with tempfile.TemporaryDirectory() as temp:
                 metadata = self.bundle.probe("musl-gcc", "musl", Path(temp))

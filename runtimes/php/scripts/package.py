@@ -10,7 +10,7 @@ import tarfile
 
 def package(bundle, output):
     manifest = json.loads((bundle / "manifest.json").read_text())
-    parts = [manifest["php"]["version"], manifest["target"], manifest["profile"], manifest["architecture"], manifest["build_id"]]
+    parts = [manifest["php"]["version"], manifest["target"], manifest["architecture"], manifest["build_id"]]
     if any(not re.fullmatch(r"[a-zA-Z0-9_.-]+", value) for value in parts):
         raise ValueError("Invalid archive identity")
     name = "php-" + "-".join(parts)

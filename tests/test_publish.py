@@ -13,16 +13,20 @@ COMMIT = "a" * 40
 TAG = "runtimes-20261106-123-1"
 
 
+LOADER = "lib/musl/ld-musl-x86_64.so.1"
+
+
 def metadata():
     return {"schema_version": 1, "runtime": "php", "php": {"version": "8.4.10", "static_modules": ["Core", "PDO", "Zend OPcache"]},
-            "target": "glibc", "profile": "full", "architecture": "x86_64", "build_id": "fixture", "verification": "PASSED",
+            "target": "musl-dynamic", "linkage": "dynamic", "loader": {"path": LOADER, "sha256": "0" * 64, "version": "1.2.5"},
+            "architecture": "x86_64", "build_id": "fixture", "verification": "PASSED",
             "builder": {"commit": COMMIT}, "shared_modules": [{"name": "redis", "enabled_by_default": {"cli": False, "fpm": False}}]}
 
 
 def plan():
     return {"schema_version": 1, "event": "schedule", "repository": REPOSITORY, "commit": COMMIT,
             "run_id": "123", "run_attempt": "1", "release_tag": TAG, "publish": True, "has_updates": True,
-            "matrix": {"include": [{"php_series": "8.4", "php_version": "8.4.10", "target": "glibc", "profile": "full",
+            "matrix": {"include": [{"php_series": "8.4", "php_version": "8.4.10", "target": "musl-dynamic",
                                     "architecture": "x86_64", "previous_version": "8.4.9"}]}}
 
 
@@ -33,6 +37,10 @@ def packaged(directory):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("#!/bin/sh\nexit 0\n")
         path.chmod(0o755)
+    loader = bundle / LOADER
+    loader.parent.mkdir(parents=True, exist_ok=True)
+    loader.write_bytes(b"loader fixture")
+    loader.chmod(0o755)
     (bundle / "manifest.json").write_text(json.dumps(metadata()))
     load("package").package(bundle, directory / "assets")
     return directory / "assets"
@@ -85,33 +93,40 @@ class PublishContracts(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.module.validate_assets(root / "bad-assets")
 
-    def test_mixed_notes_do_not_claim_php_glibc_floor_for_redis(self):
-        redis = {"runtime": "redis", "redis": {"version": "8.10.3", "tls": False}, "target": "glibc", "architecture": "x86_64", "build_id": "redisfixture", "libc": {"minimum_version": "2.38", "static": False}}
+    def test_mixed_notes_describe_fully_static_redis(self):
+        redis = {"runtime": "redis", "redis": {"version": "8.10.3", "tls": False}, "target": "musl", "architecture": "x86_64", "build_id": "redisfixture", "libc": {"family": "musl", "minimum_version": None, "static": True}}
         notes = self.module.release_notes([metadata(), redis], REPOSITORY, COMMIT, plan())
-        for expected in ("PHP", "Redis", "8.10.3", "2.38", "redis-server", "redis-cli", "No profiles", "native"):
+        for expected in ("PHP", "Redis", "8.10.3", "redis-server", "redis-cli", "No profiles", "native", "fully static musl"):
             self.assertIn(expected, notes)
         self.assertIn("PHP", self.module.release_notes([metadata()], REPOSITORY, COMMIT))
         redis_notes = self.module.release_notes([redis], REPOSITORY, COMMIT)
         self.assertNotIn("2.17", redis_notes)
+        for static in (False, None):
+            with self.subTest(static=static):
+                broken = copy.deepcopy(redis)
+                broken["libc"]["static"] = static
+                with self.assertRaisesRegex(ValueError, "fully static musl"):
+                    self.module.release_notes([broken], REPOSITORY, COMMIT)
 
     def test_notes_describe_actual_bundles_and_workflow(self):
         notes = self.module.release_notes([metadata()], REPOSITORY, COMMIT, plan())
-        for expected in ("8.4.10", "8.4.9", "glibc", "full", "x86_64", "fixture", "PDO", "Zend OPcache", "redis", "SHA-256",
-                         f"https://github.com/{REPOSITORY}/actions/runs/123", f"https://github.com/{REPOSITORY}/commit/{COMMIT}"):
+        for expected in ("8.4.10", "8.4.9", "musl-dynamic", "x86_64", "fixture", "PDO", "Zend OPcache", "redis", "SHA-256",
+                         "lib/musl/", f"https://github.com/{REPOSITORY}/actions/runs/123", f"https://github.com/{REPOSITORY}/commit/{COMMIT}"):
             self.assertIn(expected, notes)
         self.assertIn("caller-owned", notes)
         self.assertIn("initial CLI disabled, FPM disabled", notes)
+        self.assertNotIn("profile", notes.lower())
         self.assertNotIn("tested on glibc 2.17", notes)
         self.assertNotIn("fully reproducible", notes)
 
     def test_plan_rejects_missing_extra_wrong_patch_or_commit(self):
         self.module.validate_plan(plan(), [metadata()], TAG, REPOSITORY, COMMIT)
-        for defect in ("missing", "extra", "patch", "builder", "plan_commit", "plan_tag", "duplicate", "manual_false", "row_series", "row_profile"):
+        for defect in ("missing", "extra", "patch", "builder", "plan_commit", "plan_tag", "duplicate", "manual_false", "row_series", "row_profile", "row_target", "static_target"):
             with self.subTest(defect=defect):
                 data, policy = [metadata()], plan()
                 if defect == "missing": data = []
                 if defect == "extra":
-                    other = metadata(); other["target"] = "musl"; data.append(other)
+                    other = metadata(); other["build_id"] = "other"; data.append(other)
                 if defect == "patch": data[0]["php"]["version"] = "8.4.11"
                 if defect == "builder": data[0]["builder"]["commit"] = "b" * 40
                 if defect == "plan_commit": policy["commit"] = "b" * 40
@@ -120,8 +135,21 @@ class PublishContracts(unittest.TestCase):
                 if defect == "manual_false": policy["publish"] = False
                 if defect == "row_series": policy["matrix"]["include"][0]["php_series"] = "8.3"
                 if defect == "row_profile": policy["matrix"]["include"][0]["profile"] = "minimal"
+                if defect == "row_target": policy["matrix"]["include"][0]["target"] = "musl"
+                if defect == "static_target": data[0]["linkage"] = "static"
                 with self.assertRaises(ValueError):
                     self.module.validate_plan(policy, data, TAG, REPOSITORY, COMMIT)
+
+    def test_assets_require_the_bundled_loader(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assets = packaged(root)
+            self.assertEqual(len(self.module.validate_assets(assets)), 3)
+            bundle = root / "bundle"
+            (bundle / LOADER).unlink()
+            load("package").package(bundle, root / "no-loader")
+            with self.assertRaisesRegex(ValueError, "loader"):
+                self.module.validate_assets(root / "no-loader")
 
     def gh_fixture(self, fail_upload=False, existing=False, lookup_error=False):
         calls = []

@@ -25,25 +25,27 @@ class RuntimeUpdateContracts(unittest.TestCase):
         self.latest = {"8.5": "8.5.1", "8.4": "8.4.10", "8.3": "8.3.2", "8.2": "8.2.3"}
 
     def make(self, event="schedule", php_current=False, redis_current=False):
-        history = {(series, target, "full", "x86_64"): version for series, version in self.latest.items() for target in ("glibc", "musl")} if php_current else {}
-        redis_history = {(version, target, "x86_64"): version for version in ("8.10.3", "7.4.12", "7.2.17") for target in ("glibc", "musl")} if redis_current else {}
+        history = {(series, "musl-dynamic", "x86_64"): version for series, version in self.latest.items()} if php_current else {}
+        redis_history = {(version, "musl", "x86_64"): version for version in ("8.10.3", "7.4.12", "7.2.17")} if redis_current else {}
         with patch.object(self.module.php, "latest_php", side_effect=self.latest.__getitem__), patch.object(self.module.php, "published_versions", return_value=history), patch.object(self.module, "published_redis", return_value=redis_history):
-            return self.module.make_plan(event=event, repository="owner/repo", commit="a" * 40, run_id="123", run_attempt="1", profile="full", publish=False)
+            return self.module.make_plan(event=event, repository="owner/repo", commit="a" * 40, run_id="123", run_attempt="1", publish=False)
 
-    def test_manual_builds_all_php_series_and_pinned_redis_on_both_targets(self):
+    def test_manual_builds_all_php_series_and_pinned_redis_on_musl_only(self):
         policy = self.make("workflow_dispatch", True, True)
         php = policy["matrix"]["include"]
         redis = policy["redis_matrix"]["include"]
-        self.assertEqual(len(php), 8)
+        self.assertEqual(len(php), 4)
         self.assertEqual({row["php_series"] for row in php}, {"8.2", "8.3", "8.4", "8.5"})
-        self.assertEqual(len(redis), 6)
+        self.assertEqual({row["target"] for row in php}, {"musl-dynamic"})
+        self.assertTrue(all("profile" not in row for row in php))
+        self.assertEqual(len(redis), 3)
         self.assertEqual({row["redis_version"] for row in redis}, {"8.10.3", "7.4.12", "7.2.17"})
-        self.assertEqual({row["target"] for row in redis}, {"glibc", "musl"})
+        self.assertEqual({row["target"] for row in redis}, {"musl"})
         self.assertTrue(all("profile" not in row for row in redis))
         self.assertFalse(policy["publish"])
 
     def test_scheduled_noops_are_independent_per_runtime(self):
-        for php_current, redis_current, php_count, redis_count in [(False, False, 8, 6), (True, False, 0, 6), (False, True, 8, 0), (True, True, 0, 0)]:
+        for php_current, redis_current, php_count, redis_count in [(False, False, 4, 3), (True, False, 0, 3), (False, True, 4, 0), (True, True, 0, 0)]:
             with self.subTest(php=php_current, redis=redis_current):
                 policy = self.make(php_current=php_current, redis_current=redis_current)
                 self.assertEqual(len(policy["matrix"]["include"]), php_count)
@@ -58,7 +60,7 @@ class RuntimeUpdateContracts(unittest.TestCase):
             self.module.write_outputs(output, policy)
             fields = dict(line.split("=", 1) for line in output.read_text().splitlines())
             self.assertEqual(json.loads(fields["matrix"]), {"include": []})
-            self.assertEqual(len(json.loads(fields["redis_matrix"])["include"]), 6)
+            self.assertEqual(len(json.loads(fields["redis_matrix"])["include"]), 3)
             self.assertEqual(fields["has_php_updates"], "false")
             self.assertEqual(fields["has_redis_updates"], "true")
             self.assertEqual(fields["publish"], "true")
@@ -70,8 +72,8 @@ class RuntimeUpdateContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, env, clear=True), patch.object(self.module.php, "latest_php", side_effect=self.latest.__getitem__), patch("sys.argv", ["updates.py", "--output", str(Path(temp) / "plan.json")]):
             self.module.main()
             policy = json.loads((Path(temp) / "plan.json").read_text())
-            self.assertEqual(len(policy["matrix"]["include"]), 8)
-            self.assertEqual(len(policy["redis_matrix"]["include"]), 6)
+            self.assertEqual(len(policy["matrix"]["include"]), 4)
+            self.assertEqual(len(policy["redis_matrix"]["include"]), 3)
 
     def test_redis_history_rejects_incomplete_or_unverified_asset_groups(self):
         root = "redis-8.10.3-musl-x86_64-build123"

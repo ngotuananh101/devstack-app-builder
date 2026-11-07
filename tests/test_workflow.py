@@ -21,19 +21,25 @@ from test_build import load
 
 
 class WorkflowContracts(unittest.TestCase):
-    def test_manual_inputs_do_not_allow_runtime_series_or_libc_narrowing(self):
+    def test_manual_inputs_do_not_allow_profile_target_or_series_narrowing(self):
         workflow = (REPO / ".github/workflows/build.yml").read_text()
         inputs = workflow.split("    inputs:\n", 1)[1].split("\npermissions:", 1)[0]
         names = re.findall(r"^      ([a-z_]+):$", inputs, re.MULTILINE)
-        self.assertEqual(set(names), {"profile", "publish", "release_tag"})
+        self.assertEqual(set(names), {"publish", "release_tag"})
         planner = workflow.split("  plan:\n", 1)[1].split("  build-php:\n", 1)[0]
         self.assertNotIn("inputs.php_version", planner)
         self.assertNotIn("inputs.target", planner)
+        self.assertNotIn("PROFILE_INPUT", planner)
         self.assertIn("scripts/updates.py", planner)
         self.assertIn("redis_matrix:", planner)
         self.assertIn("  build-redis:\n", workflow, "Missing native Redis build job")
+        php = workflow.split("  build-php:\n", 1)[1].split("  build-redis:\n", 1)[0]
+        self.assertIn('./build.sh php "$BUILD_VERSION"', php)
+        self.assertNotIn("BUILD_TARGET", php)
+        self.assertNotIn("BUILD_PROFILE", php)
         redis = workflow.split("  build-redis:\n", 1)[1].split("  publish:\n", 1)[0]
-        self.assertIn('./build.sh redis "$BUILD_TARGET" "$BUILD_VERSION"', redis)
+        self.assertIn('./build.sh redis "$BUILD_VERSION"', redis)
+        self.assertNotIn("BUILD_TARGET", redis)
         self.assertNotIn("BUILD_PROFILE", redis)
         self.assertNotIn("docker", redis.lower())
         publish = workflow.split("  publish:\n", 1)[1]
@@ -68,7 +74,13 @@ class WorkflowContracts(unittest.TestCase):
                 path = bundle / executable
                 path.write_text("#!/bin/sh\nexit 0\n")
                 path.chmod(0o755)
-            manifest = {"schema_version": 1, "runtime": "php", "php": {"version": "8.4.27"}, "target": "glibc", "profile": "full", "architecture": "x86_64", "build_id": "test", "verification": "PASSED"}
+            loader = bundle / "lib/musl/ld-musl-x86_64.so.1"
+            loader.parent.mkdir(parents=True)
+            loader.write_bytes(b"loader fixture")
+            loader.chmod(0o755)
+            manifest = {"schema_version": 1, "runtime": "php", "php": {"version": "8.4.27"}, "target": "musl-dynamic",
+                        "linkage": "dynamic", "loader": {"path": "lib/musl/ld-musl-x86_64.so.1"}, "architecture": "x86_64",
+                        "build_id": "test", "verification": "PASSED"}
             (bundle / "manifest.json").write_text(json.dumps(manifest))
             archive = packager.package(bundle, root / "assets")
             self.assertEqual(len(publisher.validate_assets(root / "assets")), 3)
@@ -91,9 +103,11 @@ class WorkflowContracts(unittest.TestCase):
     def test_release_validator_rejects_invalid_archive_structure(self):
         publisher = load("publish")
         # Hand-authored tar fixtures exercise validation, not the packager's naming logic.
-        identity = "php-8.4.27-glibc-full-x86_64-test"
-        manifest = {"schema_version": 1, "runtime": "php", "php": {"version": "8.4.27"}, "target": "glibc", "profile": "full", "architecture": "x86_64", "build_id": "test", "verification": "PASSED"}
-        executables = ("bin/php", "bin/php-fpm", "bin/php-ext", "libexec/php", "libexec/php-fpm")
+        identity = "php-8.4.27-musl-dynamic-x86_64-test"
+        manifest = {"schema_version": 1, "runtime": "php", "php": {"version": "8.4.27"}, "target": "musl-dynamic",
+                    "linkage": "dynamic", "loader": {"path": "lib/musl/ld-musl-x86_64.so.1"}, "architecture": "x86_64",
+                    "build_id": "test", "verification": "PASSED"}
+        executables = ("bin/php", "bin/php-fpm", "bin/php-ext", "libexec/php", "libexec/php-fpm", "lib/musl/ld-musl-x86_64.so.1")
         for defect in ("directories", "split_roots", "wrong_identity", "missing_identity", "duplicate", "special"):
             with self.subTest(defect=defect), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
@@ -127,31 +141,28 @@ class WorkflowContracts(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     publisher.validate_assets(root)
 
-    def test_scheduled_and_manual_matrices_default_to_full(self):
+    def test_manual_and_scheduled_matrices_cover_all_series_on_one_target(self):
         workflow = (REPO / ".github/workflows/build.yml").read_text()
-        manual = re.search(r"^      profile:\n(?P<config>(?:^        .*\n)+)", workflow, re.MULTILINE)
-        self.assertIsNotNone(manual)
-        manual_default = re.search(r"^        default: (\w+)$", manual["config"], re.MULTILINE)[1]
-        schedule_default = re.search(r"PROFILE_INPUT: \$\{\{ inputs\.profile \|\| '(\w+)' \}\}", workflow)[1]
+        self.assertNotIn("PROFILE_INPUT", workflow)
+        self.assertNotIn("inputs.profile", workflow)
         plan_job = workflow.split("  plan:\n", 1)[1].split("  build-php:\n", 1)[0]
         command = textwrap.dedent(plan_job.split("        run: |\n", 1)[1].split("      - name:", 1)[0])
         from test_runtime_updates import load_planner
         planner = load_planner()
         upstream = {"8.5": "8.5.1", "8.4": "8.4.10", "8.3": "8.3.2", "8.2": "8.2.3"}
         from test_updates import REPOSITORY
-        scenarios = (("schedule", schedule_default, "full", False, False, 8, 6),
-                     ("workflow_dispatch", manual_default, "full", True, True, 8, 6),
-                     ("workflow_dispatch", "minimal", "minimal", False, False, 8, 6),
-                     ("schedule", schedule_default, "full", True, False, 0, 6),
-                     ("schedule", schedule_default, "full", False, True, 8, 0),
-                     ("schedule", schedule_default, "full", True, True, 0, 0))
-        for event, profile, expected, php_current, redis_current, php_count, redis_count in scenarios:
+        scenarios = (("schedule", False, False, 4, 3),
+                     ("workflow_dispatch", True, True, 4, 3),
+                     ("schedule", True, False, 0, 3),
+                     ("schedule", False, True, 4, 0),
+                     ("schedule", True, True, 0, 0))
+        for event, php_current, redis_current, php_count, redis_count in scenarios:
             with self.subTest(event=event, php_current=php_current, redis_current=redis_current), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 output = root / "output"
-                history = {(series, target, "full", "x86_64"): version for series, version in upstream.items() for target in ("glibc", "musl")} if php_current else {}
-                redis_history = {(version, target, "x86_64"): version for version in ("8.10.3", "7.4.12", "7.2.17") for target in ("glibc", "musl")} if redis_current else {}
-                env = {**os.environ, "PROFILE_INPUT": profile, "PUBLISH": "false", "RELEASE_TAG": "",
+                history = {(series, "musl-dynamic", "x86_64"): version for series, version in upstream.items()} if php_current else {}
+                redis_history = {(version, "musl", "x86_64"): version for version in ("8.10.3", "7.4.12", "7.2.17")} if redis_current else {}
+                env = {**os.environ, "PUBLISH": "false", "RELEASE_TAG": "",
                        "GITHUB_OUTPUT": str(output), "GITHUB_EVENT_NAME": event, "GITHUB_REPOSITORY": REPOSITORY,
                        "GITHUB_SHA": "a" * 40, "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}
                 # Execute the workflow's planner entry point; control only upstream/public network data.
@@ -174,9 +185,11 @@ class WorkflowContracts(unittest.TestCase):
                 self.assertEqual(len(rows), php_count)
                 self.assertEqual(len(policy["redis_matrix"]["include"]), redis_count)
                 if rows:
-                    self.assertEqual({row["profile"] for row in rows}, {expected})
                     self.assertEqual({row["php_version"] for row in rows}, {"8.5.1", "8.4.10", "8.3.2", "8.2.3"})
-                    self.assertEqual({row["target"] for row in rows}, {"glibc", "musl"})
+                    self.assertEqual({row["target"] for row in rows}, {"musl-dynamic"})
+                    self.assertTrue(all("profile" not in row for row in rows))
+                if redis_count:
+                    self.assertEqual({row["target"] for row in policy["redis_matrix"]["include"]}, {"musl"})
 
     def test_noop_matrix_and_publication_are_gated_by_persisted_plan(self):
         workflow = (REPO / ".github/workflows/build.yml").read_text()
@@ -219,15 +232,16 @@ class WorkflowContracts(unittest.TestCase):
         publish = workflow.split("  publish:\n", 1)[1]
         pattern = re.search(r"^          pattern: (.+)$", publish, re.MULTILINE)[1]
         plan_name = re.search(r"^          name: (.+)$", plan_job, re.MULTILINE)[1]
-        for artifact in ("runtime-php-8.4.10-glibc-full-x86_64", "runtime-redis-8.10.3-musl-x86_64"):
+        for artifact in ("runtime-php-8.4.10-musl-dynamic-x86_64", "runtime-redis-8.10.3-musl-x86_64"):
             self.assertTrue(fnmatch.fnmatchcase(artifact, pattern))
         self.assertFalse(fnmatch.fnmatchcase(plan_name, pattern), "Plan JSON must not be merged into bundle assets")
 
-    def test_ci_uploads_verified_archives_and_exposes_full(self):
+    def test_ci_uploads_verified_archives_without_profile_inputs(self):
         workflow = (REPO / ".github/workflows/build.yml").read_text()
         self.assertIn("python3 -I -m unittest discover -s tests -v", workflow)
         self.assertIn("dist/assets/", workflow)
-        self.assertIn("options: [minimal, full]", workflow)
+        self.assertNotIn("options: [minimal, full]", workflow)
+        self.assertNotIn("minimal", workflow)
         self.assertIn("permissions:\n  contents: read", workflow)
         self.assertIn("publish", workflow)
         self.assertIn("inputs.publish", workflow)
