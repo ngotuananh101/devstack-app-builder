@@ -41,8 +41,13 @@ source_dir="$(python3 -I "$RUNTIME_DIR/scripts/source.py" --download "$work" "$v
 deps="$(toolchain build-dependencies --work "$work" --zig-dir "$zig_dir")"
 toolchain build-loader --work "$work" --zig-dir "$zig_dir"
 toolchain write-provenance --work "$work" --output "$work/toolchain.json"
-mapfile -t flags < <(toolchain configure-flags)
-mapfile -t environment < <(toolchain env --zig-dir "$zig_dir" --deps "$deps")
+# Command substitution first: a failing subcommand inside `< <(...)` never
+# reaches `set -e`, and the arrays would silently stay empty — configure would
+# then run with the caller's PATH, no CC, and no --disable-rpath.
+flag_list="$(toolchain configure-flags)"
+mapfile -t flags <<< "$flag_list"
+environment_list="$(toolchain env --zig-dir "$zig_dir" --deps "$deps")"
+mapfile -t environment <<< "$environment_list"
 # The compiled prefix is irrelevant: relocation comes from --argv0 in the launchers,
 # and the default keeps bindir ending in /bin, which launchers.install expects.
 mkdir -p "$work/build"

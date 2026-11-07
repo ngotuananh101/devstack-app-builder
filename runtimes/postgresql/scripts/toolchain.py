@@ -180,16 +180,21 @@ def build_env(zig_dir, deps_prefix):
     zig_dir = Path(zig_dir)
     deps_prefix = Path(deps_prefix)
     pkgconfig = deps_prefix / "lib/pkgconfig"
+    # Everything Zig-specific rides on the compiler, never on LDFLAGS: LDFLAGS is
+    # recorded in Makefile.global, returned by `pg_config --ldflags` and copied
+    # into libpq.pc's Libs.private, so it must stay a value any linker accepts
+    # and a path a user can still use. -dynamic is a Zig option, and ICU's static
+    # archives are C++, so the C++ runtime has to be named on every link that
+    # reaches them -- `postgres` is linked with CC, not CXX.
     return {
         "PATH": HOST_PATH,
         "LC_ALL": "C",
         "SOURCE_DATE_EPOCH": "0",
-        "CC": f"{zig_dir}/zig cc -target {TARGET}",
-        "CXX": f"{zig_dir}/zig c++ -target {TARGET}",
+        "CC": f"{zig_dir}/zig cc -target {TARGET} -dynamic -lc++ -lc++abi",
+        "CXX": f"{zig_dir}/zig c++ -target {TARGET} -dynamic -lc++ -lc++abi",
         "CPPFLAGS": load_options()["configure"]["cppflags"],
         "CFLAGS": "-O2 -fPIC",
-        # Zig links musl statically unless told otherwise; the bundle is musl-dynamic.
-        "LDFLAGS": f"-L{deps_prefix}/lib -dynamic",
+        "LDFLAGS": f"-L{deps_prefix}/lib",
         "PKG_CONFIG_PATH": str(pkgconfig),
         "PKG_CONFIG_LIBDIR": str(pkgconfig),
         # Zig needs a writable cache even when the caller's environment is scrubbed;
@@ -214,6 +219,34 @@ def dependency_plan(options, work=None):
     return plan
 
 
+class BuildFailure(ValueError):
+    """A build step failed; the captured output decides who is to blame."""
+
+    def __init__(self, message, output):
+        super().__init__(message)
+        self.output = output
+
+
+# What a compiler or linker says when it cannot do its job, as opposed to what a
+# broken source tree, a missing file or a full disk says.
+COMPILER_DIAGNOSTICS = (
+    "error: unknown type name",
+    "error: use of undeclared identifier",
+    "fatal error:",
+    "ld.lld: error:",
+    "undefined symbol",
+    "cannot find -l",
+    "cannot create executables",
+    "unsupported option",
+    "recompile with -fPIC",
+)
+
+
+def compiler_failure(output):
+    """True when the captured output is a C/C++ compiler or linker complaint."""
+    return any(marker in output for marker in COMPILER_DIAGNOSTICS)
+
+
 def _call(command, cwd, env, what):
     # The dependency stack is a tens-of-minutes build with its output captured,
     # so the log needs a stage boundary on each side to stay diagnosable.
@@ -222,7 +255,8 @@ def _call(command, cwd, env, what):
     result = subprocess.run(command, cwd=cwd, env=env, text=True, capture_output=True)
     elapsed = time.monotonic() - started
     if result.returncode != 0:
-        raise ValueError(f"{what} failed after {elapsed:.0f}s:\n{result.stdout[-4000:]}{result.stderr[-4000:]}")
+        output = result.stdout[-4000:] + result.stderr[-4000:]
+        raise BuildFailure(f"{what} failed after {elapsed:.0f}s:\n{output}", output)
     print(f"{what}: ok in {elapsed:.0f}s", file=sys.stderr, flush=True)
     return result
 
@@ -266,34 +300,94 @@ def _util_linux(source, build, deps, env):
     _call(["make", "install"], build, env, "util-linux install")
 
 
+def non_pic_relocations(archive):
+    """Relocations that make a static archive unusable in a shared object.
+
+    Only allocated sections matter: debug sections legitimately carry absolute
+    relocations and never reach the link.
+    """
+    result = subprocess.run(["readelf", "-rW", str(archive)], text=True, capture_output=True)
+    if result.returncode != 0:
+        raise ValueError(f"Cannot read relocations from {archive}: {result.stderr.strip()}")
+    found = []
+    in_debug = False
+    for line in result.stdout.splitlines():
+        if line.startswith("Relocation section"):
+            name = line.split("'")[1] if "'" in line else ""
+            # Section names arrive as .rela.debug_info / .rel.debug_abbrev.
+            name = name.removeprefix(".rela").removeprefix(".rel")
+            in_debug = name.startswith(".debug") or name.startswith(".zdebug")
+            continue
+        if in_debug:
+            continue
+        if "R_X86_64_32S" in line or "R_X86_64_32 " in line:
+            found.append(line)
+    return found
+
+
+def check_position_independent(*archives):
+    """The plan mandates -fPIC static archives; ICU is the one that can slip."""
+    for archive in archives:
+        found = non_pic_relocations(archive)
+        if found:
+            raise ValueError(
+                f"{archive} was built without -fPIC; the first offending relocation is "
+                f"{found[0].strip()}. Static archives are linked into a shared object.")
+
+
+def pin_version(name):
+    """The exact version config/sources.json pins for a dependency."""
+    pins = _load(SOURCE_MODULE, "pg_source").dependencies()
+    if name not in pins:
+        raise ValueError(f"No pinned {name} in config/sources.json")
+    return pins[name]["version"]
+
+
 def _icu(source, build, deps, env):
     # ICU keeps its autotools project one level down, under icu/source.
     configure = source / "source/configure"
     if not configure.is_file():
         raise ValueError(f"ICU source layout changed; no source/configure under {source}")
-    try:
-        _call([str(configure), f"--prefix={deps}", "--enable-static", "--disable-shared",
+    version = pin_version("icu")
+    # ICU writes its own CXXFLAGS into icudefs.mk and ignores the environment
+    # variable, so -fPIC has to arrive as a configure assignment. Without it the
+    # static archives carry R_X86_64_32S relocations and refuse to link into a
+    # shared object; only the non-PIE `postgres` executable would hide that.
+    command = [str(configure), f"--prefix={deps}", "--enable-static", "--disable-shared",
                "--with-data-packaging=static", "--disable-tests", "--disable-samples",
-               "--disable-extras"], build, env, "ICU configure")
-        _call(["make", "-j", str(os.cpu_count() or 2)], build, env, "ICU make")
-        _call(["make", "install"], build, env, "ICU install")
-    except ValueError as exc:
+               "--disable-extras", "CXXFLAGS=-O2 -fPIC", "CFLAGS=-O2 -fPIC"]
+    try:
+        _call(command, build, env, "ICU configure")
+    except BuildFailure as exc:
+        # Only a compiler/linker complaint is attributable to the C++ toolchain;
+        # a broken tree, a missing file or a full disk is not a reason to drop
+        # ICU, and pre-emptively taking the fallback is exactly what the plan
+        # forbids. Nothing here is a user-selectable profile.
+        if not compiler_failure(exc.output):
+            raise
         raise ValueError(
-            "ICU 79.1 did not compile with zig c++ -target x86_64-linux-musl; "
+            f"ICU {version} did not compile with zig c++ -target {TARGET}; "
             "switch configure.shared to --without-icu and record the reason in "
-            f"config/build-options.json ({exc})") from exc
+            f"config/build-options.json. ({exc})") from exc
+    _call(["make", "-j", str(os.cpu_count() or 2)], build, env, "ICU make")
+    _call(["make", "install"], build, env, "ICU install")
+    check_position_independent(*(Path(deps) / "lib" / name
+                                 for name in ("libicuuc.a", "libicui18n.a", "libicudata.a")))
 
 
 STEPS = {"zlib": _zlib, "openssl": _openssl, "libxml2": _libxml2, "icu": _icu,
          "util-linux": _util_linux}
 
 # Each upstream ships its licence under a different name; the first match wins.
+# util-linux ships a COPYING that is the GPL-2.0 text for the programs, but the
+# artefact this build installs and links is libuuid, which is LGPL-2.1-or-later;
+# shipping COPYING would contradict the pin's own SPDX field.
 LICENSES = {
     "zlib": ("LICENSE",),
     "openssl": ("LICENSE.txt",),
     "libxml2": ("Copyright",),
     "icu": ("LICENSE",),
-    "util-linux": ("COPYING",),
+    "util-linux": ("Documentation/licenses/COPYING.LGPL-2.1-or-later", "README.licensing"),
 }
 
 
@@ -303,6 +397,51 @@ def _license(source, name):
         if path.is_file():
             return {"path": str(path), "sha256": digest(path)}
     raise ValueError(f"{name} source is missing its licence file: {source}")
+
+
+ICU_PROBE = """\
+#include <unicode/utypes.h>
+#include <unicode/ustring.h>
+#include <stdio.h>
+
+int main(void) {
+    UErrorCode status = U_ZERO_ERROR;
+    UChar buffer[16];
+    u_strToUpper(buffer, 16, buffer, 0, "", &status);
+    puts(u_errorName(status));
+    return status == U_ZERO_ERROR ? 0 : 1;
+}
+"""
+
+
+def icu_link_flags(deps_prefix):
+    """The ICU link line PostgreSQL's own Makefile will use, as a list."""
+    return [f"-L{deps_prefix}/lib", "-licui18n", "-licuuc", "-licudata", "-lpthread", "-lm"]
+
+
+def check_icu_links(work, env, deps_prefix):
+    """Prove the ICU archives link as PostgreSQL will link them, and run.
+
+    ICU ships static C++ archives; PostgreSQL links the backend with ``CC``, so
+    nothing on that command line names a C++ runtime unless ``build_env`` does.
+    Configure only checks ICU through pkg-config, so without this the failure
+    would surface deep inside ``make world-bin`` instead of here.
+    """
+    work = Path(work)
+    work.mkdir(parents=True, exist_ok=True)
+    source = work / "icu_probe.c"
+    source.write_text(ICU_PROBE)
+    binary = work / "icu_probe"
+    binary.unlink(missing_ok=True)
+    executable = env["CC"].split() + ["-O2", "-fPIC", f"-I{deps_prefix}/include",
+                                      str(source), *env["LDFLAGS"].split(),
+                                      *icu_link_flags(deps_prefix), "-o", str(binary)]
+    _call(executable, work, env, "ICU link probe")
+    run = subprocess.run([str(binary)], text=True, capture_output=True)
+    if run.returncode != 0 or "U_ZERO_ERROR" not in run.stdout:
+        raise ValueError(
+            "The ICU link probe built but does not run; the static ICU archives are "
+            f"not usable: rc={run.returncode} out={run.stdout.strip()!r} err={run.stderr.strip()!r}")
 
 
 def build_dependencies(work, pins, zig_dir):
@@ -325,6 +464,8 @@ def build_dependencies(work, pins, zig_dir):
         build = work / "builds" / name
         build.mkdir(parents=True, exist_ok=False)
         STEPS[name](source, build, deps, env)
+    if any(step["name"] == "icu" for step in plan):
+        check_icu_links(work / "icu-link", env, deps)
     (work / "licenses.json").write_text(json.dumps(licenses, indent=2, sort_keys=True) + "\n")
     return deps
 

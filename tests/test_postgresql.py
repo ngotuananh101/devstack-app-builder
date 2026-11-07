@@ -446,8 +446,8 @@ class PostgreSQLToolchainTests(unittest.TestCase):
 
     def test_build_environment_keeps_musl_headers_first(self):
         env = self.toolchain.build_env(Path("/zig"), Path("/deps"))
-        self.assertEqual(env["CC"], "/zig/zig cc -target x86_64-linux-musl")
-        self.assertEqual(env["CXX"], "/zig/zig c++ -target x86_64-linux-musl")
+        self.assertTrue(env["CC"].startswith("/zig/zig cc -target x86_64-linux-musl"))
+        self.assertTrue(env["CXX"].startswith("/zig/zig c++ -target x86_64-linux-musl"))
         self.assertIn("-idirafter /usr/include", env["CPPFLAGS"])
         self.assertNotIn("-I/usr/include", env["CPPFLAGS"])
         self.assertTrue(env["PKG_CONFIG_PATH"].startswith("/deps"))
@@ -460,9 +460,25 @@ class PostgreSQLToolchainTests(unittest.TestCase):
         self.assertEqual(env["SOURCE_DATE_EPOCH"], "0")
         self.assertIn("-O2 -fPIC", env["CFLAGS"])
         self.assertIn("-L/deps/lib", env["LDFLAGS"])
-        self.assertIn("-dynamic", env["LDFLAGS"])
+        # -dynamic is a Zig CLI flag. LDFLAGS is recorded in Makefile.global,
+        # reported by `pg_config --ldflags` and copied into libpq.pc, so it must
+        # stay something a user's own linker understands.
+        self.assertNotIn("-dynamic", env["LDFLAGS"])
+        self.assertIn("-dynamic", env["CC"].split())
+        self.assertIn("-dynamic", env["CXX"].split())
         self.assertNotIn("-static", env["LDFLAGS"])
         self.assertNotIn("rpath", env["LDFLAGS"])
+
+    def test_build_environment_gives_icu_the_cxx_runtime_and_pic(self):
+        # ICU is a static C++ archive linked by `zig cc`; without a named C++
+        # runtime the backend link fails on libc++ symbols. It rides on CC, not
+        # LDFLAGS, so `pg_config --ldflags` stays usable advice.
+        env = self.toolchain.build_env(Path("/zig"), Path("/deps"))
+        self.assertIn("-lc++", env["CC"].split())
+        self.assertIn("-lc++abi", env["CC"].split())
+        self.assertIn("-lc++", env["CXX"].split())
+        self.assertNotIn("-lc++", env["LDFLAGS"].split())
+        self.assertIn("-fPIC", env["CFLAGS"])
 
     def test_zig_pin_is_checked_before_any_configure(self):
         # A mismatched declared version must raise, not warn.
@@ -567,6 +583,158 @@ class PostgreSQLToolchainTests(unittest.TestCase):
             work = Path(temp)
             self.assertNotEqual(self.toolchain.archives(work), work / "downloads")
             self.assertEqual(self.toolchain.archives(work), work / "archives")
+
+    def test_extraction_rejects_escapes_special_members_and_multiple_roots(self):
+        # prepare_zig runs this on a network archive before any build output
+        # exists, so a regression here is silent without a test.
+        def archive(members):
+            path = Path(tempfile.mkdtemp()) / "probe.tar.gz"
+            with tarfile.open(path, "w:gz") as tar:
+                for name, data, kind in members:
+                    info = tarfile.TarInfo(name)
+                    if kind == "file":
+                        info.size = len(data)
+                        tar.addfile(info, io.BytesIO(data))
+                    elif kind == "dir":
+                        info.type = tarfile.DIRTYPE
+                        tar.addfile(info)
+                    else:
+                        info.type = tarfile.LNKTYPE
+                        info.linkname = "zlib-1.4/LICENSE"
+                        tar.addfile(info)
+            return path
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            good = archive([("zlib-1.4/", b"", "dir"), ("zlib-1.4/LICENSE", b"text", "file")])
+            extracted = self.toolchain._confined_extract(good, root / "good")
+            self.assertEqual(extracted, root / "good/zlib-1.4")
+            self.assertEqual((extracted / "LICENSE").read_bytes(), b"text")
+
+            for tag, members in {
+                "escape": [("zlib-1.4/", b"", "dir"), ("zlib-1.4/../../etc/passwd", b"x", "file")],
+                "absolute": [("/etc/passwd", b"x", "file")],
+                "hardlink": [("zlib-1.4/", b"", "dir"), ("zlib-1.4/link", b"", "link")],
+                "two roots": [("a/LICENSE", b"x", "file"), ("b/LICENSE", b"y", "file")],
+            }.items():
+                with self.subTest(tag), self.assertRaises(ValueError):
+                    self.toolchain._confined_extract(archive(members), root / tag)
+
+            with self.assertRaises(FileExistsError):
+                self.toolchain._confined_extract(good, root / "good")
+
+    def test_fetch_reverifies_a_cached_archive_against_its_pin(self):
+        with tempfile.TemporaryDirectory() as temp:
+            downloads = Path(temp)
+            payload = b"archive bytes"
+            existing = downloads / "zlib-1.4.tar.gz"
+            existing.write_bytes(payload)
+            digest = hashlib.sha256(payload).hexdigest()
+            pin = {"url": "https://example.invalid/zlib-1.4.tar.gz", "sha256": digest}
+            # A matching cached archive is reused without any network access.
+            self.assertEqual(self.toolchain._fetch(pin, downloads), existing)
+            # A cached archive that no longer matches its pin is refused, not used.
+            existing.write_bytes(b"tampered")
+            with self.assertRaisesRegex(ValueError, "changed on disk"):
+                self.toolchain._fetch(pin, downloads)
+            existing.unlink()
+            # A fresh download is written to .part first, so a failed or partial
+            # transfer can never be mistaken for the verified archive.
+            self.assertEqual(list(downloads.glob("*.part")), [])
+
+    def test_licence_files_match_the_spdx_the_pin_declares(self):
+        pins = module("source").dependencies()
+        expected = {
+            "zlib": "LICENSE",
+            "openssl": "LICENSE.txt",
+            "libxml2": "Copyright",
+            "icu": "LICENSE",
+            # libuuid is LGPL-2.1-or-later; COPYING is util-linux's own GPL-2.0.
+            "util-linux": "Documentation/licenses/COPYING.LGPL-2.1-or-later",
+        }
+        for name, filename in expected.items():
+            with self.subTest(name=name):
+                self.assertEqual(self.toolchain.LICENSES[name][0], filename)
+        self.assertIn("LGPL", pins["util-linux"]["license"])
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp)
+            (source / "Documentation/licenses").mkdir(parents=True)
+            (source / "Documentation/licenses/COPYING.LGPL-2.1-or-later").write_text("lgpl\n")
+            (source / "COPYING").write_text("gpl\n")
+            record = self.toolchain._license(source, "util-linux")
+            self.assertTrue(record["path"].endswith("COPYING.LGPL-2.1-or-later"))
+
+    def test_icu_fallback_only_triggers_on_a_compiler_complaint(self):
+        # A broken tree or a disk error must not be reported as "switch to
+        # --without-icu": the plan forbids reaching for the fallback pre-emptively.
+        self.assertTrue(self.toolchain.compiler_failure(
+            "ld.lld: error: undefined symbol: _Unwind_Resume"))
+        self.assertTrue(self.toolchain.compiler_failure(
+            "error: unknown type name 'char16_t'"))
+        self.assertFalse(self.toolchain.compiler_failure(
+            "make: *** No rule to make target 'install'.  Stop."))
+        self.assertFalse(self.toolchain.compiler_failure(
+            "cp: cannot create regular file: No space left on device"))
+
+    def test_icu_reports_a_broken_tree_without_blaming_the_compiler(self):
+        version = module("source").dependencies()["icu"]["version"]
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "icu"
+            (source / "source").mkdir(parents=True)
+            # A configure that fails for a non-compiler reason: no zig, no ICU.
+            configure = source / "source/configure"
+            configure.write_text("#!/bin/sh\necho 'configure: error: cannot find sources' >&2\nexit 1\n")
+            configure.chmod(0o755)
+            env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "SOURCE_DATE_EPOCH": "0"}
+            (Path(temp) / "build").mkdir()
+            with self.assertRaises(self.toolchain.BuildFailure) as caught:
+                self.toolchain._icu(source, Path(temp) / "build", Path(temp) / "deps", env)
+            self.assertNotIn("--without-icu", str(caught.exception))
+
+            # The same failure with a compiler diagnostic names the pinned version
+            # and the recorded fallback.
+            configure.write_text("#!/bin/sh\necho \"ld.lld: error: undefined symbol: _Unwind_Resume\" >&2\nexit 1\n")
+            (Path(temp) / "build2").mkdir()
+            with self.assertRaisesRegex(ValueError, f"ICU {version} did not compile") as caught:
+                self.toolchain._icu(source, Path(temp) / "build2", Path(temp) / "deps", env)
+            self.assertIn("--without-icu", str(caught.exception))
+
+    def test_icu_link_probe_uses_the_same_line_postgres_will_use(self):
+        # A stub compiler records its argv and reports success, so this pins the
+        # probe's shape: PostgreSQL links the backend with CC, so the C++ runtime
+        # must be on CC, and the ICU flags must be the ones Makefile.global gets.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            prefix = root / "deps"
+            (prefix / "lib").mkdir(parents=True)
+            (prefix / "include").mkdir(parents=True)
+            recorded = root / "argv.txt"
+            compiler = root / "zig"
+            compiler.write_text(
+                "#!/bin/sh\n"
+                f"printf '%s\\n' \"$@\" > {recorded}\n"
+                "while [ $# -gt 0 ]; do\n"
+                "  case \"$1\" in -o)\n"
+                "    printf '#!/bin/sh\\necho U_ZERO_ERROR\\n' > \"$2\"\n"
+                "    chmod +x \"$2\"\n"
+                "    shift;;\n"
+                "  esac\n"
+                "  shift\n"
+                "done\n"
+                "exit 0\n")
+            compiler.chmod(0o755)
+
+            env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "SOURCE_DATE_EPOCH": "0",
+                   "CC": f"{compiler} cc -target x86_64-linux-musl -dynamic -lc++ -lc++abi",
+                   "LDFLAGS": f"-L{prefix}/lib"}
+            self.toolchain.check_icu_links(root / "probe", env, prefix)
+            argv = recorded.read_text().split()
+            self.assertIn("-lc++", argv)
+            self.assertIn("-lc++abi", argv)
+            self.assertIn("-dynamic", argv)
+            self.assertIn(f"-L{prefix}/lib", argv)
+            for flag in ("-licui18n", "-licuuc", "-licudata", "-lpthread", "-lm"):
+                self.assertIn(flag, argv, "the probe must use PostgreSQL's own ICU_LIBS")
 
     def test_write_provenance_refuses_to_replace_a_different_record(self):
         with tempfile.TemporaryDirectory() as temp:
