@@ -20,7 +20,7 @@ Native build dependencies must already be installed; the builder never installs 
 
 ## Build
 
-Build hosts require PHP >= 8.4.1 with mbstring/zlib, Composer, Python >= 3.12, a host `cc` and native build dependencies. Installed bundles do not require those tools.
+Build hosts require PHP >= 8.4.1 with mbstring/zlib, Composer, Python >= 3.12, a host `cc`, native build dependencies and a host musl interpreter at `/lib/ld-musl-x86_64.so.1` for SPC's dynamic-musl preflight. CI explicitly installs Ubuntu's `musl` package; local builds never install it. Installed bundles use their own pinned loader and do not require those build-host tools.
 
 ```bash
 # Digest-verified immutable SPC v3 source and Composer dependencies

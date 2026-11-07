@@ -44,6 +44,8 @@ The staged manifest records `loader = {path, sha256, version, soname, satisfies:
 
 Build hosts need PHP >= 8.4.1 with mbstring/zlib, Composer, Python >= 3.12, and the SPC native build dependencies. These are **not consumer dependencies**. CI pins host PHP 8.4.27 and Composer 2.8.12.
 
+Pinned SPC also requires an executable host musl interpreter at `/lib/ld-musl-x86_64.so.1` before its dynamic-musl toolchain preflight. `doctor` does not install this prerequisite in the current workflow: PHP CI explicitly installs Ubuntu's `musl` package and checks that path before running the dependency doctor and build. Local hosts must have it prepared explicitly; build scripts never install it or skip the toolchain check. This build-host interpreter is not copied into the bundle; installed launchers still use the separately built, digest-pinned loader.
+
 ```bash
 # Verify pinned SPC v3 source and all 15 Composer dependency archive SHA-256s,
 # then install from local verified archives with scripts/plugins disabled.

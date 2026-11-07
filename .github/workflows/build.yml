@@ -88,7 +88,13 @@ jobs:
       - name: Bootstrap digest-verified SPC v3
         run: ./runtimes/php/scripts/download-spc.sh
       - name: Install CI-only build dependencies
-        run: ./runtimes/php/spc doctor --auto-fix
+        run: |
+          # SPC's dynamic-musl preflight requires a host interpreter even though
+          # installed bundles use a separately built, pinned loader.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl
+          test -x /lib/ld-musl-x86_64.so.1
+          ./runtimes/php/spc doctor --auto-fix
       - name: Build, verify actual CLI/FPM requests, and package
         env:
           BUILD_VERSION: ${{ matrix.php_version }}

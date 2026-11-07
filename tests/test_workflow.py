@@ -48,6 +48,27 @@ class WorkflowContracts(unittest.TestCase):
         self.assertIn("needs.build-redis.result", publish)
         self.assertIn("pattern: runtime-*", publish)
 
+    def test_php_ci_installs_host_musl_before_spc_preflight(self):
+        workflow = (REPO / ".github/workflows/build.yml").read_text()
+        php = workflow.split("  build-php:\n", 1)[1].split("  build-redis:\n", 1)[0]
+        preparation = php.split("      - name: Install CI-only build dependencies\n", 1)[1].split("      - name:", 1)[0]
+        command = textwrap.dedent(preparation.split("        run:", 1)[1]).strip()
+        command = command.removeprefix("|").strip()
+        import shlex
+        commands = [shlex.split(line) for line in command.splitlines()
+                    if line.strip() and not line.lstrip().startswith("#")]
+        installs = [index for index, argv in enumerate(commands)
+                    if argv[:3] == ["sudo", "apt-get", "install"] and "musl" in argv[3:]]
+        self.assertEqual(len(installs), 1, "PHP CI needs the host musl interpreter; SPC doctor does not install it")
+        update = commands.index(["sudo", "apt-get", "update"])
+        loader_check = commands.index(["test", "-x", "/lib/ld-musl-x86_64.so.1"])
+        doctor = commands.index(["./runtimes/php/spc", "doctor", "--auto-fix"])
+        self.assertLess(update, installs[0])
+        self.assertLess(installs[0], loader_check)
+        self.assertLess(loader_check, doctor)
+        self.assertLess(php.index("Install CI-only build dependencies"), php.index("Build, verify actual CLI/FPM requests"))
+        self.assertNotIn("SPC_SKIP_TOOLCHAIN_CHECK", php)
+
     def test_daily_schedule_leads_catalog_by_more_than_two_hours(self):
         workflow = (REPO / ".github/workflows/build.yml").read_text()
         schedule = workflow.split("  schedule:\n", 1)[1].split("  workflow_dispatch:", 1)[0]
