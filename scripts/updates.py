@@ -85,18 +85,18 @@ def published_redis(repository):
     return result
 
 
-def make_plan(*, event, repository, commit, run_id, run_attempt, publish=False, release_tag=""):
+def make_plan(*, event, repository, commit, run_id, run_attempt, publish=False, release_tag="", bypass=False):
     policy = php.make_plan(event=event, repository=repository, commit=commit, run_id=run_id,
-                           run_attempt=run_attempt, publish=publish, release_tag=release_tag)
+                           run_attempt=run_attempt, publish=publish, release_tag=release_tag, bypass=bypass)
     scheduled = event == "schedule"
-    history = published_redis(repository) if scheduled or publish else {}
+    history = published_redis(repository)
     config = json.loads(redis.CONFIG.read_text())
     rows = []
     for version in config["versions"]:
         redis.load_source(version)  # Never plan unpinned/unvalidated sources.
         for target in (REDIS_TARGET,):
             previous = history.get((version, target, "x86_64"))
-            if not scheduled or previous is None:
+            if bypass or previous is None:
                 rows.append({"redis_version": version, "target": target, "architecture": "x86_64", "previous_version": previous})
     policy["redis_matrix"] = {"include": rows}
     policy["has_updates"] = bool(policy["matrix"]["include"] or rows)
@@ -121,20 +121,24 @@ def main():
     parser.add_argument("--github-output", type=Path)
     args = parser.parse_args()
     publish = os.environ.get("PUBLISH", "false")
+    bypass = os.environ.get("BYPASS", "false")
     if publish not in {"true", "false"}:
         parser.error("Invalid publish input")
+    if bypass not in {"true", "false"}:
+        parser.error("Invalid bypass input")
     try:
         policy = make_plan(event=os.environ["GITHUB_EVENT_NAME"], repository=os.environ["GITHUB_REPOSITORY"],
                            commit=os.environ["GITHUB_SHA"], run_id=os.environ["GITHUB_RUN_ID"],
                            run_attempt=os.environ["GITHUB_RUN_ATTEMPT"],
-                           publish=publish == "true", release_tag=os.environ.get("RELEASE_TAG", ""))
+                           publish=publish == "true", release_tag=os.environ.get("RELEASE_TAG", ""),
+                           bypass=bypass == "true")
     except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
         parser.error(str(error))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(policy, indent=2) + "\n")
     if args.github_output:
         write_outputs(args.github_output, policy)
-    print(f"Selected {len(policy['matrix']['include'])} PHP and {len(policy['redis_matrix']['include'])} Redis bundles; publish={policy['publish']}")
+    print(f"Selected {len(policy['matrix']['include'])} PHP and {len(policy['redis_matrix']['include'])} Redis bundles; publish={policy['publish']}, bypass={policy['bypass']}")
 
 
 if __name__ == "__main__":

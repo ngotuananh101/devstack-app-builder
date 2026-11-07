@@ -50,12 +50,34 @@ class UpdateContracts(unittest.TestCase):
         self.assertEqual(len(self.module.plan_updates({"8.4": "8.4.10"},
             {("8.4", "musl", "x86_64"): "8.4.99"})), 1)
 
-    def test_manual_forces_exact_patch_matrix(self):
-        rows = self.module.plan_updates({"8.4": "8.4.10"}, {("8.4", "musl-dynamic", "x86_64"): "8.4.10"}, force=True)
+    def test_bypass_forces_exact_patch_matrix(self):
+        rows = self.module.plan_updates({"8.4": "8.4.10"}, {("8.4", "musl-dynamic", "x86_64"): "8.4.10"}, bypass=True)
         self.assertEqual([(r["php_version"], r["target"]) for r in rows], [("8.4.10", "musl-dynamic")])
         for version in ("8.4.10RC1", "8.1.10", "8.4", "8.4.010"):
             with self.subTest(version=version), self.assertRaises(ValueError):
                 self.module.version_tuple(version)
+
+    def test_manual_default_only_selects_newer_or_missing_patches(self):
+        upstream = {"8.5": "8.5.1", "8.4": "8.4.10", "8.3": "8.3.2", "8.2": "8.2.3"}
+        history = {("8.5", "musl-dynamic", "x86_64"): "8.5.1", ("8.4", "musl-dynamic", "x86_64"): "8.4.9"}
+        with patch.object(self.module, "latest_php", side_effect=upstream.__getitem__), \
+                patch.object(self.module, "published_versions", return_value=history):
+            plan = self.module.make_plan(event="workflow_dispatch", repository=REPOSITORY, commit=COMMIT,
+                                         run_id="123", run_attempt="1", publish=False)
+        self.assertEqual([(row["php_series"], row["php_version"], row["previous_version"]) for row in plan["matrix"]["include"]],
+                         [("8.4", "8.4.10", "8.4.9"), ("8.3", "8.3.2", None), ("8.2", "8.2.3", None)])
+        self.assertFalse(plan["publish"])
+
+    def test_bypass_rebuilds_every_series_and_records_the_published_patch(self):
+        upstream = {"8.5": "8.5.1", "8.4": "8.4.10", "8.3": "8.3.2", "8.2": "8.2.3"}
+        history = {(series, "musl-dynamic", "x86_64"): version for series, version in upstream.items()}
+        with patch.object(self.module, "latest_php", side_effect=upstream.__getitem__), \
+                patch.object(self.module, "published_versions", return_value=history):
+            plan = self.module.make_plan(event="workflow_dispatch", repository=REPOSITORY, commit=COMMIT,
+                                         run_id="123", run_attempt="1", publish=False, bypass=True)
+        self.assertEqual(len(plan["matrix"]["include"]), 4)
+        self.assertTrue(all(row["previous_version"] == row["php_version"] for row in plan["matrix"]["include"]))
+        self.assertTrue(plan["has_updates"])
 
     def test_public_history_uses_all_pages_and_companions(self):
         older, newer = manifest("8.4.9"), manifest("8.4.10")
@@ -136,11 +158,19 @@ class UpdateContracts(unittest.TestCase):
                 self.module.latest_php("8.4")
 
     def test_nonpublishing_manual_tag_cannot_inject_outputs(self):
-        with patch.object(self.module, "latest_php", side_effect=lambda series: {"8.5": "8.5.1", "8.4": "8.4.10", "8.3": "8.3.2", "8.2": "8.2.3"}[series]):
+        with patch.object(self.module, "latest_php", side_effect=lambda series: {"8.5": "8.5.1", "8.4": "8.4.10", "8.3": "8.3.2", "8.2": "8.2.3"}[series]), \
+                patch.object(self.module, "published_versions", return_value={}):
             policy = self.module.make_plan(event="workflow_dispatch", repository=REPOSITORY, commit=COMMIT,
                 run_id="123", run_attempt="1", publish=False, release_tag="runtimes-X\nhas_updates=false")
         self.assertEqual(policy["release_tag"], "")
         self.assertTrue(policy["has_updates"])
+
+    def test_schedule_cannot_bypass_version_checks(self):
+        with patch.object(self.module, "latest_php", side_effect=lambda series: "8.4.10" if series == "8.4" else series + ".1"), \
+                patch.object(self.module, "published_versions", return_value={}):
+            with self.assertRaisesRegex(ValueError, "manual"):
+                self.module.make_plan(event="schedule", repository=REPOSITORY, commit=COMMIT,
+                                      run_id="123", run_attempt="1", bypass=True)
 
     def test_manifest_schema_requires_an_integer(self):
         for schema in (True, 1.0):
@@ -169,11 +199,17 @@ class UpdateContracts(unittest.TestCase):
         self.assertFalse(plan["publish"])
         self.assertEqual(plan["matrix"], {"include": []})
         kwargs.update(event="workflow_dispatch", publish=False)
-        with patch.object(self.module, "latest_php", side_effect=upstream.__getitem__), patch.object(self.module, "published_versions", side_effect=AssertionError("No release lookup for a non-publishing manual build")):
+        with patch.object(self.module, "latest_php", side_effect=upstream.__getitem__), patch.object(self.module, "published_versions", return_value=history):
+            plan = self.module.make_plan(**kwargs)
+        self.assertFalse(plan["publish"])
+        self.assertEqual(plan["matrix"], {"include": []})
+        kwargs.update(bypass=True)
+        with patch.object(self.module, "latest_php", side_effect=upstream.__getitem__), patch.object(self.module, "published_versions", return_value=history):
             plan = self.module.make_plan(**kwargs)
         self.assertFalse(plan["publish"])
         self.assertEqual(len(plan["matrix"]["include"]), 4)
         self.assertTrue(all("profile" not in row for row in plan["matrix"]["include"]))
+        self.assertTrue(all(row["previous_version"] == row["php_version"] for row in plan["matrix"]["include"]))
 
 
 if __name__ == "__main__":

@@ -25,13 +25,14 @@ class WorkflowContracts(unittest.TestCase):
         workflow = (REPO / ".github/workflows/build.yml").read_text()
         inputs = workflow.split("    inputs:\n", 1)[1].split("\npermissions:", 1)[0]
         names = re.findall(r"^      ([a-z_]+):$", inputs, re.MULTILINE)
-        self.assertEqual(set(names), {"publish", "release_tag"})
+        self.assertEqual(set(names), {"bypass", "publish", "release_tag"})
         planner = workflow.split("  plan:\n", 1)[1].split("  build-php:\n", 1)[0]
         self.assertNotIn("inputs.php_version", planner)
         self.assertNotIn("inputs.target", planner)
         self.assertNotIn("PROFILE_INPUT", planner)
         self.assertIn("scripts/updates.py", planner)
         self.assertIn("redis_matrix:", planner)
+        self.assertIn("BYPASS: ${{ inputs.bypass || false }}", planner)
         self.assertIn("  build-redis:\n", workflow, "Missing native Redis build job")
         php = workflow.split("  build-php:\n", 1)[1].split("  build-redis:\n", 1)[0]
         self.assertIn('./build.sh php "$BUILD_VERSION"', php)
@@ -47,6 +48,17 @@ class WorkflowContracts(unittest.TestCase):
         self.assertIn("always()", publish)
         self.assertIn("needs.build-redis.result", publish)
         self.assertIn("pattern: runtime-*", publish)
+
+    def test_bypass_input_is_manual_only_and_defaults_to_version_checks(self):
+        workflow = (REPO / ".github/workflows/build.yml").read_text()
+        inputs = workflow.split("    inputs:\n", 1)[1].split("\npermissions:", 1)[0]
+        bypass = re.search(r"^      bypass:\n((?:^        .*\n)+)", inputs, re.MULTILINE)[1]
+        self.assertIn("type: boolean", bypass)
+        self.assertIn("default: false", bypass)
+        self.assertNotIn("bypass", workflow.split("  plan:\n", 1)[1].split("  build-php:\n", 1)[0].split("env:\n", 1)[0])
+        # Scheduled runs have no inputs at all, so they can never bypass the check.
+        schedule = workflow.split("  schedule:\n", 1)[1].split("  workflow_dispatch:", 1)[0]
+        self.assertNotIn("bypass", schedule)
 
     def test_php_ci_installs_host_musl_before_spc_preflight(self):
         workflow = (REPO / ".github/workflows/build.yml").read_text()
@@ -172,18 +184,23 @@ class WorkflowContracts(unittest.TestCase):
         planner = load_planner()
         upstream = {"8.5": "8.5.1", "8.4": "8.4.10", "8.3": "8.3.2", "8.2": "8.2.3"}
         from test_updates import REPOSITORY
-        scenarios = (("schedule", False, False, 4, 3),
-                     ("workflow_dispatch", True, True, 4, 3),
-                     ("schedule", True, False, 0, 3),
-                     ("schedule", False, True, 4, 0),
-                     ("schedule", True, True, 0, 0))
-        for event, php_current, redis_current, php_count, redis_count in scenarios:
-            with self.subTest(event=event, php_current=php_current, redis_current=redis_current), tempfile.TemporaryDirectory() as tmp:
+        # Scheduled and default manual runs check public versions; only bypass rebuilds
+        # the whole matrix regardless of what is already published.
+        scenarios = (("schedule", False, False, False, 4, 3),
+                     ("schedule", True, False, False, 0, 3),
+                     ("schedule", False, True, False, 4, 0),
+                     ("schedule", True, True, False, 0, 0),
+                     ("workflow_dispatch", True, True, False, 0, 0),
+                     ("workflow_dispatch", False, True, False, 4, 0),
+                     ("workflow_dispatch", True, True, True, 4, 3),
+                     ("workflow_dispatch", False, False, True, 4, 3))
+        for event, php_current, redis_current, bypass, php_count, redis_count in scenarios:
+            with self.subTest(event=event, php_current=php_current, redis_current=redis_current, bypass=bypass), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 output = root / "output"
                 history = {(series, "musl-dynamic", "x86_64"): version for series, version in upstream.items()} if php_current else {}
                 redis_history = {(version, "musl", "x86_64"): version for version in ("8.10.3", "7.4.12", "7.2.17")} if redis_current else {}
-                env = {**os.environ, "PUBLISH": "false", "RELEASE_TAG": "",
+                env = {**os.environ, "PUBLISH": "false", "RELEASE_TAG": "", "BYPASS": str(bypass).lower(),
                        "GITHUB_OUTPUT": str(output), "GITHUB_EVENT_NAME": event, "GITHUB_REPOSITORY": REPOSITORY,
                        "GITHUB_SHA": "a" * 40, "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}
                 # Execute the workflow's planner entry point; control only upstream/public network data.

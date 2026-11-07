@@ -24,14 +24,14 @@ class RuntimeUpdateContracts(unittest.TestCase):
         self.module = load_planner()
         self.latest = {"8.5": "8.5.1", "8.4": "8.4.10", "8.3": "8.3.2", "8.2": "8.2.3"}
 
-    def make(self, event="schedule", php_current=False, redis_current=False):
+    def make(self, event="schedule", php_current=False, redis_current=False, bypass=False):
         history = {(series, "musl-dynamic", "x86_64"): version for series, version in self.latest.items()} if php_current else {}
         redis_history = {(version, "musl", "x86_64"): version for version in ("8.10.3", "7.4.12", "7.2.17")} if redis_current else {}
         with patch.object(self.module.php, "latest_php", side_effect=self.latest.__getitem__), patch.object(self.module.php, "published_versions", return_value=history), patch.object(self.module, "published_redis", return_value=redis_history):
-            return self.module.make_plan(event=event, repository="owner/repo", commit="a" * 40, run_id="123", run_attempt="1", publish=False)
+            return self.module.make_plan(event=event, repository="owner/repo", commit="a" * 40, run_id="123", run_attempt="1", publish=False, bypass=bypass)
 
-    def test_manual_builds_all_php_series_and_pinned_redis_on_musl_only(self):
-        policy = self.make("workflow_dispatch", True, True)
+    def test_manual_bypass_builds_all_php_series_and_pinned_redis_on_musl_only(self):
+        policy = self.make("workflow_dispatch", True, True, bypass=True)
         php = policy["matrix"]["include"]
         redis = policy["redis_matrix"]["include"]
         self.assertEqual(len(php), 4)
@@ -43,6 +43,18 @@ class RuntimeUpdateContracts(unittest.TestCase):
         self.assertEqual({row["target"] for row in redis}, {"musl"})
         self.assertTrue(all("profile" not in row for row in redis))
         self.assertFalse(policy["publish"])
+
+    def test_scheduled_and_default_manual_runs_check_versions(self):
+        for event in ("schedule", "workflow_dispatch"):
+            with self.subTest(event=event):
+                policy = self.make(event, php_current=True, redis_current=True)
+                self.assertEqual(policy["matrix"], {"include": []})
+                self.assertEqual(policy["redis_matrix"], {"include": []})
+                self.assertFalse(policy["has_updates"])
+        policy = self.make("workflow_dispatch", php_current=False, redis_current=True)
+        self.assertEqual(len(policy["matrix"]["include"]), 4)
+        self.assertEqual(policy["redis_matrix"], {"include": []})
+        self.assertEqual(policy["publish"], False, "Manual runs never publish without an explicit tag")
 
     def test_scheduled_noops_are_independent_per_runtime(self):
         for php_current, redis_current, php_count, redis_count in [(False, False, 4, 3), (True, False, 0, 3), (False, True, 4, 0), (True, True, 0, 0)]:
@@ -67,13 +79,34 @@ class RuntimeUpdateContracts(unittest.TestCase):
 
     def test_removed_environment_inputs_cannot_narrow_builds(self):
         env = {"GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REPOSITORY": "owner/repo", "GITHUB_SHA": "a" * 40,
-               "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1", "PUBLISH": "false", "PROFILE_INPUT": "full",
+               "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1", "PUBLISH": "false", "BYPASS": "true", "PROFILE_INPUT": "full",
                "PHP_VERSION_INPUT": "8.2", "TARGET_INPUT": "musl", "RUNTIME_INPUT": "php"}
-        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, env, clear=True), patch.object(self.module.php, "latest_php", side_effect=self.latest.__getitem__), patch("sys.argv", ["updates.py", "--output", str(Path(temp) / "plan.json")]):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, env, clear=True), patch.object(self.module.php, "latest_php", side_effect=self.latest.__getitem__), \
+             patch.object(self.module.php, "published_versions", return_value={}), patch.object(self.module, "published_redis", return_value={}), \
+             patch("sys.argv", ["updates.py", "--output", str(Path(temp) / "plan.json")]):
             self.module.main()
             policy = json.loads((Path(temp) / "plan.json").read_text())
             self.assertEqual(len(policy["matrix"]["include"]), 4)
             self.assertEqual(len(policy["redis_matrix"]["include"]), 3)
+
+    def test_missing_or_invalid_bypass_input_fails_closed(self):
+        base = {"GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REPOSITORY": "owner/repo", "GITHUB_SHA": "a" * 40,
+                "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1", "PUBLISH": "false"}
+        for value, accepted in (("false", True), ("true", True), ("", True), ("yes", False), ("1", False)):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temp:
+                env = {**base, **({"BYPASS": value} if value != "" else {})}
+                argv = ["updates.py", "--output", str(Path(temp) / "plan.json")]
+                with patch.dict(os.environ, env, clear=True), patch.object(self.module.php, "latest_php", side_effect=self.latest.__getitem__), \
+                        patch.object(self.module.php, "published_versions", return_value={}), \
+                        patch.object(self.module, "published_redis", return_value={}), patch("sys.argv", argv):
+                    if accepted:
+                        self.module.main()
+                        policy = json.loads((Path(temp) / "plan.json").read_text())
+                        self.assertEqual(policy["bypass"], value == "true", "An absent bypass input must fail closed")
+                    else:
+                        with self.assertRaises(SystemExit):
+                            self.module.main()
+                        self.assertFalse((Path(temp) / "plan.json").exists())
 
     def test_redis_history_rejects_incomplete_or_unverified_asset_groups(self):
         root = "redis-8.10.3-musl-x86_64-build123"

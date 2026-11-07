@@ -149,7 +149,7 @@ def published_versions(repository):
     return result
 
 
-def plan_updates(latest, published, force=False):
+def plan_updates(latest, published, bypass=False):
     rows = []
     for series in SERIES:
         if series not in latest:
@@ -163,7 +163,9 @@ def plan_updates(latest, published, force=False):
             version_tuple(previous)
             if not previous.startswith(series + "."):
                 raise ValueError("Mismatched published PHP series")
-        if force or previous is None or version_tuple(version) > version_tuple(previous):
+        # Every run except an explicit bypass builds only what public metadata
+        # says is missing or older, so a manual run cannot silently republish.
+        if bypass or previous is None or version_tuple(version) > version_tuple(previous):
             rows.append({"php_series": series, "php_version": version, "target": TARGET,
                          "architecture": "x86_64", "previous_version": previous})
     if set(latest) - set(SERIES):
@@ -171,14 +173,18 @@ def plan_updates(latest, published, force=False):
     return rows
 
 
-def make_plan(*, event, repository, commit, run_id, run_attempt, publish=False, release_tag="", now=None):
+def make_plan(*, event, repository, commit, run_id, run_attempt, publish=False, release_tag="", bypass=False, now=None):
     validate_repository(repository)
     if event not in {"schedule", "workflow_dispatch"} or not re.fullmatch(r"[a-f0-9]{40}", commit):
         raise ValueError("Invalid workflow event/commit")
     if not all(isinstance(value, str) and re.fullmatch(r"[1-9][0-9]*", value) for value in (run_id, run_attempt)):
         raise ValueError("Invalid workflow run identity")
-    if type(publish) is not bool:
-        raise ValueError("Invalid publish input")
+    if type(publish) is not bool or type(bypass) is not bool:
+        raise ValueError("Invalid publish/bypass input")
+    # Bypassing version checks is a manual escape hatch; a schedule has no input
+    # that could request it and must always compare against public releases.
+    if bypass and event != "workflow_dispatch":
+        raise ValueError("Bypass is only available for manual runs")
     scheduled = event == "schedule"
     if scheduled:
         now = now or datetime.datetime.now(datetime.timezone.utc)
@@ -189,11 +195,13 @@ def make_plan(*, event, repository, commit, run_id, run_attempt, publish=False, 
     if not scheduled and not publish:
         release_tag = ""  # Unused input must never become an Actions output record.
     latest = {series: latest_php(series) for series in SERIES}
-    history = published_versions(repository) if scheduled or publish else {}
-    rows = plan_updates(latest, history, force=not scheduled)
+    # Every run except an explicit bypass compares against public releases, so the
+    # default manual run cannot silently rebuild what is already published.
+    history = published_versions(repository)
+    rows = plan_updates(latest, history, bypass=bypass)
     return {"schema_version": 1, "event": event, "repository": repository, "commit": commit,
             "run_id": run_id, "run_attempt": run_attempt, "release_tag": release_tag,
-            "publish": bool(rows) and (scheduled or publish), "has_updates": bool(rows),
+            "publish": bool(rows) and (scheduled or publish), "has_updates": bool(rows), "bypass": bypass,
             "matrix": {"include": rows}}
 
 
@@ -203,13 +211,17 @@ def main():
     parser.add_argument("--github-output", type=Path)
     args = parser.parse_args()
     publish_input = os.environ.get("PUBLISH", "false")
+    bypass_input = os.environ.get("BYPASS", "false")
     if publish_input not in {"true", "false"}:
         parser.error("Invalid publish input")
+    if bypass_input not in {"true", "false"}:
+        parser.error("Invalid bypass input")
     try:
         plan = make_plan(event=os.environ["GITHUB_EVENT_NAME"], repository=os.environ["GITHUB_REPOSITORY"],
                          commit=os.environ["GITHUB_SHA"], run_id=os.environ["GITHUB_RUN_ID"],
                          run_attempt=os.environ["GITHUB_RUN_ATTEMPT"],
-                         publish=publish_input == "true", release_tag=os.environ.get("RELEASE_TAG", ""))
+                         publish=publish_input == "true", release_tag=os.environ.get("RELEASE_TAG", ""),
+                         bypass=bypass_input == "true")
     except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
         parser.error(str(error))
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -218,7 +230,7 @@ def main():
         with args.github_output.open("a") as output:
             output.write("matrix=" + json.dumps(plan["matrix"], separators=(",", ":")) + "\n")
             output.write(f"has_updates={str(plan['has_updates']).lower()}\npublish={str(plan['publish']).lower()}\nrelease_tag={plan['release_tag']}\n")
-    print(f"Selected {len(plan['matrix']['include'])} PHP bundles; publish={plan['publish']}")
+    print(f"Selected {len(plan['matrix']['include'])} PHP bundles; publish={plan['publish']}, bypass={plan['bypass']}")
 
 
 if __name__ == "__main__":
