@@ -55,10 +55,13 @@ class WorkflowContracts(unittest.TestCase):
         bypass = re.search(r"^      bypass:\n((?:^        .*\n)+)", inputs, re.MULTILINE)[1]
         self.assertIn("type: boolean", bypass)
         self.assertIn("default: false", bypass)
-        self.assertNotIn("bypass", workflow.split("  plan:\n", 1)[1].split("  build-php:\n", 1)[0].split("env:\n", 1)[0])
-        # Scheduled runs have no inputs at all, so they can never bypass the check.
+        # A scheduled run has no inputs, so it can never request a bypass.
         schedule = workflow.split("  schedule:\n", 1)[1].split("  workflow_dispatch:", 1)[0]
         self.assertNotIn("bypass", schedule)
+        # Bypass only changes planning; build jobs must keep building the planned version.
+        for job, following in (("  build-php:\n", "  build-redis:\n"), ("  build-redis:\n", "  publish:\n")):
+            section = workflow.split(job, 1)[1].split(following, 1)[0]
+            self.assertNotIn("bypass", section.lower())
 
     def test_php_ci_installs_host_musl_before_spc_preflight(self):
         workflow = (REPO / ".github/workflows/build.yml").read_text()
