@@ -189,6 +189,15 @@ def release_notes(manifests, repository, commit, plan=None):
         shared = manifest.get("shared_modules", [])
         if not isinstance(shared, list):
             raise ValueError("Invalid shared extension inventory")
+        builtin = manifest.get("builtin_modules", [])
+        if not isinstance(builtin, list):
+            raise ValueError("Invalid built-in extension inventory")
+        for module in builtin:
+            if (not isinstance(module, dict) or not isinstance(module.get("name"), str)
+                    or not re.fullmatch(r"[a-z][a-z0-9_]*", module["name"])
+                    or module.get("always_loaded") is not True or module.get("directive") is not None):
+                raise ValueError("Invalid built-in extension inventory")
+            lines.append(f'  - Always-loaded built-in `{module["name"]}`: {module.get("runtime_name")} is compiled into PHP, so it has no INI or toggle.')
         if not shared:
             lines.append("  - No shared modules packaged.")
         for module in shared:

@@ -119,6 +119,18 @@ class PublishContracts(unittest.TestCase):
         self.assertNotIn("tested on glibc 2.17", notes)
         self.assertNotIn("fully reproducible", notes)
 
+    def test_notes_describe_builtin_modules_separately_from_shared(self):
+        data = metadata()
+        data["builtin_modules"] = [{"name": "opcache", "runtime_name": "Zend OPcache", "directive": None, "always_loaded": True}]
+        data["shared_modules"] = [{"name": "redis", "enabled_by_default": {"cli": False, "fpm": False}}]
+        notes = self.module.release_notes([data], REPOSITORY, COMMIT, plan())
+        self.assertIn("Always-loaded built-in `opcache`", notes)
+        self.assertIn("Shared `redis`: initial CLI disabled, FPM disabled", notes)
+        broken = copy.deepcopy(data)
+        broken["builtin_modules"] = [{"name": "opcache", "always_loaded": False}]
+        with self.assertRaisesRegex(ValueError, "built-in"):
+            self.module.release_notes([broken], REPOSITORY, COMMIT)
+
     def test_plan_rejects_missing_extra_wrong_patch_or_commit(self):
         self.module.validate_plan(plan(), [metadata()], TAG, REPOSITORY, COMMIT)
         for defect in ("missing", "extra", "patch", "builder", "plan_commit", "plan_tag", "duplicate", "manual_false", "row_series", "row_profile", "row_target", "static_target"):

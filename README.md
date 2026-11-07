@@ -4,7 +4,7 @@ Build Linux x86_64 standalone PHP CLI/FPM bundles and native Redis core binaries
 
 Both runtimes are musl-only and have no profiles:
 
-- **PHP** is a `musl-dynamic` bundle: the main binaries and the fixed static baseline link against musl, and a fixed set of 20 extensions ships as shared modules. The bundle carries its own musl loader (`lib/musl/ld-musl-x86_64.so.1`), which is also `libc.so`, so it needs no host libc and no host interpreter.
+- **PHP** is a `musl-dynamic` bundle: the main binaries and the fixed static baseline link against musl, and a fixed set of 20 extensions ships as shared modules (PHP 8.5 compiles OPcache into the binary instead, leaving 19 shared). The bundle carries its own musl loader (`lib/musl/ld-musl-x86_64.so.1`), which is also `libc.so`, so it needs no host libc and no host interpreter.
 - **Redis** is a fully static musl build: no interpreter, no `NEEDED` entries.
 
 ```bash
@@ -45,7 +45,7 @@ One set for every build; there is no `minimal`/`full` profile and no libc select
 - **Static** (`config/static-extensions.txt`): `ctype, curl, dom, fileinfo, filter, iconv, libxml, mbstring, mbregex, mysqlnd, openssl, pdo, phar, readline, session, simplexml, tokenizer, xml, xmlreader, xmlwriter, zlib`.
 - **Shared** (`config/shared-extensions.txt`, packaged as `.so`): `apcu, bcmath, calendar, dba, exif, gd, intl, mysqli, opcache, pdo_mysql, pdo_pgsql, pdo_sqlite, pcntl, posix, redis, sockets, sodium, sqlite3, xsl, zip`.
 
-Shared modules are **disabled by default in both SAPIs** and are toggled per installation with `bin/php-ext`. `opcache` is a Zend extension and receives `zend_extension=`. Not every extension can be shared: SPC forbids sharing `libxml`, `mbregex`, `readline` and `zlib`, and dependency edges force `xml`, `pdo`, `mysqlnd`, `dom` and related modules to stay static. SPC-required dependencies may also be static; both the requested and the actual resolved modes are recorded in the manifest.
+Shared modules are **disabled by default in both SAPIs** and are toggled per installation with `bin/php-ext`. `opcache` is a Zend extension and receives `zend_extension=`. PHP 8.5 no longer produces `opcache.so`: upstream links OPcache into every binary and removed its configure flags, so that series records `opcache` as a built-in module (always loaded, no INI, not toggleable) while 8.2–8.4 keep the shared `.so`. Not every extension can be shared: SPC forbids sharing `libxml`, `mbregex`, `readline` and `zlib`, and dependency edges force `xml`, `pdo`, `mysqlnd`, `dom` and related modules to stay static. SPC-required dependencies may also be static; both the requested and the actual resolved modes are recorded in the manifest.
 
 ## Bundle usage
 

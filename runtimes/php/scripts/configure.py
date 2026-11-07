@@ -7,6 +7,11 @@ from pathlib import Path
 import re
 
 SUPPORTED = {"8.2", "8.3", "8.4", "8.5"}
+# PHP 8.5 links OPcache into every binary (ext/opcache/config.m4 requests a static
+# module unconditionally) and no longer produces opcache.so. Its configure flags
+# also disappeared, so a phpize build succeeds but emits no module to install.
+# Keep it in the configured extension set, but never ask SPC for a shared build.
+BUILTIN = {"8.5": ["opcache"]}
 TARGET = "musl-dynamic"
 SPC_TARGET = "x86_64-linux-musl -dynamic"
 # Defaults match a healthy CI runner. A build host on a network that drops
@@ -46,11 +51,16 @@ def resolve(php_dir, version):
         return names
 
     static = names("static-extensions.txt")
-    shared = names("shared-extensions.txt")
-    overlap = set(static) & set(shared)
+    configured = names("shared-extensions.txt")
+    builtin = BUILTIN.get(".".join(version.split(".")[:2]), [])
+    missing = set(builtin) - set(configured)
+    if missing:
+        raise ValueError(f"Built-in extensions must be listed in shared-extensions.txt: {sorted(missing)}")
+    overlap = set(static) & set(configured)
     if overlap:
         raise ValueError(f"Extensions cannot be both static and shared: {sorted(overlap)}")
-    return {"version": version, "target": TARGET, "spc_target": SPC_TARGET, "static": static, "shared": shared}
+    shared = [name for name in configured if name not in builtin]
+    return {"version": version, "target": TARGET, "spc_target": SPC_TARGET, "static": static, "shared": shared, "builtin": builtin}
 
 
 def craft(resolution, parallel=None, retry=None):

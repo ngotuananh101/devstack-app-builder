@@ -19,6 +19,37 @@ MUSL_ALLOWED_NEEDED = {"libc.so"}
 MODULE_RUNTIME_NAMES = {"opcache": "Zend OPcache"}
 
 
+def module_plan(manifest):
+    """Split a manifest into stageable shared files and always-loaded built-ins.
+
+    PHP 8.5+ links OPcache into the binary, so a built-in module has no file to
+    stage and no INI to toggle; it must simply be reported loaded by every probe.
+    Returns (shared records, probed names, default states).
+    """
+    shared = manifest.get("shared_modules", [])
+    builtin = manifest.get("builtin_modules", [])
+    if not isinstance(shared, list) or not isinstance(builtin, list):
+        raise ValueError("Invalid module inventory")
+    shared_names = set()
+    for row in shared:
+        if not isinstance(row, dict) or not isinstance(row.get("name"), str) or not isinstance(row.get("path"), str):
+            raise ValueError("Invalid shared module record")
+        shared_names.add(row["name"])
+    builtin_names = set()
+    for row in builtin:
+        if (not isinstance(row, dict) or not isinstance(row.get("name"), str) or row["name"] in shared_names
+                or row.get("directive") is not None or row.get("always_loaded") is not True
+                or row.get("runtime_name") != MODULE_RUNTIME_NAMES.get(row["name"])):
+            raise ValueError("Invalid built-in module record")
+        builtin_names.add(row["name"])
+    states = {name: False for name in shared_names} | {name: True for name in builtin_names}
+    return shared, sorted(shared_names | builtin_names), states
+
+
+def expected_states(shared_names, builtin_names, enabled):
+    return {name: enabled for name in shared_names} | {name: True for name in builtin_names}
+
+
 def parse_needed(output):
     return re.findall(r"\(NEEDED\).*?\[([^\]]+)\]", output)
 
@@ -202,8 +233,8 @@ def verify(bundle):
     (bundle / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     if manifest.get("target") != "musl-dynamic" or manifest.get("linkage") != "dynamic":
         raise ValueError("Verifier only accepts musl-dynamic bundles")
-    names = [row["name"] for row in manifest["shared_modules"]]
-    for row in manifest["shared_modules"]:
+    shared, names, states = module_plan(manifest)
+    for row in shared:
         if not (bundle / row["path"]).is_file():
             raise ValueError(f"Missing requested shared module: {row['name']}")
     loader = manifest.get("loader") or {}
@@ -215,23 +246,25 @@ def verify(bundle):
         relocated = workspace / "relocated PHP with spaces"
         shutil.copytree(bundle, relocated)
         helper = relocated / "bin/php-ext"
-        expected_disabled = {name: False for name in names}
-        expected_enabled = {name: True for name in names}
+        expected_disabled = states
+        enabled_names = [row["name"] for row in shared]
+        builtin_names = [row["name"] for row in manifest.get("builtin_modules", [])]
+        expected_enabled = expected_states(enabled_names, builtin_names, True)
         if cli_modules(relocated, names, no_ini=True) != expected_disabled:
             raise ValueError("Shared-only module exists in php -n baseline")
         if cli_modules(relocated, names) != expected_disabled:
             raise ValueError("Shared modules must default to disabled")
-        if fpm_probe(relocated, names, workspace)["modules"] not in (expected_disabled, []):
+        if fpm_probe(relocated, names, workspace)["modules"] not in (expected_disabled, [], {}):
             raise ValueError("FPM shared modules unexpectedly enabled by default")
-        for name in names:
+        for name in enabled_names:
             subprocess.run([str(helper), "enable", name, "cli"], check=True)
         if cli_modules(relocated, names) != expected_enabled:
             raise ValueError("CLI enable did not load requested modules")
-        if fpm_probe(relocated, names, workspace)["modules"] not in (expected_disabled, []):
+        if fpm_probe(relocated, names, workspace)["modules"] not in (expected_disabled, [], {}):
             raise ValueError("CLI configuration leaked into FPM")
-        for name in names:
+        for name in enabled_names:
             subprocess.run([str(helper), "enable", name, "fpm"], check=True)
-        if fpm_probe(relocated, names, workspace)["modules"] not in (expected_enabled, [] if not names else None):
+        if fpm_probe(relocated, names, workspace)["modules"] not in (expected_enabled, []):
             raise ValueError("FPM enable did not load requested modules")
         # The original and relocated installations must not cross-load INIs.
         if cli_modules(bundle, names) != expected_disabled:
@@ -240,11 +273,11 @@ def verify(bundle):
         for line in mapped.splitlines():
             if ".so" in line and str(relocated) not in line:
                 raise ValueError(f"Loaded a shared object outside the bundle: {line}")
-        for name in names:
+        for name in enabled_names:
             subprocess.run([str(helper), "disable", name, "all"], check=True)
         if cli_modules(relocated, names) != expected_disabled:
             raise ValueError("CLI disable failed")
-        if fpm_probe(relocated, names, workspace)["modules"] not in (expected_disabled, []):
+        if fpm_probe(relocated, names, workspace)["modules"] not in (expected_disabled, [], {}):
             raise ValueError("FPM disable failed")
     manifest["elf_inventory"] = inventory
     manifest["loader_check"] = check_loader_integrity(bundle, loader)

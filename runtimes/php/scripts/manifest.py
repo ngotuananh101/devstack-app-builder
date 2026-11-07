@@ -13,6 +13,9 @@ LOADER_NAME = "ld-musl-x86_64.so.1"
 # musl's loader is also libc: PHP requests NEEDED libc.so, satisfied by the loader
 # itself. A separate libc.so file is not staged, so the bundle has one libc.
 DEFAULT_ENABLED = {"cli": False, "fpm": False}
+# Extensions linked into PHP 8.5+ under PHP's own name; they are always active and
+# must never be staged as a shared module or toggled through an INI.
+BUILTIN_RUNTIME_NAMES = {"opcache": "Zend OPcache"}
 
 
 def digest(path):
@@ -20,7 +23,20 @@ def digest(path):
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
-def stage_modules(buildroot, bundle, requested):
+def builtin_records(resolution, static_modules):
+    records = []
+    for name in resolution.get("builtin", []):
+        runtime_name = BUILTIN_RUNTIME_NAMES.get(name)
+        if runtime_name is None:
+            raise ValueError(f"Unknown built-in extension: {name}")
+        # The manifest may only claim a built-in extension the binary reports itself.
+        if runtime_name not in static_modules:
+            raise ValueError(f"Built binary does not provide the required built-in module: {name}")
+        records.append({"name": name, "runtime_name": runtime_name, "directive": None, "always_loaded": True})
+    return records
+
+
+def stage_modules(buildroot, bundle, requested, builtin=()):
     destination = bundle / "lib/php/extensions"
     destination.mkdir(parents=True, exist_ok=True)
     registry = []
@@ -35,7 +51,9 @@ def stage_modules(buildroot, bundle, requested):
         path.chmod(0o644)
         registry.append({"name": name, "directive": "zend_extension" if name in {"opcache", "xdebug"} else "extension", "path": f"lib/php/extensions/{name}.so", "sha256": digest(path), "enabled_by_default": dict(DEFAULT_ENABLED)})
     (bundle / "etc").mkdir(parents=True, exist_ok=True)
-    (bundle / "etc/shared-modules.tsv").write_text("".join(f'{row["name"]}\t{row["directive"]}\t{Path(row["path"]).name}\n' for row in registry))
+    rows = [f'{row["name"]}\t{row["directive"]}\t{Path(row["path"]).name}\n' for row in registry]
+    rows += [f'{row["name"]}\tbuiltin\t\n' for row in builtin]
+    (bundle / "etc/shared-modules.tsv").write_text("".join(rows))
     return registry
 
 
@@ -116,7 +134,6 @@ def stage(php_dir, bundle, resolution, provenance, repo_root, buildroot=None, do
     shutil.copy2(php_dir / "config/php-fpm.conf", bundle / "etc/php-fpm.conf.example")
     shutil.copy2(repo_root / "LICENSE", bundle / "share/licenses/builder.txt")
     shutil.copy2(upstream_path, bundle / "spc-build-manifest.json")
-    modules = stage_modules(buildroot, bundle, resolution["shared"])
     # Record metadata from the built binary itself: the bundle's bin/php is a
     # launcher that starts it through the bundled loader.
     metadata = php_metadata(buildroot / "bin/php")
@@ -127,6 +144,9 @@ def stage(php_dir, bundle, resolution, provenance, repo_root, buildroot=None, do
     overlap = baseline & set(resolution["shared"])
     if overlap:
         raise ValueError(f"Shared-only modules were built in: {sorted(overlap)}")
+    # A built-in module is only recorded once the binary itself reports it.
+    builtin = builtin_records(resolution, metadata["static_modules"])
+    modules = stage_modules(buildroot, bundle, resolution["shared"], builtin)
     commit = subprocess.check_output(["git", "-C", str(repo_root), "rev-parse", "HEAD"], text=True).strip()
     input_files = []
     # SPC's downloaded source/toolchain archives are captured by name+digest.
@@ -141,7 +161,7 @@ def stage(php_dir, bundle, resolution, provenance, repo_root, buildroot=None, do
             builder_digest.update(str(path.relative_to(repo_root)).encode())
             builder_digest.update(bytes.fromhex(digest(path)))
     build_id = hashlib.sha256((digest(bundle / "libexec/php") + digest(bundle / "libexec/php-fpm") + loader_record["sha256"] + json.dumps(provenance, sort_keys=True) + builder_digest.hexdigest() + "".join(row["sha256"] for row in modules)).encode()).hexdigest()[:16]
-    manifest = {"schema_version": 1, "runtime": "php", "build_id": build_id, "architecture": metadata["architecture"], "target": resolution["target"], "libc": {"family": "musl", "minimum_version": None}, "linkage": "dynamic", "loader": loader_record, "php": metadata, "requested": resolution, "shared_modules": modules, "paths": {"cli": "bin/php", "fpm": "bin/php-fpm", "extension_manager": "bin/php-ext", "cli_binary": "libexec/php", "fpm_binary": "libexec/php-fpm", "musl_loader": loader_record["path"], "php_ini": "etc/php.ini", "cli_scan_dir": "etc/cli/conf.d", "fpm_scan_dir": "etc/fpm/conf.d", "extension_dir": "lib/php/extensions"}, "spc": provenance, "builder": {"commit": commit, "source_sha256": builder_digest.hexdigest()}, "build_host": {"system": platform.platform()}, "source_inputs": input_files, "verification": "NOT_RUN"}
+    manifest = {"schema_version": 1, "runtime": "php", "build_id": build_id, "architecture": metadata["architecture"], "target": resolution["target"], "libc": {"family": "musl", "minimum_version": None}, "linkage": "dynamic", "loader": loader_record, "php": metadata, "requested": resolution, "shared_modules": modules, "builtin_modules": builtin, "paths": {"cli": "bin/php", "fpm": "bin/php-fpm", "extension_manager": "bin/php-ext", "cli_binary": "libexec/php", "fpm_binary": "libexec/php-fpm", "musl_loader": loader_record["path"], "php_ini": "etc/php.ini", "cli_scan_dir": "etc/cli/conf.d", "fpm_scan_dir": "etc/fpm/conf.d", "extension_dir": "lib/php/extensions"}, "spc": provenance, "builder": {"commit": commit, "source_sha256": builder_digest.hexdigest()}, "build_host": {"system": platform.platform()}, "source_inputs": input_files, "verification": "NOT_RUN"}
     manifest["resolved_modes"] = modes
     manifest["spc_target"] = upstream["target"]
     (bundle / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")

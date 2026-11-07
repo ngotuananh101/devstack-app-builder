@@ -40,6 +40,35 @@ class BuildContracts(unittest.TestCase):
         self.assertIn('shared-extensions: "apcu,bcmath', yaml)
         self.assertIn('extensions: "ctype,curl', yaml)
 
+    def test_php85_opcache_is_builtin_instead_of_a_shared_module(self):
+        """PHP 8.5 links OPcache into the binary and never emits opcache.so."""
+        module = load("configure")
+        result = module.resolve(REPO / "runtimes/php", "8.5")
+        self.assertEqual(result["builtin"], ["opcache"])
+        self.assertNotIn("opcache", result["shared"])
+        self.assertNotIn("opcache", result["static"])
+        self.assertEqual(len(result["shared"]), 19)
+        self.assertEqual(len(result["static"]), 21)
+        yaml = module.craft(result)
+        shared_line = next(line for line in yaml.splitlines() if line.startswith("shared-extensions:"))
+        self.assertNotIn("opcache", shared_line)
+        self.assertIn("zip", shared_line)
+        for version in ("8.2", "8.3", "8.4"):
+            with self.subTest(version=version):
+                legacy = module.resolve(REPO / "runtimes/php", version)
+                self.assertEqual(legacy["builtin"], [])
+                self.assertIn("opcache", legacy["shared"])
+                self.assertIn('shared-extensions: "apcu,bcmath', module.craft(legacy))
+
+    def test_builtin_extensions_must_exist_in_the_shared_list(self):
+        module = load("configure")
+        with tempfile.TemporaryDirectory() as tmp:
+            php_dir = Path(tmp)
+            shutil.copytree(REPO / "runtimes/php/config", php_dir / "config")
+            (php_dir / "config/shared-extensions.txt").write_text("redis\n")
+            with self.assertRaisesRegex(ValueError, "Built-in extensions"):
+                module.resolve(php_dir, "8.5")
+
     def test_configure_rejects_bad_versions_and_overlap(self):
         module = load("configure")
         for version in ("8.1", "9.0", "8.4RC1", '8.4"\nx: x', "8"):
@@ -81,6 +110,38 @@ class BuildContracts(unittest.TestCase):
             registry = module.stage_modules(root / "buildroot", root / "bundle", ["redis"])
             self.assertEqual(registry[0]["path"], "lib/php/extensions/redis.so")
             self.assertTrue((root / "bundle/lib/php/extensions/redis.so").is_file())
+
+    def test_builtin_modules_are_recorded_only_when_linked_into_the_binary(self):
+        module = load("manifest")
+        self.assertEqual(module.builtin_records({}, ["Core"]), [])
+        self.assertEqual(module.builtin_records({"builtin": []}, ["Core"]), [])
+        records = module.builtin_records({"builtin": ["opcache"]}, ["Core", "Zend OPcache"])
+        self.assertEqual(records, [{"name": "opcache", "runtime_name": "Zend OPcache",
+                                    "directive": None, "always_loaded": True}])
+        with self.assertRaisesRegex(ValueError, "opcache"):
+            module.builtin_records({"builtin": ["opcache"]}, ["Core"])
+
+    def test_stage_refuses_a_builtin_module_that_the_binary_lacks(self):
+        module = load("manifest")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            buildroot = root / "buildroot"
+            (buildroot / "bin").mkdir(parents=True)
+            for name in ("php", "php-fpm"):
+                shutil.copy2("/usr/bin/php", buildroot / "bin" / name)
+            (buildroot / "build-manifest.json").write_text(json.dumps({"target": {"libc": "musl"}, "targets": {"php": {"extensions": {"static": ["pdo"], "shared": [], "all": ["pdo"]}}}}))
+            loader = root / "libc.so"
+            loader.write_bytes(b"loader fixture")
+            notice = root / "COPYRIGHT"
+            notice.write_text("musl fixture notice")
+            metadata = {"source": str(loader), "pin": {"version": "1.2.5"},
+                        "loader": {"sha256": hashlib.sha256(loader.read_bytes()).hexdigest(), "version": "1.2.5", "soname": "libc.so"},
+                        "license": {"path": str(notice), "sha256": hashlib.sha256(notice.read_bytes()).hexdigest()},
+                        "toolchain_musl_version": "1.2.5", "compiler": "cc"}
+            resolution = {"version": "8.4", "target": "musl-dynamic", "static": ["pdo"], "shared": [], "builtin": ["opcache"]}
+            with self.assertRaisesRegex(ValueError, "opcache"):
+                module.stage(REPO / "runtimes/php", root / "bundle", resolution, {}, REPO, buildroot, None, metadata)
+            self.assertFalse((root / "bundle/manifest.json").exists())
 
     def test_manifest_uses_actual_php_metadata(self):
         module = load("manifest")

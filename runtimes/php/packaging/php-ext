@@ -14,6 +14,11 @@ tab=$(printf '\t')
 if [ "$action" = list ]; then
     while IFS="$tab" read -r name directive module; do
         [ -n "$name" ] || continue
+        if [ "$directive" = builtin ]; then
+            [ -z "$module" ] || fail "Built-in module must not name a shared file: $name"
+            printf '%s\t%s\tcli=builtin\tfpm=builtin\n' "$name" "$directive"
+            continue
+        fi
         cli=disabled; fpm=disabled
         [ ! -f "$ROOT/etc/cli/conf.d/20-$name.ini" ] || cli=enabled
         [ ! -f "$ROOT/etc/fpm/conf.d/20-$name.ini" ] || fpm=enabled
@@ -28,7 +33,14 @@ while IFS="$tab" read -r name directive module; do
     if [ "$name" = "$ext" ]; then found=yes; break; fi
 done < "$registry"
 [ "$found" = yes ] || fail "Not a packaged shared module: $ext (static/absent modules cannot be toggled)."
-case "$directive" in extension|zend_extension) ;; *) fail 'Invalid module directive in registry.' ;; esac
+case "$directive" in
+    builtin)
+        [ -z "$module" ] || fail "Built-in module must not name a shared file: $ext"
+        fail "$ext is a built-in module (always loaded); it cannot be enabled or disabled."
+        ;;
+    extension|zend_extension) ;;
+    *) fail 'Invalid module directive in registry.' ;;
+esac
 case "$module" in "$ext.so") ;; *) fail 'Invalid module filename in registry.' ;; esac
 [ -f "$ROOT/lib/php/extensions/$module" ] || fail "Missing shared module: $module"
 for target in cli fpm; do

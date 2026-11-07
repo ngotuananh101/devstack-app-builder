@@ -12,7 +12,7 @@ There is exactly one target, `musl-dynamic`, and no profile selector.
 | Linkage | Dynamic. `libexec/php` and `libexec/php-fpm` request the bundled interpreter `ld-musl-x86_64.so.1` and `NEEDED libc.so`, which the loader itself satisfies |
 | Bundled loader | `lib/musl/ld-musl-x86_64.so.1`, compiled from the pinned musl release in `config/musl.json` with the host `cc` |
 | Host requirements | None at run time: no host libc, no host loader, no package manager |
-| Extension modes | Fixed static baseline plus 20 shared modules, toggleable per SAPI |
+| Extension modes | Fixed static baseline plus 20 shared modules (19 on PHP 8.5), toggleable per SAPI |
 | ELF verification | `NEEDED` may contain only `libc.so`; any `GLIBC_*` symbol, foreign `NEEDED`, or non-`$ORIGIN` `RPATH`/`RUNPATH` fails |
 
 The static baseline lives in `config/static-extensions.txt` and the shared set in `config/shared-extensions.txt`; they must be disjoint. Both files are the whole extension policy — there is no `minimal`/`full` choice.
@@ -21,6 +21,8 @@ The build exports `PHP_RPATH=no` for every phpize-generated shared-extension con
 
 - Static: `ctype, curl, dom, fileinfo, filter, iconv, libxml, mbstring, mbregex, mysqlnd, openssl, pdo, phar, readline, session, simplexml, tokenizer, xml, xmlreader, xmlwriter, zlib`.
 - Shared: `apcu, bcmath, calendar, dba, exif, gd, intl, mysqli, opcache, pdo_mysql, pdo_pgsql, pdo_sqlite, pcntl, posix, redis, sockets, sodium, sqlite3, xsl, zip`.
+
+PHP 8.5 links OPcache into every binary: `ext/opcache/config.m4` requests an unconditional static module and `UPGRADING` states that `--enable-opcache`/`--disable-opcache` were removed and no `opcache.so` is produced. `scripts/configure.py` therefore keeps `opcache` in the configured list but removes it from the SPC `shared-extensions` request for 8.5 (`shared` count 19), and records it under `builtin`. A phpize attempt would otherwise run `make install` with an empty `PHP_MODULES` and fail on `cp: cannot stat 'modules/*'`. `scripts/manifest.py` only records a built-in module when the built binary itself reports it (`Zend OPcache` in `php -n`), and `scripts/verify.py` requires it to be active in both SAPIs without any `opcache.so` or INI. Series 8.2–8.4 are unchanged and keep the shared `.so`.
 
 Shared modules default to **disabled in both SAPIs**. SPC forbids sharing `libxml`, `mbregex`, `readline` and `zlib`, and dependency edges force `xml`, `dom`, `simplexml`, `pdo`, `mysqlnd` and related modules to stay static. SPC may resolve extra required static dependencies. Both SPC's actual resolved modes and the actual `php -n` baseline are recorded; staging fails if a requested shared-only module is static.
 
@@ -84,11 +86,11 @@ php-<actual-patch>-musl-dynamic-x86_64-<build-id>/
   libexec/php-fpm                # actual FPM binary
   libexec/launch.sh              # shared installed environment setup
   lib/musl/ld-musl-x86_64.so.1   # bundled musl loader, also libc.so
-  lib/php/extensions/*.so        # 20 shared modules
+  lib/php/extensions/*.so        # shared modules (20; 19 on PHP 8.5, whose OPcache is built in)
   etc/php.ini                   # shared base INI
   etc/cli/conf.d/                # CLI startup snippets
   etc/fpm/conf.d/                # FPM startup snippets
-  etc/shared-modules.tsv         # module, directive, filename
+  etc/shared-modules.tsv         # module, directive, filename (`builtin` rows have no filename)
   etc/php-fpm.conf.example       # example only, not used implicitly
   share/licenses/builder.txt
   share/licenses/musl.txt
@@ -115,7 +117,7 @@ RUNTIME="/home/me/.local/share/devstack/PHP 8.4"
 "$RUNTIME/bin/php-ext" disable redis all
 ```
 
-The helper only accepts modules present in the shared registry and on disk. Static modules, unavailable modules and invalid names fail instead of claiming success. INIs use `extension=` or `zend_extension=` from the registry. OPcache keeps the artifact/helper name `opcache` and the directive `zend_extension=opcache.so`; runtime probes map that name to PHP's registered extension name `Zend OPcache`. Edits are atomic. Reload/restart FPM after a change. The repo helper `runtimes/php/scripts/ext.sh ACTION RUNTIME [MODULE] [SAPI]` delegates to the packaged helper and is not needed by consumers.
+The helper only accepts modules present in the shared registry and on disk. Static modules, unavailable modules and invalid names fail instead of claiming success. INIs use `extension=` or `zend_extension=` from the registry. OPcache keeps the artifact/helper name `opcache` and, on 8.2–8.4, the directive `zend_extension=opcache.so`; runtime probes map that name to PHP's registered extension name `Zend OPcache`. On PHP 8.5 the registry row has directive `builtin` and no filename: `bin/php-ext list` reports `cli=builtin fpm=builtin` and `enable`/`disable` fail with an explicit message instead of writing an INI. Edits are atomic. Reload/restart FPM after a change. The repo helper `runtimes/php/scripts/ext.sh ACTION RUNTIME [MODULE] [SAPI]` delegates to the packaged helper and is not needed by consumers.
 
 ## FPM consumer contract
 
@@ -152,6 +154,7 @@ DEVSTACK_FPM_CONFIG="/absolute/app/config/php-8.4-fpm.conf" "$RUNTIME/bin/php-fp
 - `requested`: static/shared lists; `resolved_modes`: SPC's resolved lists including forced dependencies.
 - `loader`: `path`, `sha256`, `version`, `soname` (normally `null`), `satisfies`, `source`, `toolchain_musl_version`, `compiler`, `license`.
 - `shared_modules[]`: name, directive, relative path, SHA-256, initial enabled state for CLI/FPM.
+- `builtin_modules[]`: name, PHP's registered `runtime_name`, `directive: null` and `always_loaded: true` for extensions compiled into the binary (PHP 8.5 OPcache); these have no staged file and no INI.
 - `paths`: relative launchers, binaries, INI scan dirs, module directory.
 - `spc`: immutable commit/source/lock/dependency provenance; `spc_target`, `builder`, `build_host`, `source_inputs`.
 - `elf_inventory`: required libraries per binary/module, marked static/shared, plus the loader row and any `GLIBC_*` tokens (which must be empty).

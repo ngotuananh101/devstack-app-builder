@@ -68,6 +68,30 @@ class LauncherContracts(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.root / "etc/fpm/conf.d/20-opcache.ini").read_text(), "zend_extension=opcache.so\n")
 
+    def test_builtin_module_reports_always_loaded_and_refuses_toggling(self):
+        (self.root / "etc/shared-modules.tsv").write_text(
+            "redis\textension\tredis.so\nopcache\tbuiltin\t\n")
+        (self.root / "lib/php/extensions/opcache.so").unlink()
+        listed = self.run_bin("php-ext", "list")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertIn("opcache\tbuiltin\tcli=builtin\tfpm=builtin", listed.stdout)
+        for action in ("enable", "disable"):
+            for sapi in ("cli", "fpm", "all"):
+                with self.subTest(action=action, sapi=sapi):
+                    result = self.run_bin("php-ext", action, "opcache", sapi)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("built-in", result.stderr.lower())
+        for sapi in ("cli", "fpm"):
+            self.assertFalse((self.root / f"etc/{sapi}/conf.d/20-opcache.ini").exists())
+
+    def test_builtin_registry_row_rejects_a_stray_filename(self):
+        (self.root / "etc/shared-modules.tsv").write_text("opcache\tbuiltin\topcache.so\n")
+        for arguments in (("list",), ("enable", "opcache", "cli")):
+            with self.subTest(arguments=arguments):
+                result = self.run_bin("php-ext", *arguments)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("built-in", result.stderr.lower())
+
     def test_rejects_static_missing_or_invalid_modules(self):
         for name in ("pdo", "xdebug", "../redis", "redis.so"):
             with self.subTest(name=name):

@@ -10,6 +10,31 @@ from test_build import load, REPO
 
 
 class VerifyContracts(unittest.TestCase):
+    def test_builtin_modules_are_always_expected_present(self):
+        module = load("verify")
+        self.assertEqual(module.expected_states([], [], True), {})
+        self.assertEqual(module.expected_states(["redis"], [], False), {"redis": False})
+        self.assertEqual(module.expected_states(["redis"], ["opcache"], False), {"redis": False, "opcache": True})
+        self.assertEqual(module.expected_states(["redis"], ["opcache"], True), {"redis": True, "opcache": True})
+
+    def test_builtin_modules_need_no_module_file(self):
+        module = load("verify")
+        shared = [{"name": "redis", "path": "lib/php/extensions/redis.so"}]
+        builtin = [{"name": "opcache", "runtime_name": "Zend OPcache", "directive": None, "always_loaded": True}]
+        required, probed, states = module.module_plan({"shared_modules": shared, "builtin_modules": builtin})
+        self.assertEqual([row["name"] for row in required], ["redis"])
+        self.assertEqual(sorted(probed), ["opcache", "redis"])
+        self.assertEqual(states, {"redis": False, "opcache": True})
+        self.assertEqual(module.module_plan({"shared_modules": shared})[1], ["redis"])
+        for defect in ({"name": "redis", "runtime_name": "redis", "directive": None, "always_loaded": True},
+                       {"name": "opcache", "runtime_name": "Zend OPcache", "directive": "zend_extension", "always_loaded": False},
+                       {"name": "opcache"}):
+            with self.subTest(defect=defect), self.assertRaises(ValueError):
+                module.module_plan({"shared_modules": shared, "builtin_modules": [defect]})
+        with self.assertRaises(ValueError):
+            module.module_plan({"shared_modules": [{"name": "opcache", "path": "lib/php/extensions/opcache.so"}],
+                                "builtin_modules": [builtin[0]]})
+
     def test_only_the_loader_is_an_allowed_runtime_dependency(self):
         module = load("verify")
         self.assertIsNotNone(module, "runtime verifier is not implemented")
