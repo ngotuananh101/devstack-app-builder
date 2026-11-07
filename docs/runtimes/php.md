@@ -1,6 +1,6 @@
 # PHP Runtime Bundles
 
-This builder produces Linux x86_64 PHP CLI/FPM archives for DevStack. Consumers download binaries; they do not need SPC, Composer, system PHP, sudo, or a package manager. A native local PHP **8.4.27** build passed full CLI/FPM verification and extracted-archive checks on **2026-11-07**, including functional probes for all 20 shared modules. **The full musl-dynamic CI matrix remains unvalidated.** One successful local patch version does not certify every supported series or production input provenance.
+This builder produces Linux x86_64 PHP CLI/FPM archives for DevStack. Consumers download binaries; they do not need SPC, Composer, system PHP, sudo, or a package manager. CI run [42384737455](https://github.com/ngotuananh101/devstack-app-builder/actions/runs/42384737455) built, verified and published PHP **8.2.35, 8.3.36, 8.4.27 and 8.5.12** as Release `runtimes-20261107-musl-c95d643` on **2026-11-07**, alongside Redis 7.2.17, 7.4.12 and 8.10.3. A native local PHP **8.4.27** build additionally passed functional probes for all 20 shared modules. Publication of one matrix does not certify production input provenance or the remaining legal gates.
 
 ## Single target: musl-dynamic
 
@@ -186,7 +186,7 @@ On 2026-11-07, `./build.sh php 8.4.27` completed natively with exit code 0 after
 - A fresh archive extraction passed checksum, manifest, permissions, loader/module digests and the same runtime verifier. Functional checks covered all 20 shared modules, including ICU normalization/date formatting, active OPcache, SQLite queries, fork/wait, socket I/O, sodium round trips, XSL transforms and ZIP XZ compression/decompression. MySQL/PostgreSQL drivers and the Redis class were checked without external database/server connections.
 - The repository suite passed 95 tests. The shared-link regression executes the reviewed PHP method against real static archives with cyclic dependencies; the OPcache regression uses actual preinstalled CLI/FPM.
 
-This is local evidence for PHP 8.4.27, not full-series CI or production certification. SPC still warns that `llvm-compiler-rt`'s `LICENSE.TXT` was not found; complete third-party legal notices and the input gates above remain unresolved. No commit, push or release publication was performed for this validation.
+That local run is evidence for PHP 8.4.27 only. Full-series CI evidence came from run [42384737455](https://github.com/ngotuananh101/devstack-app-builder/actions/runs/42384737455) at commit `c95d643`, which built, verified and published **8.2.35, 8.3.36, 8.4.27 and 8.5.12** as public Release `runtimes-20261107-musl-c95d643` (21 assets: 4 PHP + 3 Redis bundles, each with archive, checksum and manifest). Downloaded 8.5.12 and 8.4.27 assets were re-verified independently: checksum matched, `verification=PASSED`, and the extracted bundles loaded/toggled modules as expected (8.5.12 reports OPcache as a built-in with 19 shared modules; 8.4.27 keeps `opcache.so` among 20). This is still not production certification: SPC warns that `llvm-compiler-rt`'s `LICENSE.TXT` was not found, so complete third-party legal notices and the input gates above remain unresolved.
 
 ## Public Release/download contract
 
