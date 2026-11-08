@@ -10,6 +10,7 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "runtimes/postgresql/scripts"
@@ -1369,6 +1370,400 @@ class PostgreSQLBundleTests(unittest.TestCase):
         self.assertIn('"$work/inst/usr/local/pgsql"', text[stage:])
         self.assertIn('"$work/request.json"', text[stage:])
         self.assertIn('"$REPO_ROOT"', text[stage:])
+
+
+class PostgreSQLVerifyTests(unittest.TestCase):
+    """Verifying a staged bundle: plan, lifecycle, masking and relocation.
+
+    The real bundle cannot be built inside a unit test (it needs a full
+    toolchain build), so the tests here cover every decision verify() makes
+    from the manifest: what it plans to run, what it refuses, and how it
+    proves no host loader took part. The end-to-end run happens against the
+    staged bundle at dist/postgresql/18.6/musl-dynamic.
+    """
+
+    def setUp(self):
+        self.assertTrue((SCRIPTS / "bundle.py").is_file(), "PostgreSQL bundle module is missing")
+        self.bundle = module("bundle")
+        self.modules = module("modules")
+
+    def manifest(self):
+        """A manifest shaped exactly like the one stage() writes."""
+        included = []
+        for kind in ("sql", "preload", "cli", "shared"):
+            for name in self.modules.load_expected("18")[kind]:
+                included.append({"name": name, "kind": kind})
+        return {
+            "schema_version": 1,
+            "runtime": "postgresql",
+            "postgresql": {"version": "18.6", "major": "18"},
+            "target": "musl-dynamic",
+            "architecture": "x86_64",
+            "linkage": "dynamic",
+            "build_id": "0" * 16,
+            "verification": "NOT_RUN",
+            "loader": {"path": "lib/musl/ld-musl-x86_64.so.1", "sha256": "c" * 64,
+                       "musl_version": "1.2.5"},
+            "locale": {"default_provider": "builtin", "default_locale": "C.UTF-8",
+                       "alternate": "PG_UNICODE_FAST"},
+            "libraries": [
+                {"name": "zlib", "version": "1.4", "sha256": "d" * 64, "linkage": "static",
+                 "license": "share/licenses/zlib.txt"},
+                {"name": "openssl", "version": "3.6.5", "sha256": "e" * 64,
+                 "linkage": "shared", "license": "share/licenses/openssl.txt"},
+                {"name": "libxml2", "version": "2.15.4", "sha256": "f" * 64,
+                 "linkage": "static", "license": "share/licenses/libxml2.txt"},
+                {"name": "icu", "version": "79.1", "sha256": "1" * 64, "linkage": "static",
+                 "license": "share/licenses/icu.txt"},
+                {"name": "util-linux", "version": "2.42.4", "sha256": "2" * 64,
+                 "linkage": "static", "license": "share/licenses/util-linux.txt"}],
+            "modules": {"included": included, "skipped": []},
+            "binaries": [],
+            "source_archive": "share/sources/postgresql-18.6.tar.bz2",
+            "licenses": {"builder": "share/licenses/builder.txt",
+                         "postgresql": "share/licenses/postgresql.txt",
+                         "musl": "share/licenses/musl.txt"},
+            "provenance": {},
+            "icu": {"decision": "with_icu", "reason": "zig c++ compiled ICU 79.1"},
+            "builder": {"commit": "0" * 40, "source_sha256": "3" * 64},
+        }
+
+    def staged(self, root):
+        """A bundle directory shaped like stage() left it, with a real loader.
+
+        The loader is the host's glibc loader: it accepts `--library-path`
+        and runs the fixture binaries, so lifecycle/smoke plumbing can be
+        exercised without a musl toolchain. Nothing here claims to be a real
+        PostgreSQL server; the real one is exercised by `verify` on dist/.
+        """
+        bundle = root / "bundle"
+        for directory in ("bin", "lib/musl", "libexec/bin", "share/extension"):
+            (bundle / directory).mkdir(parents=True)
+        shutil.copy2(HOST_LOADER, bundle / "lib/musl/ld-musl-x86_64.so.1")
+        (bundle / "lib/musl/ld-musl-x86_64.so.1").chmod(0o755)
+        for command in ("postgres", "initdb", "pg_ctl", "psql", "pg_config",
+                        "createdb", "dropdb", "pg_dump", "pg_restore", "pg_isready",
+                        "vacuumdb", "reindexdb", "clusterdb", "oid2name", "vacuumlo"):
+            launcher = bundle / "bin" / command
+            launcher.write_text("#!/bin/sh\nexit 0\n")
+            if command == "pg_config":
+                # Behaves like the real one: every path is derived from the
+                # launcher's own location, so a copy reports the copy's paths.
+                launcher.write_text(
+                    "#!/bin/sh\n"
+                    "ROOT=$(CDPATH='' cd -P -- \"$(dirname -- \"$0\")/..\" && pwd)\n"
+                    "printf '%s\\n' \"$ROOT/bin\" \"$ROOT/share\" \"$ROOT/lib\" \"$ROOT/lib\"\n")
+            launcher.chmod(0o755)
+            (bundle / "libexec/bin" / command).write_bytes(b"\x7fELF" + command.encode())
+        return bundle
+
+    def write(self, bundle, manifest=None):
+        """Write a manifest whose loader record names the loader actually staged."""
+        manifest = manifest if manifest is not None else self.manifest()
+        manifest["loader"]["sha256"] = sha256_file(bundle / manifest["loader"]["path"])
+        (bundle / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        return manifest
+
+    # -- the pure plan -----------------------------------------------------
+
+    def test_check_plan_covers_every_included_kind(self):
+        manifest = self.manifest()
+        checks = self.bundle.checks(manifest)
+        for kind in ("sql", "preload", "cli"):
+            self.assertTrue(any(row["kind"] == kind for row in checks), kind)
+        self.assertEqual({row["name"] for row in checks if row["kind"] == "sql"},
+                         {row["name"] for row in manifest["modules"]["included"]
+                          if row["kind"] == "sql"})
+        for row in checks:
+            self.assertEqual(set(row), {"kind", "name", "statement"}, row)
+
+    def test_check_plan_has_one_row_per_included_module(self):
+        manifest = self.manifest()
+        checks = self.bundle.checks(manifest)
+        planned = {(row["kind"], row["name"]) for row in checks}
+        for row in manifest["modules"]["included"]:
+            if row["kind"] == "shared":
+                continue
+            self.assertIn((row["kind"], row["name"]), planned, row)
+        # `shared` libraries are loaded by something else, never on their own.
+        self.assertFalse([row for row in checks if row["kind"] == "shared"])
+
+    def test_check_plan_statements_are_real_proofs_not_creates(self):
+        checks = {row["name"]: row["statement"] for row in self.bundle.checks(self.manifest())}
+        # A named proof-of-linkage case per module the brief calls out.
+        self.assertIn("'a=>1'::hstore->'a'", checks["hstore"])
+        self.assertIn("cube_distance", checks["cube"])
+        self.assertIn("'ABC'::citext = 'abc'", checks["citext"])
+        self.assertIn("similarity", checks["pg_trgm"])
+        self.assertIn("'a.b'::ltree <@ 'a'::ltree", checks["ltree"])
+        self.assertIn("digest", checks["pgcrypto"])
+        self.assertIn("uuid_generate_v4()", checks["uuid-ossp"])
+        self.assertIn("xpath", checks["xml2"])
+        for name, statement in checks.items():
+            if not any(row["name"] == name and row["kind"] == "sql"
+                       for row in self.bundle.checks(self.manifest())):
+                continue
+            self.assertNotRegex(statement, r"^\s*CREATE\s+EXTENSION\s+\S+\s*;?\s*$", name)
+            self.assertRegex(statement, r"SELECT", name)
+        # Preload rows carry the library name; CLI rows carry the command name.
+        for row in self.bundle.checks(self.manifest()):
+            if row["kind"] == "preload":
+                self.assertEqual(row["statement"], row["name"])
+            if row["kind"] == "cli":
+                self.assertTrue(row["statement"], row["name"])
+
+    def test_a_sql_module_without_a_statement_is_an_error_not_a_silent_skip(self):
+        manifest = self.manifest()
+        manifest["modules"]["included"].append({"name": "brand_new", "kind": "sql"})
+        with self.assertRaisesRegex(ValueError, "brand_new"):
+            self.bundle.checks(manifest)
+
+    def test_every_sql_module_in_the_real_manifest_has_a_statement(self):
+        # The table in the module must cover a real bundle's modules, not just
+        # the brief's examples: a statement written from memory would drift.
+        manifest = self.manifest()
+        for row in self.bundle.checks(manifest):
+            self.assertNotIn("TODO", row["statement"], row["name"])
+
+    # -- refusals ----------------------------------------------------------
+
+    def test_verify_rejects_a_tampered_binary_before_smoking(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = self.staged(root)
+            manifest = self.manifest()
+            manifest["loader"]["sha256"] = sha256_file(bundle / "lib/musl/ld-musl-x86_64.so.1")
+            postgres = bundle / "libexec/bin/postgres"
+            manifest["binaries"] = [{"path": "libexec/bin/postgres", "sha256": sha256_file(postgres),
+                                     "interpreter": "/lib/ld-musl-x86_64.so.1",
+                                     "needed": ["libc.so"], "rpath": None, "runpath": None,
+                                     "glibc_required": None, "machine": "Advanced Micro Devices X86-64"}]
+            self.write(bundle, manifest)
+            data = bytearray(postgres.read_bytes())
+            data[0] ^= 0xFF
+            postgres.write_bytes(bytes(data))
+            with mock.patch.object(self.bundle, "lifecycle") as lifecycle, \
+                    mock.patch.object(self.bundle, "assert_no_host_loaders"):
+                with self.assertRaises(ValueError):
+                    self.bundle.verify(bundle)
+            lifecycle.assert_not_called()
+            # A crash mid-verification must not leave PASSED on disk.
+            self.assertEqual(json.loads((bundle / "manifest.json").read_text())["verification"],
+                             "NOT_RUN")
+
+    def test_verify_refuses_to_report_passed_for_an_unsupported_locale_request(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = self.staged(root)
+            manifest = self.manifest()
+            manifest["locale"]["default_provider"] = "libc"
+            self.write(bundle, manifest)
+            with self.assertRaisesRegex(ValueError, "builtin"):
+                self.bundle.verify(bundle)
+            self.assertEqual(json.loads((bundle / "manifest.json").read_text())["verification"],
+                             "NOT_RUN")
+
+    def test_verify_refuses_a_bin_that_is_a_symlink_or_not_executable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = self.staged(root)
+            manifest = self.manifest()
+            self.write(bundle, manifest)
+            (bundle / "bin/psql").unlink()
+            (bundle / "bin/psql").symlink_to("postgres")
+            with self.assertRaisesRegex(ValueError, "psql"):
+                self.bundle.verify(bundle)
+            (bundle / "bin/psql").unlink()
+            (bundle / "bin/psql").write_text("#!/bin/sh\nexit 0\n")
+            (bundle / "bin/psql").chmod(0o644)
+            with self.assertRaisesRegex(ValueError, "psql"):
+                self.bundle.verify(bundle)
+
+    def test_verify_refuses_a_missing_expected_module(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = self.staged(root)
+            manifest = self.manifest()
+            self.write(bundle, manifest)
+            with mock.patch.object(self.bundle, "lifecycle"), \
+                    mock.patch.object(self.bundle, "assert_no_host_loaders", return_value="bwrap"), \
+                    mock.patch.object(self.bundle.modules, "inventory", return_value=[]):
+                with self.assertRaisesRegex(ValueError, "missing sql: hstore"):
+                    self.bundle.verify(bundle)
+            self.assertEqual(json.loads((bundle / "manifest.json").read_text())["verification"],
+                             "NOT_RUN")
+
+    # -- host loader masking ----------------------------------------------
+
+    def test_host_loader_masking_is_detected_or_reported(self):
+        with tempfile.TemporaryDirectory() as temp:
+            bundle = self.staged(Path(temp))
+            strategy = self.bundle.assert_no_host_loaders(bundle)
+        self.assertIn(strategy, ("bwrap", "poison-file"))
+        # Never a silent "no isolation available".
+        self.assertNotIn("none", strategy.lower())
+        self.assertNotIn("unavailable", strategy.lower())
+
+    def test_host_loader_masking_fails_when_no_strategy_can_run(self):
+        with mock.patch.object(self.bundle.shutil, "which", return_value=None), \
+                mock.patch.object(self.bundle, "_poison_probe", return_value=False):
+            with self.assertRaisesRegex(ValueError, "host loader"):
+                self.bundle.assert_no_host_loaders(Path("/nonexistent"))
+
+    def test_the_masking_strategy_makes_the_real_host_loader_unusable(self):
+        # On this host /lib/ld-musl-x86_64.so.1 exists, so the strategy must
+        # actually hide it; the check inside the sandbox is what verify relies on.
+        if not self.bundle._bwrap_usable():
+            self.skipTest("bwrap cannot create namespaces on this host")
+        self.assertEqual(self.bundle._masked_host_loaders_probe(), "bwrap")
+
+    # -- lifecycle and relocation -----------------------------------------
+
+    def test_lifecycle_always_stops_the_server(self):
+        calls = []
+
+        def record(arguments, **kwargs):
+            calls.append([str(argument) for argument in arguments])
+            return ""
+
+        manifest = self.manifest()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = self.staged(root)
+            with mock.patch.object(self.bundle, "_run", side_effect=record), \
+                    mock.patch.object(self.bundle, "smoke", return_value=["smoke"]):
+                self.bundle.lifecycle(bundle, manifest, ["auto_explain"])
+            verbs = [call[-1] for call in calls
+                     if call[0].endswith("pg_ctl") and call[-1] in ("start", "stop")]
+            self.assertEqual(verbs, ["start", "stop"])
+
+    def test_lifecycle_stops_the_server_even_when_smoke_fails(self):
+        calls = []
+
+        def record(arguments, **kwargs):
+            calls.append([str(argument) for argument in arguments])
+            return ""
+
+        manifest = self.manifest()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = self.staged(root)
+            with mock.patch.object(self.bundle, "_run", side_effect=record), \
+                    mock.patch.object(self.bundle, "smoke", side_effect=ValueError("boom")):
+                with self.assertRaisesRegex(ValueError, "boom"):
+                    self.bundle.lifecycle(bundle, manifest, ["auto_explain"])
+            self.assertTrue(any(call[0].endswith("pg_ctl") and call[-1] == "stop" for call in calls))
+
+    def test_lifecycle_keeps_all_cluster_state_out_of_the_bundle(self):
+        # The staged tree is what gets packaged, and its socket path is already
+        # 118 characters — past sun_path's 108 — so a cluster created inside it
+        # could neither start nor be shipped. Every path lifecycle writes must
+        # live in its own workspace, and the workspace must be gone afterwards.
+        manifest = self.manifest()
+        seen = []
+
+        def record(arguments, **kwargs):
+            seen.append(kwargs["env"])
+            return ""
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = self.staged(root)
+            with mock.patch.object(self.bundle, "_run", side_effect=record), \
+                    mock.patch.object(self.bundle, "smoke", return_value=["smoke"]):
+                self.bundle.lifecycle(bundle, manifest, ["auto_explain"])
+        data = Path(seen[0]["PGDATA"])
+        self.assertFalse(data.resolve().is_relative_to(bundle.resolve()),
+                         "the data directory must not live in the bundle")
+        self.assertFalse(Path(seen[0]["PGHOST"]).resolve().is_relative_to(bundle.resolve()))
+        self.assertLess(len(str(data.parent / "socket")), 108, "pg_ctl would refuse the socket")
+        self.assertFalse(data.parent.exists(), "the workspace is removed after the run")
+        self.assertEqual([Path(environment["PGDATA"]) for environment in seen[1:]],
+                         [data] * (len(seen) - 1), "every step sees the same cluster")
+
+
+        manifest = self.manifest()
+
+        def failing(arguments, **kwargs):
+            if str(arguments[-1]) == "start":
+                # lifecycle writes its log into its own workspace; the log holds
+                # the real reason a preload did not load.
+                Path(kwargs["env"]["PGDATA"]).parent.joinpath("server.log").write_text(
+                    'LOG: could not load library "/x/auto_explain.so": no such file\n')
+                raise ValueError("pg_ctl start failed")
+            return ""
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = self.staged(root)
+            with mock.patch.object(self.bundle, "_run", side_effect=failing):
+                with self.assertRaisesRegex(ValueError, "could not load library"):
+                    self.bundle.lifecycle(bundle, manifest, ["auto_explain"])
+
+    def test_relocated_bundle_reports_paths_inside_itself(self):
+        if not shutil.which("cc") or not shutil.which("readelf"):
+            self.skipTest("ELF fixture compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = self.staged(root)
+            self.write(bundle)
+            relocated = self.bundle.relocate(bundle)
+            try:
+                self.assertNotEqual(relocated, bundle)
+                self.assertIn("#", str(relocated))
+                self.assertTrue(relocated.is_dir())
+                self.assertTrue((relocated / "bin/psql").is_file())
+                # pg_config must report the copy's own paths, not the original's.
+                original = self.bundle.pg_config_paths(bundle)
+                derived = self.bundle.pg_config_paths(relocated)
+                self.assertEqual(set(derived), {"bindir", "sharedir", "libdir", "pkglibdir"})
+                for key, value in derived.items():
+                    self.assertEqual(value, original[key].replace(str(bundle), str(relocated)), key)
+            finally:
+                shutil.rmtree(relocated, ignore_errors=True)
+
+    def test_preload_list_is_every_preload_module_in_manifest_order(self):
+        manifest = self.manifest()
+        self.assertEqual(self.bundle.preload_list(manifest),
+                         [row["name"] for row in manifest["modules"]["included"]
+                          if row["kind"] == "preload"])
+
+    # -- manifest bookkeeping ---------------------------------------------
+
+    def test_verify_records_the_strategy_only_on_success(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = self.staged(root)
+            manifest = self.manifest()
+            manifest["loader"]["sha256"] = sha256_file(bundle / "lib/musl/ld-musl-x86_64.so.1")
+            self.write(bundle, manifest)
+            copy = root / "PostgreSQL 18.6 #relocated"
+            shutil.copytree(bundle, copy, symlinks=True)
+            with mock.patch.object(self.bundle, "assert_no_host_loaders", return_value="bwrap"), \
+                    mock.patch.object(self.bundle, "lifecycle", return_value=["server-version"]), \
+                    mock.patch.object(self.bundle, "relocate", return_value=copy), \
+                    mock.patch.object(self.bundle, "pg_config_paths", return_value={}), \
+                    mock.patch.object(self.bundle, "_verify_binaries"), \
+                    mock.patch.object(self.bundle, "_check_launchers"), \
+                    mock.patch.object(self.bundle, "_check_module_inventory"):
+                result = self.bundle.verify(bundle)
+            self.assertFalse(copy.exists(), "the relocated copy is cleaned up")
+            self.assertEqual(result["strategy"], "bwrap")
+            self.assertIn("checks", result)
+            stored = json.loads((bundle / "manifest.json").read_text())
+            self.assertEqual(stored["verification"], "PASSED")
+            self.assertEqual(stored["verification_strategy"], "bwrap")
+            self.assertEqual(stored["checks"], ["server-version", "server-version"])
+
+    def test_build_script_verifies_before_packaging_and_keeps_a_failed_tree(self):
+        text = (SCRIPTS / "build.sh").read_text()
+        stage = text.index('bundle.py" stage')
+        verify = text.index('bundle.py" verify')
+        self.assertLess(stage, verify)
+        self.assertIn('"$bundle"', text[verify:])
+        # A non-zero verify must abort before anything is packaged.
+        if "package" in text:
+            self.assertLess(verify, text.index("package"))
 
 
 if __name__ == "__main__":

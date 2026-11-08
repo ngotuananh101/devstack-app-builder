@@ -67,4 +67,9 @@ env "${environment[@]}" make -C "$work/build" DESTDIR="$work/inst" install-world
 python3 -I "$RUNTIME_DIR/scripts/bundle.py" stage \
   "$work/inst/usr/local/pgsql" "$bundle" "$work/request.json" "$work/toolchain.json" "$REPO_ROOT"
 printf 'Staged bundle: %s\n' "$bundle"
+# Verification runs a real cluster out of the staged tree with the host's own
+# musl loader masked away. A failure here leaves the tree in place — it is the
+# only evidence of what went wrong — and must never reach packaging.
+python3 -I "$RUNTIME_DIR/scripts/bundle.py" verify "$bundle"
+printf 'Verified bundle: %s\n' "$bundle"
 printf 'PostgreSQL build workspace: %s\n' "$work"
