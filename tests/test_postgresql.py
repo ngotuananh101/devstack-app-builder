@@ -947,6 +947,16 @@ class PostgreSQLBundleTests(unittest.TestCase):
                 f"comment = '{name}'\ndefault_version = '1.0'\n")
         for name in expected["preload"]:
             build_library(install / "lib" / (name + ".so"), name + ".so")
+        # `shared` is a generated list, so the fixture has to carry what the
+        # real install tree carries or staging rightly refuses it as missing.
+        # The unversioned symlinks staging takes from the dependency prefix
+        # (libssl, libcrypto) are deliberately not built here: they belong to
+        # that prefix, and a regular file at the same path would collide with
+        # the symlink staging adds.
+        for name in expected["shared"]:
+            target = install / "lib" / (name + ".so")
+            if not target.exists() and name not in ("libssl", "libcrypto"):
+                build_library(target, name + ".so")
         (install / "share/postgres.bki").write_text("# bki\n")
         for sample in ("postgresql.conf.sample", "pg_hba.conf.sample",
                        "pg_ident.conf.sample", "pg_service.conf.sample", "psqlrc.sample"):
@@ -1370,6 +1380,277 @@ class PostgreSQLBundleTests(unittest.TestCase):
         self.assertIn('"$work/inst/usr/local/pgsql"', text[stage:])
         self.assertIn('"$work/request.json"', text[stage:])
         self.assertIn('"$REPO_ROOT"', text[stage:])
+
+    def test_build_script_packages_into_dist_assets_after_verifying(self):
+        # The same wiring Redis uses: package the verified tree into the shared
+        # asset directory, then print the bundle path the caller is told about.
+        text = (SCRIPTS / "build.sh").read_text()
+        verify = text.index('bundle.py" verify')
+        package = text.index('bundle.py" package')
+        self.assertLess(verify, package)
+        self.assertIn('package "$bundle" "$REPO_ROOT/dist/assets"', text)
+        printed = text.index("printf 'Verified bundle:")
+        self.assertLess(package, printed)
+        self.assertIn("$bundle", text[printed:printed + 60])
+
+
+class PostgreSQLPackageTests(unittest.TestCase):
+    """Packaging a verified bundle into the three named assets.
+
+    The archive is the only thing a user downloads, so its name, its modes and
+    its refusal to replace anything already on disk are all part of the
+    contract, not conveniences.
+    """
+
+    def setUp(self):
+        self.assertTrue((SCRIPTS / "bundle.py").is_file(), "PostgreSQL bundle module is missing")
+        self.bundle = module("bundle")
+
+    def staged(self, root, version="18.6", build_id="abc123"):
+        """A bundle directory shaped like stage() left it, with a real loader."""
+        bundle = root / "bundle"
+        for directory in ("bin", "lib/musl", "libexec/bin", "share/extension"):
+            (bundle / directory).mkdir(parents=True)
+        shutil.copy2(HOST_LOADER, bundle / "lib/musl/ld-musl-x86_64.so.1")
+        (bundle / "lib/musl/ld-musl-x86_64.so.1").chmod(0o755)
+        for command in ("postgres", "initdb", "pg_ctl", "psql"):
+            launcher = bundle / "bin" / command
+            launcher.write_text("#!/bin/sh\nexec ...\n")
+            launcher.chmod(0o755)
+            raw = bundle / "libexec/bin" / command
+            raw.write_text("#!/bin/sh\nexit 0\n")
+            raw.chmod(0o755)
+        manifest = {
+            "schema_version": 1,
+            "runtime": "postgresql",
+            "postgresql": {"version": version, "major": version.split(".")[0]},
+            "target": "musl-dynamic",
+            "architecture": "x86_64",
+            "linkage": "dynamic",
+            "build_id": build_id,
+            "verification": "NOT_RUN",
+        }
+        (bundle / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        return bundle, manifest
+
+    def mark_passed(self, bundle, manifest):
+        manifest["verification"] = "PASSED"
+        (bundle / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        return manifest
+
+    def test_packaging_requires_verified_manifest_and_names_the_asset(self):
+        with tempfile.TemporaryDirectory(prefix="postgresql package ") as temp:
+            root = Path(temp)
+            bundle, manifest = self.staged(root)
+            with self.assertRaisesRegex(ValueError, "verification"):
+                self.bundle.package(bundle, root / "assets")
+            # Nothing may be produced by a refused package, not even the directory.
+            self.assertFalse((root / "assets").exists())
+            self.mark_passed(bundle, manifest)
+            archive = self.bundle.package(bundle, root / "assets")
+            self.assertEqual(archive.name,
+                             "postgresql-18.6-musl-dynamic-x86_64-abc123.tar.gz")
+            self.assertEqual(archive.parent, root / "assets")
+            # The sidecars sit beside the archive and describe the same bytes.
+            self.assertEqual(
+                (root / "assets/postgresql-18.6-musl-dynamic-x86_64-abc123.tar.gz.sha256")
+                .read_text().split()[0],
+                hashlib.sha256(archive.read_bytes()).hexdigest())
+            metadata = json.loads(
+                (root / "assets/postgresql-18.6-musl-dynamic-x86_64-abc123.manifest.json")
+                .read_text())
+            self.assertEqual(metadata["verification"], "PASSED")
+            self.assertEqual(metadata["postgresql"], {"version": "18.6", "major": "18"})
+
+    def test_packaging_refuses_a_bundle_that_is_not_a_postgresql_one(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle, manifest = self.staged(root)
+            self.mark_passed(bundle, manifest)
+            for runtime in ("redis", "", None):
+                with self.subTest(runtime=runtime):
+                    manifest["runtime"] = runtime
+                    (bundle / "manifest.json").write_text(json.dumps(manifest))
+                    with self.assertRaises(ValueError):
+                        self.bundle.package(bundle, root / "assets")
+
+    def test_packaging_preserves_executable_modes_and_launchers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle, manifest = self.staged(root)
+            self.mark_passed(bundle, manifest)
+            archive = self.bundle.package(bundle, root / "assets")
+            root_name = "postgresql-18.6-musl-dynamic-x86_64-abc123"
+            with tarfile.open(archive) as tar:
+                psql = tar.getmember(root_name + "/bin/psql")
+                self.assertEqual(psql.mode & 0o777, 0o755)
+                loader = tar.getmember(root_name + "/lib/musl/ld-musl-x86_64.so.1")
+                self.assertEqual(loader.mode & 0o777, 0o755)
+                raw = tar.getmember(root_name + "/libexec/bin/psql")
+                self.assertEqual(raw.mode & 0o777, 0o755)
+                # The archive holds one root named after the asset, with the
+                # bundle's relative layout below it — no absolute paths.
+                names = tar.getnames()
+                self.assertTrue(all(name == root_name or name.startswith(root_name + "/")
+                                    for name in names), names[:5])
+                self.assertIn(root_name + "/manifest.json", names)
+                self.assertFalse([name for name in names if Path(name).is_absolute()])
+
+    def test_packaging_never_overwrites_a_sidecar_or_archive(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle, manifest = self.staged(root)
+            self.mark_passed(bundle, manifest)
+            assets = root / "assets"
+            assets.mkdir()
+            family = "postgresql-18.6-musl-dynamic-x86_64-abc123"
+            for existing in (family + ".tar.gz", family + ".tar.gz.sha256",
+                             family + ".manifest.json"):
+                with self.subTest(existing=existing):
+                    target = assets / existing
+                    target.unlink(missing_ok=True)
+                    target.write_text("keep me\n")
+                    with self.assertRaises(FileExistsError):
+                        self.bundle.package(bundle, assets)
+                    self.assertEqual(target.read_text(), "keep me\n")
+                    # Every other asset of the set is left as it was: the
+                    # reservation happens before anything is written.
+                    for name in (family + ".tar.gz", family + ".tar.gz.sha256",
+                                 family + ".manifest.json"):
+                        if name != existing:
+                            self.assertFalse((assets / name).exists(), name)
+                    target.unlink()
+
+    def test_packaging_unwinds_only_what_it_created(self):
+        # A failure after the reservation must not leave a half-written set,
+        # and must not delete a file that was already there.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle, manifest = self.staged(root)
+            self.mark_passed(bundle, manifest)
+            assets = root / "assets"
+            assets.mkdir()
+            pre_existing = assets / "unrelated.tar.gz"
+            pre_existing.write_text("not mine\n")
+            with mock.patch.object(self.bundle.tarfile, "open",
+                                   side_effect=OSError("disk went away")):
+                with self.assertRaises(OSError):
+                    self.bundle.package(bundle, assets)
+            self.assertEqual(sorted(path.name for path in assets.iterdir()),
+                             ["unrelated.tar.gz"])
+            self.assertEqual(pre_existing.read_text(), "not mine\n")
+
+    def test_archive_identity_parts_are_filesystem_safe(self):
+        for part in ("18.6", "musl-dynamic", "x86_64", "abc123"):
+            self.assertRegex(part, r"^[a-zA-Z0-9_.-]+$")
+        # Anything that could escape the output directory or split the name is
+        # refused before a single byte is written.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for build_id in ("../../etc/passwd", "abc/123", "abc 123", "abc\n123", ""):
+                with self.subTest(build_id=build_id):
+                    bundle, manifest = self.staged(root / build_id.replace("/", "_"),
+                                                   build_id=build_id)
+                    self.mark_passed(bundle, manifest)
+                    with self.assertRaises(ValueError):
+                        self.bundle.package(bundle, root / "assets")
+
+    def test_package_cli_writes_the_assets_and_prints_the_archive(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle, manifest = self.staged(root)
+            self.mark_passed(bundle, manifest)
+            command = ["python3", "-I", str(SCRIPTS / "bundle.py"), "package",
+                       str(bundle), str(root / "assets")]
+            run = subprocess.run(command, text=True, capture_output=True,
+                                 env={**os.environ, "PYTHONPATH": ""})
+            self.assertEqual(run.returncode, 0, run.stderr)
+            archive = root / "assets/postgresql-18.6-musl-dynamic-x86_64-abc123.tar.gz"
+            self.assertEqual(run.stdout.strip(), str(archive))
+            self.assertTrue(archive.is_file())
+
+
+class PostgreSQLConfigReconciliationTests(unittest.TestCase):
+    """The committed module lists against the trees that were really built.
+
+    `shared` is generated from what staging actually put in `lib/`, so a stale
+    list is not a documentation nit: `compare` reports every entry as
+    "unexpected shared" and the manifest carries that noise forever.
+    """
+
+    def setUp(self):
+        self.modules = module("modules")
+        self.bundle = module("bundle")
+
+    def test_generate_prints_the_inventory_grouped_by_kind(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "share/extension").mkdir(parents=True)
+            (root / "lib").mkdir()
+            (root / "bin").mkdir()
+            (root / "share/extension/hstore.control").write_text("default_version = '1.8'\n")
+            (root / "lib/hstore.so").write_bytes(b"\x7fELF")
+            (root / "lib/auto_explain.so").write_bytes(b"\x7fELF")
+            (root / "lib/utf8_and_euc_jp.so").write_bytes(b"\x7fELF")
+            (root / "bin/oid2name").write_bytes(b"\x7fELF")
+            run = subprocess.run(
+                ["python3", "-I", str(SCRIPTS / "modules.py"), "--generate", str(root), "18"],
+                text=True, capture_output=True, env={**os.environ, "PYTHONPATH": ""})
+            self.assertEqual(run.returncode, 0, run.stderr)
+            generated = json.loads(run.stdout)
+            self.assertEqual(generated, {
+                "sql": ["hstore"],
+                "preload": ["auto_explain"],
+                "shared": ["utf8_and_euc_jp"],
+                "cli": ["oid2name"],
+            })
+            self.assertEqual(list(generated), list(self.modules.KINDS))
+            # What it prints must be exactly what `load_expected` accepts, or
+            # the reconciliation step could never be pasted into the config.
+            with tempfile.TemporaryDirectory() as other:
+                config = Path(other) / "modules.json"
+                config.write_text(json.dumps({"18": generated}))
+                old = self.modules.CONFIG
+                try:
+                    self.modules.CONFIG = config
+                    self.assertEqual(self.modules.load_expected("18"), generated)
+                finally:
+                    self.modules.CONFIG = old
+
+    def test_generate_refuses_an_unsupported_major(self):
+        with tempfile.TemporaryDirectory() as temp:
+            for major in ("16", "19", "18.6", ""):
+                with self.subTest(major=major):
+                    run = subprocess.run(
+                        ["python3", "-I", str(SCRIPTS / "modules.py"),
+                         "--generate", temp, major],
+                        text=True, capture_output=True, env={**os.environ, "PYTHONPATH": ""})
+                    self.assertNotEqual(run.returncode, 0)
+
+    def test_the_committed_shared_lists_are_generated_not_empty(self):
+        # The exact defect this reconciliation exists to fix: `shared: []`
+        # against a tree with 36 shared libraries.
+        for major in ("17", "18"):
+            expected = self.modules.load_expected(major)
+            with self.subTest(major=major):
+                self.assertTrue(expected["shared"], "shared must be generated, not empty")
+                for name in ("libpq", "libssl", "libcrypto",
+                             "utf8_and_euc_jp", "utf8_and_win", "test_decoding"):
+                    self.assertIn(name, expected["shared"], name)
+
+    def test_the_committed_config_matches_every_installed_bundle(self):
+        # Only meaningful where the real bundles exist (this branch's build
+        # host); a clean checkout skips rather than asserting on absent trees.
+        for version in ("17.11", "18.6"):
+            tree = ROOT / "dist/postgresql" / version / "musl-dynamic"
+            if not tree.is_dir():
+                continue
+            manifest = json.loads((tree / "manifest.json").read_text())
+            major = manifest["postgresql"]["major"]
+            with self.subTest(version=version):
+                self.assertEqual(
+                    self.modules.compare(self.modules.inventory(tree),
+                                         self.modules.load_expected(major)), [])
 
 
 class PostgreSQLVerifyTests(unittest.TestCase):
@@ -1908,6 +2189,47 @@ class PostgreSQLVerifyTests(unittest.TestCase):
         self.assertEqual(answer("f|t\n"), "icu:linked")
         with self.assertRaisesRegex(ValueError, "not being used"):
             answer("t|t\n")
+
+    def test_the_icu_proof_uses_a_collation_no_host_can_withhold(self):
+        # The proof must not depend on the host's locale catalogue. A fresh
+        # cluster only has a locale-derived collation such as "C.utf8" because
+        # pg_import_system_collations enumerated `locale -a`; on a host without
+        # it the statement aborts and a host-independent verification becomes
+        # host-dependent. COLLATE "C" is byte order, exists in every major, and
+        # keeps the discriminator: ICU en-US orders 'B' < 'a' false, byte order
+        # gives true.
+        manifest = self.manifest()
+        statements = []
+
+        def record(psql, arguments, env, stdin=None, timeout=300):
+            statements.append(stdin)
+            return "f|t\n"
+
+        with mock.patch.object(self.bundle, "_psql", side_effect=record):
+            self.assertEqual(self.bundle._icu(Path("/nonexistent"), manifest,
+                                              {"PATH": "/usr/bin:/bin"}), "icu:linked")
+        self.assertEqual(len(statements), 1)
+        script = statements[0]
+        self.assertIn('COLLATE "C"', script)
+        # Not just "C": a locale-derived name such as C.utf8, POSIX or any
+        # xx_YY form is exactly what must not appear.
+        self.assertNotIn("C.utf8", script)
+        self.assertNotIn("POSIX", script)
+        self.assertNotRegex(script, r"COLLATE\s+\"?[a-z]{2}_[A-Z]{2}")
+        # The discriminator survives verbatim: same expression, byte order side.
+        self.assertIn("('B' < 'a' COLLATE verify_icu)", script)
+        # And the absent-ICU branch creates only the ICU collation; it must not
+        # lean on a host catalogue either.
+        statements.clear()
+        absent = self.manifest()
+        absent["libraries"] = [row for row in absent["libraries"] if row["name"] != "icu"]
+
+        def refuse(psql, arguments, env, stdin=None, timeout=300):
+            raise ValueError("could not open file: icuuc")
+
+        with mock.patch.object(self.bundle, "_psql", side_effect=refuse):
+            self.assertEqual(self.bundle._icu(Path("/nonexistent"), absent,
+                                              {"PATH": "/usr/bin:/bin"}), "icu:absent")
 
     # -- workspace hygiene on the failure paths ----------------------------
 
