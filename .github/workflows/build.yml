@@ -155,10 +155,12 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install CI-only native build dependencies
         run: |
-          # Only the C compiler, binutils and the build tools live on the host.
-          # musl itself is compiled from its pinned source by loader.py, so the
-          # runner's musl-tools (1.2.4 on Ubuntu 24.04) is neither installed nor
-          # wanted: the bundle's loader and its objects must be the pinned 1.2.5.
+          # Only the C compiler and its kernel UAPI headers, binutils and the build
+          # tools live on the host. musl itself is compiled from its pinned source by
+          # loader.py, so the runner's musl-tools (1.2.4 on Ubuntu 24.04) is neither
+          # installed nor wanted: the bundle's loader and its objects must be the
+          # pinned 1.2.5. Nothing here needs /lib/ld-musl-x86_64.so.1 to exist —
+          # build-time programs are linked against the toolchain's own loader.
           # Every library httpd links is built from a pinned, digest-verified
           # source into the staging prefix, so no -dev package is installed here.
           sudo apt-get update

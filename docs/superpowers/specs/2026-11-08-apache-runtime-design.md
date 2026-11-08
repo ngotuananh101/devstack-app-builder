@@ -298,10 +298,12 @@ root and Lounge's `LoadModule` lines say `modules/...`.
   resolves the dependency graph, emits `--print-plan`, downloads, verifies and
   extracts each archive into its own fresh directory.
 - `scripts/loader.py` — compiles the pinned musl into a private toolchain (its own
-  `musl-gcc` wrapper and specs, `--syslibdir=/lib`), proves it by compiling and
-  running a program with it — including a kernel UAPI header, because musl ships
-  none — and returns the loader to ship, the compiler path every later step uses,
-  and the kernel include roots it discovered.
+  `musl-gcc` wrapper and specs, `--syslibdir=<toolchain>/lib`), proves it by
+  compiling and running a program with it — including a kernel UAPI header, because
+  musl ships none — and returns the loader to ship, the compiler path every later
+  step uses, and the kernel include roots it discovered. The loader it names is the
+  toolchain's own, not `/lib`: `configure` runs the programs it just compiled, and
+  a CI runner has no distribution musl installed.
 - `scripts/uapi.py` — reads the host compiler's include search list and returns
   every directory supplying `linux/` or `asm/`, refusing a set that does not cover
   both. Fedora keeps them together under `/usr/include`; Ubuntu splits `asm/` into
@@ -316,8 +318,10 @@ root and Lounge's `LoadModule` lines say `modules/...`.
   `loader.py` builds the pinned release into a private toolchain, and `deps.py` and
   `httpd.py` are handed its compiler path and the kernel include roots, both as
   arguments rather than as constants.
-- `scripts/stage.py` — installs httpd into `libexec/bin`, generates launchers from
-  one template, moves DSOs to `modules/`, libraries to `lib/`, stages config, htdocs,
+- `scripts/stage.py` — installs httpd into `libexec/bin`, rewrites each program's
+  `PT_INTERP` to the portable `/lib/ld-musl-x86_64.so.1` (the build's compiler names
+  the toolchain loader so `configure` can run test programs on a musl-less host),
+  generates launchers from one template, moves DSOs to `modules/`, libraries to `lib/`, stages config, htdocs,
   include, licenses, sources, writes `manifest.json`.
 - `scripts/verify.py` — below.
 - `scripts/package.py` — deterministic tar.gz + `.sha256` + manifest sidecar.

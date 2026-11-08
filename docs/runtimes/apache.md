@@ -92,6 +92,16 @@ a bundle whose loader is older than the objects linked against it is precisely t
 ABI mismatch the build must not ship. The host only has to provide a working C
 compiler, which a probe proves before anything is downloaded.
 
+**The toolchain names its own loader while the build runs.** `configure` compiles a
+test program and runs it straight away, so the interpreter in its `PT_INTERP` has to
+exist on the host — and a runner with no musl installed has no
+`/lib/ld-musl-x86_64.so.1`. So the toolchain is built with
+`--syslibdir=<toolchain>/lib`, every build-time program asks for that loader, and
+`stage.py` rewrites each shipped program's `PT_INTERP` back to the portable
+`/lib/ld-musl-x86_64.so.1` before the manifest is written. The rewrite is
+length-preserving and refused if the new name cannot fit; the launchers name the
+bundled loader explicitly, so nothing in a relocated bundle depends on it either way.
+
 **Kernel UAPI headers do come from the host**, because musl deliberately ships none:
 `<linux/*.h>` and the `<asm/*.h>` they include are the distribution's, and they must
 match the kernel the bundle runs on. Their location is not portable — Fedora keeps
@@ -107,7 +117,7 @@ The pipeline runs under fresh `.cache/apache/build.*` directories:
    list must supply `linux/` and `asm/`; either failing stops the run here,
 2. `fetch.py` — verify each SHA-256, then extract into `sources/<name>/`,
 3. `loader.py` — build the pinned musl into the toolchain, then compile, link and
-   run a probe program with it **including a kernel header**; the same `libc.so`
+   **run a probe program** with it, including a kernel header; the same `libc.so`
    becomes the shipped loader,
 4. `deps.py` — build the 15 dependency pins (every pin except musl) into a staging
    prefix with that toolchain's `musl-gcc`,

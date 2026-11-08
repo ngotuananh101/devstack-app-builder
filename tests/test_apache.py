@@ -159,9 +159,15 @@ class ToolchainContracts(unittest.TestCase):
         # through DESTDIR so it never writes /lib on the build host.
         text = (SCRIPTS / "loader.py").read_text()
         self.assertIn('"--prefix=" + str(toolchain)', text)
-        self.assertIn('"--syslibdir=" + str(PurePosixPath(SYSLOADER).parent)', text)
+        self.assertIn('"--syslibdir=" + str(toolchain / PurePosixPath(TOOLCHAIN_LOADER).parent)',
+                      text)
         self.assertIn('"DESTDIR=" + str(stage)', text)
-        self.assertEqual(self.loader.SYSLOADER, "/lib/ld-musl-x86_64.so.1")
+        # The interpreter the compiler names must be the toolchain's own loader,
+        # not /lib: configure runs its test programs on hosts that have no musl.
+        self.assertEqual(self.loader.TOOLCHAIN_LOADER, "lib/ld-musl-x86_64.so.1")
+        # ...and the portable /lib name lives in stage.py, the only step that has
+        # a shipped bundle to write it back into.
+        self.assertNotIn("SYSLOADER", text)
 
     def test_no_step_compiles_with_the_hosts_musl_gcc(self):
         # A default of musl-gcc would silently reintroduce the dependency this
@@ -271,6 +277,43 @@ class ToolchainContracts(unittest.TestCase):
             mute.chmod(0o755)
             with self.assertRaisesRegex(ValueError, "include search list"):
                 uapi.discover(mute)
+
+    def test_the_interpreter_is_rewritten_for_the_bundle(self):
+        # The build's compiler names the toolchain loader so configure can run its
+        # test programs on a host with no musl; a shipped ELF must not carry that
+        # workspace path, and the rewrite is length-preserving.
+        elf = load("elf")
+        sysloader = "/lib/ld-musl-x86_64.so.1"
+        with tempfile.TemporaryDirectory() as temporary:
+            program = Path(temporary) / "prog"
+            build = subprocess.run(
+                ["cc", "-O2", "-Wl,-dynamic-linker," + sysloader,
+                 "-o", str(program), "-xc", "-"],
+                input="int main(void){return 0;}\n", text=True, capture_output=True)
+            self.assertEqual(build.returncode, 0, build.stderr)
+            self.assertEqual(elf.interpreter(program), sysloader)
+            # A path that cannot fit is refused rather than written over the
+            # following bytes; this is a segment-layout problem, not a patch.
+            with self.assertRaisesRegex(ValueError, "cannot fit"):
+                elf.set_interpreter(program, "/" + "x" * 200)
+            self.assertEqual(elf.interpreter(program), sysloader)
+            longer = temporary + "/" + "l" * 8 + "/loader"
+            Path(longer).parent.mkdir(parents=True, exist_ok=True)
+            if len(longer) == len(sysloader):
+                self.assertFalse(elf.set_interpreter(program, longer))
+                self.assertEqual(elf.interpreter(program), longer)
+
+    def test_staging_makes_every_program_name_the_portable_loader(self):
+        # Every staged program goes through portable_interpreter, or a build
+        # workspace path would ship inside the bundle and fail elsewhere.
+        text = (SCRIPTS / "stage.py").read_text()
+        staging = text.split("def stage_binaries", 1)[1].split("def stage_modules", 1)[0]
+        # Both copy sites in stage_binaries rewrite it: httpd's own programs and
+        # the dependency-prefix programs (openssl).
+        self.assertEqual(staging.count("portable_interpreter("), 2)
+        self.assertIn('SYSLOADER = "/lib/" + LOADER_NAME', text)
+        stage = load("stage")
+        self.assertEqual(stage.SYSLOADER, "/lib/ld-musl-x86_64.so.1")
 
     def test_the_wrapper_names_the_host_compiler_that_built_it(self):
         # musl's own wrapper execs a bare `gcc`; a host that only provides `cc`

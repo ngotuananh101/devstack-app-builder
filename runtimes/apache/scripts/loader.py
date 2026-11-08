@@ -27,14 +27,17 @@ import sys
 import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import elf
 import fetch
 import uapi
 
 LOADER_NAME = "ld-musl-x86_64.so.1"
-# Every linked program requests this interpreter. The bundle's launchers exec the
-# bundled loader themselves, so the kernel never resolves it; keeping the name
-# rather than the build prefix out of PT_INTERP is what makes the ELF portable.
-SYSLOADER = "/lib/" + LOADER_NAME
+# Where the toolchain puts its own loader while the build runs. It cannot be /lib:
+# `configure` compiles a program and runs it immediately, so the interpreter its
+# PT_INTERP names has to exist on a host that never installed musl — and a CI
+# runner has not. The toolchain's own loader is used instead, and stage.py rewrites
+# every shipped PT_INTERP back to the portable /lib name.
+TOOLCHAIN_LOADER = "lib/" + LOADER_NAME
 
 
 def digest(path):
@@ -139,6 +142,12 @@ def build_toolchain(source, work, compiler, jobs):
     through DESTDIR: the wrapper must name where the toolchain really lives, while
     `make install` would otherwise try to create /lib/ld-musl-x86_64.so.1 on the
     build host. The staged tree is moved into place afterwards.
+
+    --syslibdir is the toolchain's own lib/, not /lib: every program the build
+    compiles asks for that interpreter, and configure runs its test programs
+    immediately. Naming the workspace loader is what lets a host with no musl
+    installed at all complete the dependency build; stage.py rewrites the shipped
+    PT_INTERP back to the portable /lib name when it stages the bundle.
     """
     toolchain = work / "toolchain"
     stage = work / "toolchain-stage"
@@ -150,7 +159,7 @@ def build_toolchain(source, work, compiler, jobs):
     environment = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "SOURCE_DATE_EPOCH": "0"}
     steps = (
         (["sh", str(source / "configure"), "--prefix=" + str(toolchain),
-          "--syslibdir=" + str(PurePosixPath(SYSLOADER).parent),
+          "--syslibdir=" + str(toolchain / PurePosixPath(TOOLCHAIN_LOADER).parent),
           "--disable-static", "--enable-shared"],
          dict(environment, CC=shutil.which(compiler) or compiler)),
         (["make", "-j", str(jobs)], environment),
@@ -162,7 +171,8 @@ def build_toolchain(source, work, compiler, jobs):
     if staged != toolchain:
         staged.rename(toolchain)
     shutil.rmtree(stage)
-    for path in ("bin/musl-gcc", "lib/musl-gcc.specs", "lib/libc.so", "include/stdio.h"):
+    for path in ("bin/musl-gcc", "lib/musl-gcc.specs", "lib/libc.so", "include/stdio.h",
+                 TOOLCHAIN_LOADER):
         if not (toolchain / path).exists():
             raise ValueError("The musl toolchain is missing " + path)
     write_wrapper(toolchain, compiler)
@@ -186,6 +196,10 @@ def probe_toolchain(toolchain, work, version, kernel):
     The probe includes a kernel header because that is the one thing it takes from
     the host, and a kernel root that does not resolve <asm/*.h> is what failed the
     very first CI run of this build.
+
+    The interpreter the program asks for must be the toolchain's own loader, and the
+    program must run — that is the check a host without /lib/ld-musl-x86_64.so.1
+    fails, and the one `configure` makes on every dependency.
     """
     source = work / "toolchain-probe.c"
     program = work / "toolchain-probe"
@@ -207,16 +221,21 @@ def probe_toolchain(toolchain, work, version, kernel):
     dynamic = subprocess.check_output(["readelf", "-dW", str(program)], text=True)
     if re.search(r"\((?:RPATH|RUNPATH)\)", dynamic):
         raise ValueError("The musl toolchain adds a search path to every object")
-    interpreter = re.search(r"Requesting program interpreter: \[?([^\]\n]+)\]?",
-                            subprocess.check_output(["readelf", "-lW", str(program)], text=True))
-    if not interpreter or interpreter[1] != SYSLOADER:
-        raise ValueError("The toolchain requests %s instead of %s"
-                         % (interpreter[1] if interpreter else "no interpreter", SYSLOADER))
-    # The bundled loader is executed the way the launchers execute it: as the
-    # program's interpreter, named explicitly. PT_INTERP above is a name only.
-    result = subprocess.run([toolchain["libc"], str(program)], text=True, capture_output=True)
+    interpreter = elf.interpreter(program)
+    wanted = str(Path(toolchain["prefix"]) / TOOLCHAIN_LOADER)
+    if interpreter != wanted:
+        raise ValueError("The toolchain requests %s instead of its own loader %s"
+                         % (interpreter or "no interpreter", wanted))
+    # The program is run the way configure runs its test programs: the kernel
+    # resolves PT_INTERP. A host with no musl installed fails here, not 40 minutes
+    # into the dependency build.
+    result = subprocess.run([str(program)], text=True, capture_output=True, env=environment)
     if result.returncode != 0 or result.stdout.strip() != "toolchain-ok":
         raise ValueError("A program built with the toolchain does not run:\n" + result.stderr)
+    # And once more through the loader that ships, the way the launchers run it.
+    result = subprocess.run([toolchain["libc"], str(program)], text=True, capture_output=True)
+    if result.returncode != 0 or result.stdout.strip() != "toolchain-ok":
+        raise ValueError("The bundled loader cannot run a toolchain program:\n" + result.stderr)
     actual = banner_version(toolchain["libc"])
     if actual != version:
         raise ValueError("Toolchain musl %s is not the pinned %s" % (actual, version))

@@ -43,6 +43,11 @@ EXTRA_PROGRAMS = ("openssl",)
 # HTTPD_ROOT at configure time, so without -d it reads the build host's config
 # file and the bundle's own conf/ is never consulted.
 SERVER_ROOT_ARGUMENT = {"httpd": '-d "$ROOT"'}
+# The interpreter every shipped program must name. The build's compiler points
+# PT_INTERP at the toolchain's own loader so configure can run its test programs on
+# a host with no musl installed; the bundle ships no build workspace paths, so every
+# program is rewritten to this name, which the launchers supply explicitly.
+SYSLOADER = "/lib/" + LOADER_NAME
 DBD_DRIVER = re.compile(r"apr_dbd_[a-z0-9]+-1\.so")
 
 
@@ -56,6 +61,23 @@ def is_elf(path):
         return path.read_bytes()[:4] == b"\x7fELF"
     except OSError:
         return False
+
+
+def portable_interpreter(path):
+    """Rewrite a staged program's PT_INTERP to the name the bundle ships.
+
+    Nothing else reads this: the launchers exec the bundled loader with
+    --library-path, so the kernel never resolves the name in a bundle run. It still
+    has to be the portable one — a build workspace path inside a shipped ELF is a
+    host dependency, and it would make the bundle fail on any machine but the one
+    that built it.
+    """
+    current = elf.interpreter(path)
+    if current is None:
+        raise ValueError("Staged program requests no interpreter: " + path.name)
+    if current == SYSLOADER:
+        return
+    elf.set_interpreter(path, SYSLOADER)
 
 
 def copy(source, destination, mode=None):
@@ -88,6 +110,7 @@ def stage_binaries(install, prefix, bundle):
         if not is_elf(program):
             raise ValueError("Unexpected non-ELF program in bin/: " + program.name)
         copy(program, bundle / "libexec/bin" / program.name, 0o755)
+        portable_interpreter(bundle / "libexec/bin" / program.name)
         if program.name in UNLAUNCHED:
             # 0755 is deliberate: a setuid bit inside a user-owned tarball would be
             # restored by a root extraction, and nothing in the bundle needs it.
@@ -100,6 +123,7 @@ def stage_binaries(install, prefix, bundle):
         if not program.is_file():
             raise ValueError("The dependency prefix is missing bin/" + name)
         copy(program, bundle / "libexec/bin" / name, 0o755)
+        portable_interpreter(bundle / "libexec/bin" / name)
         stage_launcher(bundle, template, name)
         launchers.append(name)
     controller = bundle / "bin/apachectl"
