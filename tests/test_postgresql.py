@@ -1464,6 +1464,23 @@ class PostgreSQLVerifyTests(unittest.TestCase):
         (bundle / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         return manifest
 
+    def environment(self, root):
+        """The minimal environment smoke() needs, without starting a cluster."""
+        socket = Path(root) / "socket"
+        socket.mkdir(parents=True, exist_ok=True)
+        return self.bundle._environment(Path(root), Path(root) / "data", socket)
+
+    def psql(self, version="18.6"):
+        """A psql stand-in: the version banner, the ICU ordering, a true row otherwise."""
+        def respond(psql, arguments, env, stdin=None, timeout=300):
+            if any("version()" in str(argument) for argument in arguments):
+                return f"PostgreSQL {version} on x86_64-pc-linux-gnu\n"
+            if stdin and "COLLATE" in stdin:
+                # What the real bundle prints: ICU orders B before a, builtin C.utf8 does not.
+                return "f|t\n"
+            return "t\n"
+        return respond
+
     # -- the pure plan -----------------------------------------------------
 
     def test_check_plan_covers_every_included_kind(self):
@@ -1610,6 +1627,51 @@ class PostgreSQLVerifyTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "host loader"):
                 self.bundle.assert_no_host_loaders(Path("/nonexistent"))
 
+    def test_verify_falls_back_to_the_poison_probe_without_bwrap(self):
+        # Without unprivileged user namespaces — common in CI and containers —
+        # bwrap cannot run, and a bundle that still proves its own linkage must
+        # verify rather than abort the build. This is the call verify() makes,
+        # with the bundle it is verifying, not a bare one.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = self.staged(root)
+            self.write(bundle)
+            copy = root / "PostgreSQL 18.6 #relocated"
+            shutil.copytree(bundle, copy, symlinks=True)
+            with mock.patch.object(self.bundle.shutil, "which", return_value=None), \
+                    mock.patch.object(self.bundle, "_poison_probe", return_value=True), \
+                    mock.patch.object(self.bundle, "lifecycle",
+                                      return_value=["server-version"]) as lifecycle, \
+                    mock.patch.object(self.bundle, "relocate", return_value=copy), \
+                    mock.patch.object(self.bundle, "pg_config_paths", return_value={}), \
+                    mock.patch.object(self.bundle, "_verify_binaries"), \
+                    mock.patch.object(self.bundle, "_check_launchers"), \
+                    mock.patch.object(self.bundle, "_check_module_inventory"):
+                result = self.bundle.verify(bundle)
+            self.assertEqual(result["strategy"], "poison-file")
+            # The lifecycle must be told which strategy proved isolation, so it
+            # can run unmasked under the poison fallback and masked under bwrap.
+            self.assertEqual({call.args[3] for call in lifecycle.call_args_list},
+                             {"poison-file"})
+            stored = json.loads((bundle / "manifest.json").read_text())
+            self.assertEqual(stored["verification"], "PASSED")
+            self.assertEqual(stored["verification_strategy"], "poison-file")
+
+    def test_verify_never_passes_without_bwrap_or_the_poison_probe(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = self.staged(root)
+            self.write(bundle)
+            with mock.patch.object(self.bundle.shutil, "which", return_value=None), \
+                    mock.patch.object(self.bundle, "_poison_probe", return_value=False), \
+                    mock.patch.object(self.bundle, "lifecycle") as lifecycle:
+                with self.assertRaisesRegex(ValueError, "host loader"):
+                    self.bundle.verify(bundle)
+            lifecycle.assert_not_called()
+            stored = json.loads((bundle / "manifest.json").read_text())
+            self.assertEqual(stored["verification"], "NOT_RUN")
+            self.assertNotIn("verification_strategy", stored)
+
     def test_the_masking_strategy_makes_the_real_host_loader_unusable(self):
         # On this host /lib/ld-musl-x86_64.so.1 exists, so the strategy must
         # actually hide it; the check inside the sandbox is what verify relies on.
@@ -1681,7 +1743,7 @@ class PostgreSQLVerifyTests(unittest.TestCase):
         self.assertEqual([Path(environment["PGDATA"]) for environment in seen[1:]],
                          [data] * (len(seen) - 1), "every step sees the same cluster")
 
-
+    def test_lifecycle_names_the_server_log_when_preload_fails(self):
         manifest = self.manifest()
 
         def failing(arguments, **kwargs):
@@ -1722,6 +1784,178 @@ class PostgreSQLVerifyTests(unittest.TestCase):
             finally:
                 shutil.rmtree(relocated, ignore_errors=True)
 
+    def test_every_planned_cli_row_is_executed_by_smoke(self):
+        # A cli row in the plan must be run by smoke, not by a hardcoded list
+        # beside it: otherwise a new cli module would be planned, ignored, and
+        # still reported PASSED — the silent skip the brief forbids.
+        manifest = self.manifest()
+        manifest["modules"]["included"].append({"name": "pg_waldump", "kind": "cli"})
+        with tempfile.TemporaryDirectory() as temp:
+            bundle = self.staged(Path(temp))
+            # A launcher the fixture does not ship by default, so the only way
+            # it gets run is because the plan named it.
+            (bundle / "bin/pg_waldump").write_text("#!/bin/sh\nexit 0\n")
+            (bundle / "bin/pg_waldump").chmod(0o755)
+            with mock.patch.object(self.bundle, "_run", return_value=""), \
+                    mock.patch.dict(self.bundle.CLI_PROOFS, {"pg_waldump": ("--help",)}), \
+                    mock.patch.object(self.bundle, "_psql", side_effect=self.psql()):
+                names = self.bundle.smoke(bundle, manifest, self.environment(Path(temp)))
+        self.assertIn("tool:pg_waldump", names)
+
+    def test_a_planned_cli_without_a_proof_invocation_is_an_error_not_a_version_banner(self):
+        # Without this, `--version` would be the quiet default and a tool that
+        # cannot reach the cluster at all would still be recorded as exercised.
+        manifest = self.manifest()
+        manifest["modules"]["included"].append({"name": "pg_waldump", "kind": "cli"})
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = self.staged(root)
+            (bundle / "bin/pg_waldump").write_text("#!/bin/sh\nexit 0\n")
+            (bundle / "bin/pg_waldump").chmod(0o755)
+            with mock.patch.object(self.bundle, "_run", return_value=""), \
+                    mock.patch.object(self.bundle, "_psql", side_effect=self.psql()):
+                with self.assertRaisesRegex(ValueError, "pg_waldump"):
+                    self.bundle.smoke(bundle, manifest, self.environment(root))
+
+    def test_a_planned_cli_the_bundle_does_not_provide_fails_rather_than_passes(self):
+        # The bundle has no bin/pg_waldump in this fixture, so running it must
+        # fail — a plan row that cannot be executed is a failure, never a skip.
+        manifest = self.manifest()
+        manifest["modules"]["included"].append({"name": "pg_waldump", "kind": "cli"})
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = self.staged(root)
+            with mock.patch.object(self.bundle, "_psql", side_effect=self.psql()):
+                with self.assertRaisesRegex(ValueError, "pg_waldump"):
+                    self.bundle.smoke(bundle, manifest, self.environment(root))
+
+    def test_smoke_proves_every_planned_preload_row_loaded(self):
+        # Start-up is the proof: a bogus entry in shared_preload_libraries makes
+        # the server refuse to start, so a cluster that came up with the planned
+        # list has loaded every one of those libraries.
+        manifest = self.manifest()
+        with tempfile.TemporaryDirectory() as temp:
+            bundle = self.staged(Path(temp))
+            with mock.patch.object(self.bundle, "_run", return_value=""), \
+                    mock.patch.object(self.bundle, "_psql", side_effect=self.psql()):
+                names = self.bundle.smoke(bundle, manifest, self.environment(Path(temp)))
+        for row in self.bundle.checks(manifest):
+            if row["kind"] == "preload":
+                self.assertIn(f"preload:{row['name']}", names, row["name"])
+
+    def test_the_round_trip_no_longer_carries_its_own_tool_list(self):
+        self.assertFalse(hasattr(self.bundle, "ROUND_TRIP_TOOLS"),
+                         "the tool list must come from checks(), not a constant")
+
+    # -- placeholder substitution and the sql details it must not break ----
+
+    def test_substitution_leaves_sql_braces_and_percent_signs_alone(self):
+        # str.format would read {1,2,3} as a field and raise; a regex or a LIKE
+        # pattern with % must survive untouched. Both shapes are in real proofs.
+        statement = ("SELECT '{1,2,3}'::text[] @> ARRAY['1'] "
+                     "AND 'x' LIKE '%x%' AND host = '{host}';")
+        result = self.bundle._substitute(statement, Path("/tmp/sock"))
+        self.assertIn("'{1,2,3}'", result)
+        self.assertIn("LIKE '%x%'", result)
+        self.assertIn("host = '/tmp/sock'", result)
+        # No placeholder survives that the table knows how to fill.
+        for placeholder in ("{dsn}", "{host}", "{port}", "{dsn_db}", "{dbname}"):
+            self.assertNotIn(placeholder, result)
+
+    def test_every_proof_statement_survives_substitution(self):
+        # The whole table, not one example: a statement added later with braces
+        # must not be able to reintroduce the format() failure.
+        socket = Path("/tmp/verify socket")
+        for row in self.bundle.checks(self.manifest()):
+            if row["kind"] != "sql":
+                continue
+            result = self.bundle._substitute(row["statement"], socket)
+            for placeholder in ("{dsn}", "{host}", "{port}", "{dsn_db}", "{dbname}"):
+                self.assertNotIn(placeholder, result, row["name"])
+            if "{dsn}" in row["statement"] or "{host}" in row["statement"]:
+                self.assertIn(str(socket), result, row["name"])
+
+    def test_the_pg_stat_statements_proof_names_its_own_schema(self):
+        # verify creates the extension into verify_stat_statements, so an
+        # unqualified relation name raises "does not exist" on a real cluster.
+        statement = self.bundle.SQL_PROOFS["pg_stat_statements"]
+        self.assertIn("verify_stat_statements.pg_stat_statements", statement)
+
+    def test_the_pg_stat_statements_extension_is_created_in_that_schema(self):
+        calls = []
+
+        def record(psql, arguments, env, stdin=None, timeout=300):
+            calls.append(" ".join(str(argument) for argument in arguments))
+            return ""
+
+        with mock.patch.object(self.bundle, "_psql", side_effect=record):
+            self.bundle._create_extension("psql", {"kind": "sql", "name": "pg_stat_statements",
+                                                   "statement": ""}, {"PATH": "/usr/bin:/bin"})
+        self.assertTrue(any("CREATE SCHEMA IF NOT EXISTS verify_stat_statements" in call
+                            for call in calls), calls)
+        self.assertTrue(any("SCHEMA verify_stat_statements" in call for call in calls), calls)
+
+    def test_the_icu_ordering_parse_reads_unaligned_output(self):
+        # psql separates columns with a pipe even under -tA; the parse must
+        # read f|t as ICU-then-builtin, and must reject t|t, the fallback shape.
+        manifest = self.manifest()
+
+        def answer(output):
+            with mock.patch.object(self.bundle, "_psql", return_value=output):
+                return self.bundle._icu(Path("/nonexistent"), manifest,
+                                        {"PATH": "/usr/bin:/bin"})
+
+        self.assertEqual(answer("f|t\n"), "icu:linked")
+        with self.assertRaisesRegex(ValueError, "not being used"):
+            answer("t|t\n")
+
+    # -- workspace hygiene on the failure paths ----------------------------
+
+    def test_lifecycle_removes_its_workspace_when_isolation_raises(self):
+        # _isolation runs inside the try: bwrap vanishing between the probe and
+        # here must not leak a /tmp/pg-verify-* directory behind it.
+        manifest = self.manifest()
+        created = []
+        real = self.bundle._workspace
+
+        def record():
+            path = real()
+            created.append(path)
+            return path
+
+        def explode(workspace, strategy):
+            raise ValueError("bwrap disappeared between the probe and the lifecycle")
+
+        with tempfile.TemporaryDirectory() as temp:
+            bundle = self.staged(Path(temp))
+            with mock.patch.object(self.bundle, "_workspace", side_effect=record), \
+                    mock.patch.object(self.bundle, "_isolation", side_effect=explode):
+                with self.assertRaisesRegex(ValueError, "bwrap disappeared"):
+                    self.bundle.lifecycle(bundle, manifest, ["auto_explain"], "bwrap")
+        self.assertEqual(len(created), 1)
+        self.assertFalse(created[0].exists(), "the workspace leaked")
+
+    def test_verify_removes_a_relocated_copy_it_already_made(self):
+        # relocate() creates the copy before returning, so a failure after that
+        # point must still remove it; otherwise every failed run leaves ~300 MB.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = self.staged(root)
+            self.write(bundle)
+            copy = root / "PostgreSQL 18.6 #relocated"
+            shutil.copytree(bundle, copy, symlinks=True)
+            with mock.patch.object(self.bundle, "assert_no_host_loaders", return_value="bwrap"), \
+                    mock.patch.object(self.bundle, "lifecycle", return_value=["server-version"]), \
+                    mock.patch.object(self.bundle, "relocate", return_value=copy), \
+                    mock.patch.object(self.bundle, "pg_config_paths",
+                                      side_effect=ValueError("pg_config broke")), \
+                    mock.patch.object(self.bundle, "_verify_binaries"), \
+                    mock.patch.object(self.bundle, "_check_launchers"), \
+                    mock.patch.object(self.bundle, "_check_module_inventory"):
+                with self.assertRaisesRegex(ValueError, "pg_config broke"):
+                    self.bundle.verify(bundle)
+            self.assertFalse(copy.exists(), "the relocated copy leaked")
+
     def test_preload_list_is_every_preload_module_in_manifest_order(self):
         manifest = self.manifest()
         self.assertEqual(self.bundle.preload_list(manifest),
@@ -1761,9 +1995,16 @@ class PostgreSQLVerifyTests(unittest.TestCase):
         verify = text.index('bundle.py" verify')
         self.assertLess(stage, verify)
         self.assertIn('"$bundle"', text[verify:])
-        # A non-zero verify must abort before anything is packaged.
-        if "package" in text:
-            self.assertLess(verify, text.index("package"))
+        # `set -e` is what makes a non-zero verify abort: without it the script
+        # would print "Verified bundle" and carry on regardless.
+        self.assertIn("set -euo pipefail", text)
+        self.assertIn("printf 'Verified bundle", text)
+        # A non-zero verify must abort before anything is packaged. Packaging
+        # does not exist yet — a later task owns it — so assert the ordering
+        # the moment it appears rather than guarding on a keyword that is
+        # currently absent and leaving the check inert.
+        if 'bundle.py" package' in text:
+            self.assertLess(verify, text.index('bundle.py" package'))
 
 
 if __name__ == "__main__":

@@ -63,12 +63,14 @@ HOST_LOADER_TREES = ("/usr/x86_64-linux-musl/lib64",)
 # starts its commands inside the same sandbox as initdb and the postmaster.
 MASK_VARIABLE = "PG_BUNDLE_VERIFY_MASK"
 
-# The tools Step 6 round-trips against the running cluster, in the order the
-# brief names them. pg_upgrade and pg_basebackup are deliberately absent: both
-# need a second cluster and their own lifecycle, and cross-major migration is
-# out of scope for the design.
-ROUND_TRIP_TOOLS = ("createdb", "pg_dump", "dropdb", "createdb", "pg_restore",
-                    "vacuumdb", "pg_isready", "reindexdb", "clusterdb")
+# How each contrib cli module is exercised against the running cluster. A cli
+# module with no entry here is a ValueError naming it, never a bare --version.
+# Which modules run is read from checks(), never from a list beside it, so a
+# cli module added to the manifest is executed rather than silently skipped.
+CLI_PROOFS = {
+    "oid2name": ("-d", "postgres", "-q"),
+    "vacuumlo": ("-n", "postgres"),
+}
 
 # Every SQL module the manifest may include, with the statement that proves it
 # linked. Each statement is written from the module's own
@@ -647,6 +649,8 @@ def checks(manifest):
         elif kind == "preload":
             plan.append({"kind": "preload", "name": name, "statement": name})
         elif kind == "cli":
+            # The statement is the command name; smoke() runs it against the
+            # cluster. A tool the bundle does not ship fails there, by name.
             plan.append({"kind": "cli", "name": name, "statement": name})
         elif kind == "shared":
             # Shared libraries are loaded by something else — libpq by a
@@ -736,11 +740,17 @@ def _masked_host_loaders_probe():
     workspace = _workspace()
     try:
         # Every alias of a host loader must be missing or zero bytes inside the
-        # sandbox; the second half also proves the bundle's own loader still is
-        # an ELF, so a mask that broke everything cannot pass as isolation.
-        script = "; ".join(
+        # sandbox, and every musl-dev tree must be empty, or the mask is not
+        # the mask that was asked for. A tree left populated is a second way to
+        # resolve a host loader, so it is asserted exactly like the files.
+        checks = [
             f"test ! -s {loader} || {{ echo '{loader} is still a live loader' >&2; exit 1; }}"
-            for loader in HOST_LOADERS)
+            for loader in HOST_LOADERS]
+        checks += [
+            f"test -z \"$(ls -A {tree} 2>/dev/null)\" || "
+            f"{{ echo '{tree} still lists entries' >&2; exit 1; }}"
+            for tree in HOST_LOADER_TREES]
+        script = "; ".join(checks)
         result = subprocess.run(
             [executable, *_mask_arguments(workspace), "--", "/bin/sh", "-c", script],
             text=True, capture_output=True, timeout=60)
@@ -926,10 +936,12 @@ def lifecycle(root, manifest, preload, strategy=None):
     socket = workspace / "socket"
     log = workspace / "server.log"
     socket.mkdir(parents=True, exist_ok=True)
-    mask = _isolation(workspace, strategy)
-    env = _environment(workspace, data, socket, mask)
     started = False
     try:
+        # Inside the try: _isolation can raise (bwrap disappearing between the
+        # probe and here), and the workspace must not leak when it does.
+        mask = _isolation(workspace, strategy)
+        env = _environment(workspace, data, socket, mask)
         _run([root / "bin/initdb", "-D", data, "-U", "verify", "--encoding=UTF8",
               "--locale-provider=builtin", "--builtin-locale=C.UTF-8", "--no-instructions"],
              env=env)
@@ -1028,10 +1040,19 @@ def smoke(root, manifest, env=None):
                                  f"returned {last!r}, not true")
             exercised.append(f"sql:{row['name']}")
 
-        # Step 6: the remaining local tools, round-tripped against this cluster.
-        exercised.extend(_round_trip(root, env))
+        # Step 6: the client tools, derived from the plan — never a list beside
+        # it — so a cli module the plan names is executed or fails by name.
+        plan = checks(manifest)
+        exercised.extend(_round_trip(root, env, plan))
         # Step 7: ICU ordering, or its absence as a checked fact.
         exercised.append(_icu(root, manifest, env))
+        # Step 8: every planned preload row. Under bwrap the server already
+        # started with exactly this list in shared_preload_libraries, and a
+        # bogus entry makes start-up fail — measured on this bundle — so a
+        # cluster that came up is the proof that each one loaded.
+        for row in plan:
+            if row["kind"] == "preload":
+                exercised.append(f"preload:{row['name']}")
         return exercised
     finally:
         if owned:
@@ -1041,8 +1062,10 @@ def smoke(root, manifest, env=None):
 def _substitute(statement, socket):
     """Fill the connection placeholders a proof may use.
 
-    A plain replace, never str.format: several proofs contain braces (JSONB,
-    array and regex literals) that format would try to interpret as fields.
+    A plain replace, never str.format: several proofs contain braces — array
+    literals like '{1,2,3}', JSONB documents, regex quantifiers — and format
+    would read those as fields and raise. A '%' in a LIKE pattern must survive
+    too, which rules out the %-formatting operator for the same reason.
     """
     values = {
         "dsn": f"host={socket} port=5432 dbname=postgres user=verify",
@@ -1071,8 +1094,14 @@ def _create_extension(psql, row, env):
         raise ValueError(f"CREATE EXTENSION {name} failed: {exc}") from exc
 
 
-def _round_trip(root, env):
-    """Round-trip the local tools the brief names, through their launchers."""
+def _round_trip(root, env, plan):
+    """Round-trip the core client tools, then exercise every planned cli module.
+
+    The cli half is driven by `plan`, so a module the plan names is either run
+    or reported by name when the bundle has no such command. A tool named for
+    `database` takes part in the dump/restore round-trip; any other tool is run
+    with its own proven invocation on the postgres database.
+    """
     exercised = []
     database = "verify_roundtrip"
     dump = Path(env["TMPDIR"]) / "verify.dump"
@@ -1096,13 +1125,26 @@ def _round_trip(root, env):
     exercised.append("tool:clusterdb")
     _run([root / "bin/dropdb", database], env=env)
     dump.unlink(missing_ok=True)
+
     # The contrib client tools have no cluster of their own; proving they run
-    # against this one proves their launchers resolve libpq.
-    _run([root / "bin/oid2name", "-d", "postgres", "-q"], env=env)
-    exercised.append("tool:oid2name")
-    _psql(root / "bin/psql", ["-c", "SELECT lo_from_bytea(0, 'x'::bytea)"], env)
-    _run([root / "bin/vacuumlo", "-n", "postgres"], env=env)
-    exercised.append("tool:vacuumlo")
+    # against this one proves their launchers resolve libpq. Every planned cli
+    # row is run here, so the plan and the execution cannot drift apart.
+    for row in plan:
+        if row["kind"] != "cli":
+            continue
+        name = row["name"]
+        command = root / "bin" / name
+        if not command.is_file():
+            raise ValueError(f"Planned cli module {name!r} has no bin/{name} in the bundle")
+        arguments = CLI_PROOFS.get(name)
+        if arguments is None:
+            raise ValueError(f"Planned cli module {name!r} has no proof invocation; "
+                             "add one to CLI_PROOFS rather than running --version")
+        if name == "vacuumlo":
+            # vacuumlo only has work to do once a large object exists.
+            _psql(root / "bin/psql", ["-c", "SELECT lo_from_bytea(0, 'x'::bytea)"], env)
+        _run([command, *arguments], env=env)
+        exercised.append(f"tool:{name}")
     return exercised
 
 
@@ -1152,16 +1194,24 @@ def relocate(bundle):
     return destination
 
 
-def pg_config_paths(root, env=None):
+def pg_config_paths(root, strategy="bwrap"):
     """The four paths pg_config reports, which must all live in the bundle.
 
     Split by line, never by whitespace: the relocated bundle's name contains
     spaces, and a whitespace split would silently compare the truncated
     `/…/PostgreSQL` as if it were a path.
+
+    pg_config is a staged command like any other, so under bwrap it runs
+    masked, in a short-lived workspace of its own that is always removed.
     """
-    env = env or {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
-    output = _run([Path(root) / "bin/pg_config", "--bindir", "--sharedir", "--libdir",
-                   "--pkglibdir"], env=env)
+    workspace = _workspace()
+    try:
+        env = _environment(workspace, workspace / "data", workspace / "socket",
+                           _isolation(workspace, strategy))
+        output = _run([Path(root) / "bin/pg_config", "--bindir", "--sharedir", "--libdir",
+                       "--pkglibdir"], env=env)
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
     values = output.splitlines()
     if len(values) != 4:
         raise ValueError(f"pg_config reported {len(values)} paths, not four: {output!r}")
@@ -1250,7 +1300,11 @@ def verify(bundle):
     _verify_manifest(bundle, manifest)
     _verify_binaries(bundle, manifest)
     _check_launchers(bundle)
-    strategy = assert_no_host_loaders()
+    # The bundle goes in: on a host where bwrap cannot create namespaces the
+    # poison probe is the only proof available, and it needs a bundle to probe.
+    # Without this argument that branch is unreachable and every such host
+    # aborts a perfectly verifiable build.
+    strategy = assert_no_host_loaders(bundle)
 
     preload = preload_list(manifest)
     # pg_stat_statements only loads through shared_preload_libraries, and it is
@@ -1260,15 +1314,19 @@ def verify(bundle):
         preload = preload + ["pg_stat_statements"]
     names = lifecycle(bundle, manifest, preload, strategy)
 
-    relocated = relocate(bundle)
+    # Inside the try from the start: relocate() creates the copy before it
+    # returns, so a failure between the copytree and the return would leak it.
+    relocated = None
     try:
+        relocated = relocate(bundle)
         names = names + lifecycle(relocated, manifest, preload, strategy)
-        for key, value in pg_config_paths(relocated).items():
+        for key, value in pg_config_paths(relocated, strategy).items():
             if not Path(value).resolve().is_relative_to(relocated.resolve()):
                 raise ValueError(f"pg_config --{key} reports {value!r}, outside the "
                                  "relocated bundle")
     finally:
-        shutil.rmtree(relocated, ignore_errors=True)
+        if relocated is not None:
+            shutil.rmtree(relocated, ignore_errors=True)
 
     _check_module_inventory(bundle, manifest)
 
