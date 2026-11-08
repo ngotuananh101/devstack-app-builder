@@ -26,7 +26,7 @@
     },
     "openssl": {
       "version": "3.6.5",
-      "url": "https://www.openssl.org/source/openssl-3.6.5.tar.gz",
+      "url": "https://distfiles.macports.org/openssl3/openssl-3.6.5.tar.gz",
       "sha256": "a2157c2830efdec3788939b00c9b0638306d3f0bbb76dc4832ee503bb397df98",
       "license": "Apache-2.0"
     },
