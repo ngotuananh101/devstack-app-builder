@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Classify and verify PostgreSQL loadable modules, client libraries, and tools."""
+import argparse
 import json
 from pathlib import Path
 import re
@@ -16,6 +17,7 @@ PRELOAD_ONLY = frozenset({
     "pg_overexplain",
 })
 CLI_ONLY = frozenset({"oid2name", "vacuumlo"})
+MAJORS = ("17", "18")
 
 
 def _load_exclusions() -> dict[str, str]:
@@ -98,8 +100,8 @@ def compare(inventory_data, expected_data) -> list[str]:
 
 def load_expected(major: str) -> dict:
     """Load and validate the expected module inventory for a supported major version."""
-    if not isinstance(major, str) or major not in ("17", "18"):
-        raise ValueError(f"Unsupported major {major!r}; supported majors are ('17', '18')")
+    if not isinstance(major, str) or major not in MAJORS:
+        raise ValueError(f"Unsupported major {major!r}; supported majors are {MAJORS}")
     if not CONFIG.is_file():
         raise FileNotFoundError(f"Configuration file {CONFIG} is missing")
     data = json.loads(CONFIG.read_text())
@@ -129,3 +131,41 @@ def load_expected(major: str) -> dict:
             seen.add(name)
 
     return expected
+
+
+def generate(install_root: Path, major: str) -> dict:
+    """The expected-module object for one real install tree or staged bundle.
+
+    `shared` cannot be written by hand: it is whatever staging put in `lib/`,
+    including the vendored shared OpenSSL libraries the staging step copies
+    there, so guessing it produces a list that `compare` then reports as
+    "unexpected shared" for every entry. This makes the config a generated
+    artefact of the build it describes.
+
+    `major` is validated even though nothing here reads it: emitting a block
+    for a major `load_expected` would reject only moves the failure to the
+    paste-in step, and the exclusions this file carries are per-runtime.
+    """
+    if not isinstance(major, str) or major not in MAJORS:
+        raise ValueError(f"Unsupported major {major!r}; supported majors are {MAJORS}")
+    generated: dict[str, list[str]] = {kind: [] for kind in KINDS}
+    for row in inventory(install_root):
+        generated[row["kind"]].append(row["name"])
+    # Sorted because load_expected rejects an unsorted list; KINDS order because
+    # that is the order the config file carries the blocks in.
+    return {kind: sorted(generated[kind]) for kind in KINDS}
+
+
+def _main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--generate", nargs=2, metavar=("INSTALL_ROOT", "MAJOR"),
+                        help="Print the expected-module JSON for an installed tree")
+    args = parser.parse_args()
+    if args.generate is None:
+        parser.error("nothing to do; pass --generate <install_root> <major>")
+    install_root, major = args.generate
+    print(json.dumps(generate(Path(install_root), major), indent=2))
+
+
+if __name__ == "__main__":
+    _main()
