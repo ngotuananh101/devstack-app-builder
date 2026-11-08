@@ -52,7 +52,7 @@
     {
       "name": "jansson",
       "version": "2.14",
-      "url": "https://github.com/akheron/jansson/releases/download/v2.14/jansson-2.14.tar.gz",
+      "url": "https://distfiles.macports.org/jansson/jansson-2.14.tar.gz",
       "sha256": "5798d010e41cf8d76b66236cfb2f2543c8d082181d16bc3085ab49538d4b9929",
       "license": "MIT",
       "role": "link"
@@ -60,7 +60,7 @@
     {
       "name": "expat",
       "version": "2.10.0",
-      "url": "https://github.com/libexpat/libexpat/releases/download/R_2_10_0/expat-2.10.0.tar.gz",
+      "url": "https://downloads.sourceforge.net/project/expat/expat/2.10.0/expat-2.10.0.tar.gz",
       "sha256": "5466a341f9c692ef7a958a6881311be597f8e1ce345984cf78414f54793dea4c",
       "license": "MIT",
       "role": "link"
@@ -108,7 +108,7 @@
     {
       "name": "curl",
       "version": "8.23.0",
-      "url": "https://github.com/curl/curl/releases/download/curl-8_23_0/curl-8.23.0.tar.gz",
+      "url": "https://curl.se/download/curl-8.23.0.tar.gz",
       "sha256": "e3de77cfa6367083c776a26647fc9f633b538c06c3baa73d931a252ac8f72b49",
       "license": "curl",
       "role": "link"

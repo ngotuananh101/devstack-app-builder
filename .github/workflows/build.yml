@@ -162,7 +162,11 @@ jobs:
           # digest-verified by the build script; only these host tools are apt's.
           # bubblewrap is not a build dependency: it is how verification hides
           # every host musl loader before starting a server, and publication
-          # accepts only a bundle verified that way.
+          # accepts only a bundle verified that way. On this image bwrap does not
+          # create the user namespace the mask needs, so verify takes the
+          # poison-file fallback and prints bwrap's own reason; the bundle is then
+          # not publishable from here. The job still proves the bundle builds,
+          # stages and runs a real cluster; publication runs where bwrap works.
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends bison flex perl build-essential binutils curl bubblewrap
       - name: Build, verify a real server lifecycle, and package

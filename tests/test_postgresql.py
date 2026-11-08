@@ -1,4 +1,5 @@
 """PostgreSQL source authenticity and CLI contracts."""
+import contextlib
 import hashlib
 import importlib.util
 import io
@@ -49,13 +50,14 @@ def sha256_file(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def build_elf(root, destination, needed=("libpq.so.5",), search=None, message=None):
+def build_elf(root, destination, needed=("libpq.so.5",), search=None, message=None,
+              interpreter="/lib/ld-musl-x86_64.so.1"):
     """Compile a musl-interp executable that needs no libc to run."""
     source = Path(root) / "fixture.c"
     if not source.exists():
         source.write_text(FIXTURE_SOURCE)
     command = ["cc", "-nostdlib", "-fno-stack-protector",
-               "-Wl,--dynamic-linker=/lib/ld-musl-x86_64.so.1", "-Wl,-e,_start",
+               f"-Wl,--dynamic-linker={interpreter}", "-Wl,-e,_start",
                "-Wl,--no-as-needed"]
     if message is not None:
         command.append(f'-DMSG="{message}"')
@@ -616,6 +618,65 @@ class PostgreSQLToolchainTests(unittest.TestCase):
         self.assertNotIn("-lc++", env["LDFLAGS"].split())
         self.assertIn("-fPIC", env["CFLAGS"])
 
+    def test_build_environment_names_the_pinned_loader_when_there_is_one(self):
+        # Without this every program `zig cc` links asks for the host path
+        # /lib/ld-musl-x86_64.so.1 and `configure` aborts with "cannot run C
+        # compiled programs" on a runner that never installed musl.
+        env = self.toolchain.build_env(Path("/zig"), Path("/deps"), Path("/work/loader/libc.so"))
+        self.assertIn("-Wl,--dynamic-linker=/work/loader/libc.so", env["CC"].split())
+        self.assertIn("-Wl,--dynamic-linker=/work/loader/libc.so", env["CXX"].split())
+        # Still not an LDFLAGS value: that string is replayed by a user's linker.
+        self.assertNotIn("dynamic-linker", env["LDFLAGS"])
+
+    def test_build_environment_leaves_the_loader_out_when_none_is_named(self):
+        env = self.toolchain.build_env(Path("/zig"), Path("/deps"))
+        self.assertNotIn("--dynamic-linker", " ".join(env["CC"].split()))
+        self.assertNotIn("--dynamic-linker", " ".join(env["CXX"].split()))
+
+    def test_build_programs_that_do_not_run_are_reported_as_such(self):
+        # The probe exists so the failure names its cause in seconds instead of
+        # surfacing inside a dependency's configure as "cannot run C compiled
+        # programs". A compiler that produces a program which dies stands in for
+        # the missing-loader case the probe was added for.
+        with tempfile.TemporaryDirectory() as temp:
+            work = Path(temp)
+            script = work / "broken-cc"
+            script.write_text(
+                "import pathlib, sys\n"
+                "target = pathlib.Path(sys.argv[sys.argv.index('-o') + 1])\n"
+                "target.write_text('#!/bin/sh\\nexit 3\\n')\n"
+                "target.chmod(0o755)\n")
+            script.chmod(0o755)
+            env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C",
+                   "CC": f"python3 -I {script}", "LDFLAGS": ""}
+            with self.assertRaisesRegex(ValueError, "cannot run C compiled programs"):
+                self.toolchain.check_build_programs_run(work / "probe", env)
+
+    def test_a_probe_whose_loader_does_not_exist_names_the_configure_symptom(self):
+        # This is the CI failure the probe was added for: the ELF is fine, but
+        # the interpreter it asks for is not on the host, so the kernel refuses
+        # the exec. The message must name the downstream symptom, not a bare
+        # permission error nobody can act on.
+        if not shutil.which("cc"):
+            self.skipTest("C compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            work = Path(temp)
+            env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LDFLAGS": "",
+                   "CC": "cc -Wl,--dynamic-linker=/nonexistent/ld-musl-x86_64.so.1"}
+            with self.assertRaisesRegex(ValueError, "cannot run C compiled programs"):
+                self.toolchain.check_build_programs_run(work / "probe", env)
+
+    def test_loader_path_reads_back_what_build_loader_recorded(self):
+        # Guessing the path from the layout is what this avoids: the loader
+        # module owns where libc.so goes.
+        with tempfile.TemporaryDirectory() as temp:
+            work = Path(temp)
+            (work / "loader.json").write_text(json.dumps(
+                {"source": "/work/loader/libc.so", "loader": {"sha256": "a" * 64}}))
+            self.assertEqual(self.toolchain.loader_path(work), "/work/loader/libc.so")
+            (work / "loader.json").write_text(json.dumps({"source": "/elsewhere/libc.so"}))
+            self.assertEqual(self.toolchain.loader_path(work), "/elsewhere/libc.so")
+
     def test_zig_pin_is_checked_before_any_configure(self):
         # A mismatched declared version must raise, not warn.
         with tempfile.TemporaryDirectory() as temp:
@@ -759,6 +820,59 @@ class PostgreSQLToolchainTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 self.toolchain._confined_extract(good, root / "good")
 
+    def test_fetch_retries_a_transient_gateway_error(self):
+        # GitHub's release CDN answers 504 for a single asset while the rest of
+        # the same release serves normally, and recovers within seconds. Without
+        # a retry one such answer kills a build that has already spent an hour
+        # compiling, so the download is attempted more than once.
+        with tempfile.TemporaryDirectory() as temp:
+            downloads = Path(temp)
+            payload = b"archive bytes"
+            pin = {"url": "https://example.invalid/zlib-1.4.tar.gz",
+                   "sha256": hashlib.sha256(payload).hexdigest()}
+            attempts = []
+
+            def fake_run(command, **kwargs):
+                attempts.append(command)
+                target = Path(command[command.index("--output") + 1])
+                if len(attempts) == 1:
+                    target.write_bytes(b"partial")
+                    return subprocess.CompletedProcess(command, 22, "", "504")
+                target.write_bytes(payload)
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with mock.patch.object(self.toolchain.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(self.toolchain.time, "sleep"):
+                archive = self.toolchain._fetch(pin, downloads)
+            self.assertEqual(archive.read_bytes(), payload)
+            self.assertEqual(len(attempts), 2)
+            # Every attempt still pins the protocol: a retry must not be a way
+            # to reach plain HTTP.
+            for command in attempts:
+                self.assertIn("=https", command)
+
+    def test_fetch_gives_up_after_its_attempts_and_says_so(self):
+        # Retrying forever would turn a real outage into a hung build. When
+        # every attempt fails the archive is still absent and the error names
+        # the URL, exactly as before.
+        with tempfile.TemporaryDirectory() as temp:
+            downloads = Path(temp)
+            attempts = []
+
+            def fake_run(command, **kwargs):
+                attempts.append(command)
+                Path(command[command.index("--output") + 1]).write_bytes(b"partial")
+                return subprocess.CompletedProcess(command, 22, "", "504")
+
+            pin = {"url": "https://example.invalid/zlib-1.4.tar.gz", "sha256": "0" * 64}
+            with mock.patch.object(self.toolchain.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(self.toolchain.time, "sleep"):
+                with self.assertRaisesRegex(ValueError, "Cannot download.*example.invalid"):
+                    self.toolchain._fetch(pin, downloads)
+            self.assertGreater(len(attempts), 1)
+            self.assertEqual(list(downloads.glob("*.part")), [])
+            self.assertFalse((downloads / "zlib-1.4.tar.gz").exists())
+
     def test_fetch_reverifies_a_cached_archive_against_its_pin(self):
         with tempfile.TemporaryDirectory() as temp:
             downloads = Path(temp)
@@ -776,6 +890,106 @@ class PostgreSQLToolchainTests(unittest.TestCase):
             existing.unlink()
             # A fresh download is written to .part first, so a failed or partial
             # transfer can never be mistaken for the verified archive.
+            self.assertEqual(list(downloads.glob("*.part")), [])
+
+    def test_a_digest_mismatch_says_what_arrived_instead(self):
+        # A bare "SHA-256 mismatch for <url>" is not diagnosable: it cannot
+        # distinguish a changed upstream archive from a proxy that answered
+        # HTTP 200 with an HTML error page, and that difference decides whether
+        # the pin or the network is at fault. The message must carry the digest
+        # that actually arrived, the size, and the content type.
+        with tempfile.TemporaryDirectory() as temp:
+            downloads = Path(temp)
+            payload = b"<html>Service Unavailable</html>"
+
+            def fake_run(command, **kwargs):
+                Path(command[command.index("--output") + 1]).write_bytes(payload)
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            pin = {"url": "https://example.invalid/zlib-1.4.tar.gz", "sha256": "0" * 64}
+            with mock.patch.object(self.toolchain.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(self.toolchain, "_content_type",
+                                      return_value="text/html"):
+                with self.assertRaises(ValueError) as caught:
+                    self.toolchain._fetch(pin, downloads)
+            message = str(caught.exception)
+            self.assertIn("SHA-256", message)
+            self.assertIn(hashlib.sha256(payload).hexdigest(), message)
+            self.assertIn(f"{len(payload)} bytes", message)
+            self.assertIn("text/html", message)
+            # The mismatching download is not kept: it is not the pinned archive.
+            self.assertFalse((downloads / "zlib-1.4.tar.gz").exists())
+            self.assertEqual(list(downloads.glob("*.part")), [])
+
+    def test_a_github_failure_falls_back_to_the_mirror(self):
+        # GitHub's release CDN can answer 504 for hours while every other host
+        # is healthy, and a build needs all of its archives at once. The mirror
+        # is tried only after the direct attempts are exhausted, and only its
+        # bytes that match the pin are accepted: the mirror is never trusted,
+        # it is merely another source for an archive whose digest is already
+        # known.
+        with tempfile.TemporaryDirectory() as temp:
+            downloads = Path(temp)
+            payload = b"archive bytes"
+            pin = {"url": "https://github.com/example/zlib/releases/download/v1/zlib-1.4.tar.gz",
+                   "sha256": hashlib.sha256(payload).hexdigest()}
+            attempts = []
+
+            def fake_run(command, **kwargs):
+                attempts.append(command)
+                if "gh-proxy.org" in command[-1]:
+                    Path(command[command.index("--output") + 1]).write_bytes(payload)
+                    return subprocess.CompletedProcess(command, 0, "", "")
+                return subprocess.CompletedProcess(command, 22, "", "504")
+
+            with mock.patch.object(self.toolchain.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(self.toolchain.time, "sleep"):
+                archive = self.toolchain._fetch(pin, downloads)
+            self.assertEqual(archive.read_bytes(), payload)
+            # Every direct attempt came first; the mirror is the last resort.
+            direct = [c for c in attempts if "gh-proxy.org" not in c[-1]]
+            self.assertEqual(len(direct), self.toolchain.FETCH_ATTEMPTS)
+            self.assertEqual(len(attempts), self.toolchain.FETCH_ATTEMPTS + 1)
+            self.assertEqual(attempts[-1][-1], self.toolchain.MIRROR + pin["url"])
+
+    def test_the_mirror_is_not_tried_for_a_host_that_is_not_github(self):
+        # Only GitHub's release CDN has this failure mode. A 404 on an upstream
+        # mirror is a real answer, and routing it through a proxy would hide it.
+        with tempfile.TemporaryDirectory() as temp:
+            downloads = Path(temp)
+            pin = {"url": "https://zlib.net/zlib-1.4.tar.gz", "sha256": "0" * 64}
+            attempts = []
+
+            def fake_run(command, **kwargs):
+                attempts.append(command)
+                return subprocess.CompletedProcess(command, 22, "404", "")
+
+            with mock.patch.object(self.toolchain.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(self.toolchain.time, "sleep"):
+                with self.assertRaises(ValueError):
+                    self.toolchain._fetch(pin, downloads)
+            self.assertFalse(any("gh-proxy.org" in c[-1] for c in attempts))
+
+    def test_a_mirror_that_returns_different_bytes_is_refused(self):
+        # The whole point of pinning is that a mirror cannot be trusted by name.
+        with tempfile.TemporaryDirectory() as temp:
+            downloads = Path(temp)
+            pin = {"url": "https://github.com/example/zlib/releases/download/v1/zlib-1.4.tar.gz",
+                   "sha256": "a" * 64}
+
+            def fake_run(command, **kwargs):
+                if "gh-proxy.org" in command[-1]:
+                    Path(command[command.index("--output") + 1]).write_bytes(b"tampered")
+                    return subprocess.CompletedProcess(command, 0, "", "")
+                return subprocess.CompletedProcess(command, 22, "", "504")
+
+            with mock.patch.object(self.toolchain.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(self.toolchain.time, "sleep"), \
+                    mock.patch.object(self.toolchain, "_content_type",
+                                      return_value="application/x-gzip"):
+                with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+                    self.toolchain._fetch(pin, downloads)
+            self.assertFalse((downloads / "zlib-1.4.tar.gz").exists())
             self.assertEqual(list(downloads.glob("*.part")), [])
 
     def test_licence_files_match_the_spdx_the_pin_declares(self):
@@ -951,6 +1165,69 @@ class PostgreSQLBundleTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.bundle.elf(Path(temp) / "missing")
 
+    # -- staged interpreter -------------------------------------------------
+
+    def test_staged_program_is_repointed_at_the_portable_loader(self):
+        # The build links every program against the workspace's own loader so
+        # `configure` can run what it compiles. A shipped ELF must not carry
+        # that path, so staging rewrites PT_INTERP to the portable name.
+        if not shutil.which("cc") or not shutil.which("readelf"):
+            self.skipTest("ELF fixture compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace_loader = root / "work/loader/libc.so"
+            workspace_loader.parent.mkdir(parents=True)
+            build_library(workspace_loader, "libc.so")
+            library = build_library(root / "libpq.so.5", "libpq.so.5")
+            binary = build_elf(root, root / "postgres", search=library.parent,
+                               interpreter=str(workspace_loader))
+            self.assertEqual(self.bundle.program_interpreter(binary), str(workspace_loader))
+            self.assertTrue(self.bundle.portable_interpreter(binary))
+            self.assertEqual(self.bundle.program_interpreter(binary),
+                             self.bundle.INTERPRETER)
+            # The rewrite is in place: the file is still a valid ELF to readelf
+            # and nothing else in it moved.
+            self.assertEqual(self.bundle.elf(binary)["needed"], ["libpq.so.5"])
+            # Rewriting an already-portable program changes nothing.
+            self.assertFalse(self.bundle.portable_interpreter(binary))
+
+    def test_staged_interpreter_rewrite_refuses_a_name_that_does_not_fit(self):
+        # Length-preserving by construction: a longer name means the segment
+        # layout would have to change, which is a toolchain problem rather than
+        # something to paper over by truncating the path.
+        if not shutil.which("cc") or not shutil.which("readelf"):
+            self.skipTest("ELF fixture compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            library = build_library(root / "libpq.so.5", "libpq.so.5")
+            binary = build_elf(root, root / "postgres", search=library.parent)
+            with self.assertRaisesRegex(ValueError, "cannot fit"):
+                self.bundle.set_interpreter(binary, "/" + "x" * 200)
+            self.assertEqual(self.bundle.program_interpreter(binary), self.bundle.INTERPRETER)
+
+    def test_a_staged_program_with_no_interpreter_is_refused(self):
+        # A static program would silently ship a bundle that cannot be launched,
+        # so it is named rather than skipped.
+        if not shutil.which("cc"):
+            self.skipTest("ELF fixture compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "static.c"
+            source.write_text(
+                "void _start(void)\n"
+                "{\n"
+                "\t__asm__ volatile (\"syscall\" : : \"a\" (60), \"D\" (0)\n"
+                "\t                  : \"rcx\", \"r11\", \"memory\");\n"
+                "\t__builtin_unreachable();\n"
+                "}\n")
+            static = root / "static"
+            subprocess.run(["cc", "-nostdlib", "-static", "-Wl,-e,_start",
+                            "-o", str(static), str(source)],
+                           check=True, capture_output=True)
+            self.assertIsNone(self.bundle.program_interpreter(static))
+            with self.assertRaisesRegex(ValueError, "requests no interpreter"):
+                self.bundle.portable_interpreter(static)
+
     # -- version through the loader ----------------------------------------
 
     def test_binary_version_runs_through_the_loader(self):
@@ -994,12 +1271,16 @@ class PostgreSQLBundleTests(unittest.TestCase):
 
     # -- stage -------------------------------------------------------------
 
-    def fixture(self, root):
+    def fixture(self, root, interpreter="/lib/ld-musl-x86_64.so.1"):
         """A synthetic install tree shaped like `install-world-bin` produced it.
 
         The binaries NEEDED `libcrypto.so.3`, the one shared dependency, because
         that is what the real build links and what the loader can resolve from
         the dependency prefix at staging time.
+
+        `interpreter` is what the build's compiler named. It defaults to the
+        portable path; a build that links against the workspace's own loader
+        passes that path here instead.
         """
         install = root / "inst"
         for directory in ("bin", "lib", "share/extension", "share/timezone",
@@ -1011,7 +1292,7 @@ class PostgreSQLBundleTests(unittest.TestCase):
         for command in ("postgres", "initdb", "pg_ctl", "psql", "pg_config",
                         "pg_dump", "oid2name", "vacuumlo"):
             build_elf(root, install / "bin" / command, needed=("libcrypto.so.3",),
-                      search=root / "shared")
+                      search=root / "shared", interpreter=interpreter)
             (install / "bin" / command).chmod(0o755)
         expected = self.modules.load_expected("18")
         for name in expected["sql"]:
@@ -1227,6 +1508,106 @@ class PostgreSQLBundleTests(unittest.TestCase):
                           [{key: row[key] for key in ("path",)}
                            for row in manifest["binaries"]])
 
+    def test_stage_rewrites_a_workspace_interpreter_to_the_portable_one(self):
+        # The build links against the workspace's own loader so configure can
+        # run what it compiles on a host with no musl. Staging must not let that
+        # path into the archive, and the manifest must record what is on disk.
+        if not shutil.which("cc") or not shutil.which("readelf"):
+            self.skipTest("ELF fixture compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            install = self.fixture(root)
+            record = self.provenance(root, install)
+            workspace_loader = record["loader"]["path"]
+            for command in ("postgres", "initdb", "pg_ctl", "psql", "pg_config",
+                            "pg_dump", "oid2name", "vacuumlo"):
+                build_elf(root, install / "bin" / command, needed=("libcrypto.so.3",),
+                          search=root / "shared", interpreter=workspace_loader)
+                (install / "bin" / command).chmod(0o755)
+            output = root / "bundle"
+            manifest = self.bundle.stage(install, output, self.request(root), record, ROOT)
+            for row in manifest["binaries"]:
+                self.assertEqual(row["interpreter"], self.bundle.INTERPRETER, row["path"])
+                self.assertEqual(
+                    self.bundle.program_interpreter(output / row["path"]),
+                    self.bundle.INTERPRETER, row["path"])
+            # The rewrite is in place, so the recorded digest is the on-disk one.
+            for row in manifest["binaries"]:
+                self.assertEqual(row["sha256"], sha256_file(output / row["path"]), row["path"])
+            # The loader itself is an interpreter, never a program rewritten.
+            self.assertIsNone(
+                self.bundle.program_interpreter(output / "lib/musl/ld-musl-x86_64.so.1"))
+
+    def test_stage_rewrites_programs_outside_bin_too(self):
+        # `install-world-bin` also puts pg_regress, pg_isolation_regress and
+        # isolationtester under lib/pgxs. Those are programs, not modules: a
+        # rewrite limited to bin/ would leave the build-workspace loader name in
+        # three files that no launcher wraps, and the archive would be correct
+        # only on the machine that built it.
+        if not shutil.which("cc") or not shutil.which("readelf"):
+            self.skipTest("ELF fixture compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            install = self.fixture(root)
+            record = self.provenance(root, install)
+            workspace_loader = record["loader"]["path"]
+            pgxs = install / "lib/pgxs/src/test/regress"
+            pgxs.mkdir(parents=True)
+            build_elf(root, pgxs / "pg_regress", needed=("libcrypto.so.3",),
+                      search=root / "shared", interpreter=workspace_loader)
+            (pgxs / "pg_regress").chmod(0o755)
+            output = root / "bundle"
+            self.bundle.stage(install, output, self.request(root), record, ROOT)
+            self.assertEqual(
+                self.bundle.program_interpreter(
+                    output / "lib/pgxs/src/test/regress/pg_regress"),
+                self.bundle.INTERPRETER)
+
+    def test_stage_leaves_shared_objects_alone_while_walking(self):
+        # The wider walk must not refuse a file that legitimately asks for no
+        # interpreter. A staged .so has no PT_INTERP; only a *command* in bin/
+        # is required to have one.
+        if not shutil.which("cc") or not shutil.which("readelf"):
+            self.skipTest("ELF fixture compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            install = self.fixture(root)
+            record = self.provenance(root, install)
+            output = root / "bundle"
+            manifest = self.bundle.stage(install, output, self.request(root), record, ROOT)
+            for name in ("libpq.so.5", "utf8_and_euc_jp.so"):
+                self.assertIsNone(self.bundle.program_interpreter(output / "lib" / name))
+            self.assertTrue(manifest["binaries"])
+
+    def test_the_walk_refuses_a_static_command_but_not_a_shared_object(self):
+        # The walk skips files with no interpreter so a .so is not refused, but
+        # a command in bin/ must be launchable. stage() already refuses a static
+        # command earlier (its version probe prints nothing), so this guard is
+        # the one that keeps that true if the ordering ever changes.
+        if not shutil.which("cc"):
+            self.skipTest("C compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "static.c"
+            source.write_text(
+                "void _start(void)\n"
+                "{\n"
+                "\t__asm__ volatile (\"syscall\" : : \"a\" (60), \"D\" (0)\n"
+                "\t                  : \"rcx\", \"r11\", \"memory\");\n"
+                "\t__builtin_unreachable();\n"
+                "}\n")
+            bundle = root / "bundle"
+            (bundle / "bin").mkdir(parents=True)
+            (bundle / "lib").mkdir()
+            static = bundle / "bin/postgres"
+            subprocess.run(["cc", "-nostdlib", "-static", "-Wl,-e,_start",
+                            "-o", str(static), str(source)],
+                           check=True, capture_output=True)
+            static.chmod(0o755)
+            build_library(bundle / "lib/libpq.so.5", "libpq.so.5")
+            with self.assertRaisesRegex(ValueError, "requests no interpreter"):
+                self.bundle.portable_interpreters(bundle)
+
     def test_stage_refuses_a_binary_the_install_tree_cannot_resolve(self):
         # The counterpart of the test above: a NEEDED library present in no
         # searched directory must abort staging rather than be skipped, so the
@@ -1441,6 +1822,22 @@ class PostgreSQLBundleTests(unittest.TestCase):
             again = subprocess.run(command, text=True, capture_output=True, env=environment)
             self.assertNotEqual(again.returncode, 0)
             self.assertIn("Refusing", again.stderr)
+
+    def test_build_script_builds_the_loader_before_the_dependencies(self):
+        # The compiler has to be told which loader to name, so the loader must
+        # exist first: without it `configure` compiles programs it cannot run
+        # and the first dependency aborts with "cannot run C compiled programs".
+        text = (SCRIPTS / "build.sh").read_text()
+        loader = text.index("build-loader")
+        dependencies = text.index("build-dependencies")
+        self.assertLess(loader, dependencies)
+        between = text[loader:dependencies]
+        self.assertIn("loader-path", between)
+        # The pinned loader reaches the dependency build...
+        self.assertIn('--loader "$loader"', text[dependencies:dependencies + 200])
+        # ...and the environment configure and make run in.
+        environment = text.index("toolchain env ")
+        self.assertIn('--loader "$loader"', text[environment:environment + 200])
 
     def test_build_script_stages_after_install_and_checks_provenance(self):
         text = (SCRIPTS / "build.sh").read_text()
@@ -2132,8 +2529,12 @@ class PostgreSQLVerifyTests(unittest.TestCase):
             bundle = self.staged(root)
             manifest = self.manifest()
             self.write(bundle, manifest)
+            # "poison-file" rather than "bwrap": the mask is a host capability
+            # this test does not need. Claiming "bwrap" on a runner without
+            # bubblewrap made verify() abort in _isolation — "bwrap disappeared" —
+            # before the module gate this test exists to check was ever reached.
             with mock.patch.object(self.bundle, "lifecycle"), \
-                    mock.patch.object(self.bundle, "assert_no_host_loaders", return_value="bwrap"), \
+                    mock.patch.object(self.bundle, "assert_no_host_loaders", return_value="poison-file"), \
                     mock.patch.object(self.bundle.modules, "inventory", return_value=[]):
                 with self.assertRaisesRegex(ValueError, "missing sql: hstore"):
                     self.bundle.verify(bundle)
@@ -2152,7 +2553,7 @@ class PostgreSQLVerifyTests(unittest.TestCase):
             inventory = (self.modules.inventory(bundle)
                          + [{"name": "stowaway", "kind": "shared"}])
             with mock.patch.object(self.bundle, "lifecycle"), \
-                    mock.patch.object(self.bundle, "assert_no_host_loaders", return_value="bwrap"), \
+                    mock.patch.object(self.bundle, "assert_no_host_loaders", return_value="poison-file"), \
                     mock.patch.object(self.bundle.modules, "inventory", return_value=inventory):
                 with self.assertRaisesRegex(ValueError, "unexpected shared: stowaway"):
                     self.bundle.verify(bundle)
@@ -2171,6 +2572,42 @@ class PostgreSQLVerifyTests(unittest.TestCase):
             stray.chmod(0o755)
             with self.assertRaisesRegex(ValueError, "postgres-real"):
                 self.bundle._check_launchers(bundle)
+
+    def test_verify_refuses_a_program_that_still_names_the_build_loader(self):
+        # stage() rewrites every program's PT_INTERP, and this proves it without
+        # trusting the walk that did it. A manifest-only check cannot: the three
+        # programs under lib/pgxs run without a launcher and appear in no
+        # manifest entry, so a bundle carrying a build-workspace loader path in
+        # pg_regress would report PASSED and then fail on every other machine.
+        if not shutil.which("cc") or not shutil.which("readelf"):
+            self.skipTest("ELF fixture compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = self.staged(root)
+            program = bundle / "lib/pgxs/src/test/regress/pg_regress"
+            program.parent.mkdir(parents=True)
+            # A NEEDED library is what makes the linker keep a PT_INTERP; with
+            # nothing to resolve the program links without one and says nothing.
+            build_library(bundle / "lib/libpq.so.5", "libpq.so.5")
+            build_elf(root, program, needed=("libpq.so.5",), search=bundle / "lib",
+                      interpreter=str(root / "work/loader.so"))
+            program.chmod(0o755)
+            self.assertEqual(self.bundle.program_interpreter(program),
+                             str(root / "work/loader.so"))
+            with self.assertRaisesRegex(ValueError, "pg_regress"):
+                self.bundle._check_program_interpreters(bundle)
+            self.bundle.set_interpreter(program, self.bundle.INTERPRETER)
+            self.bundle._check_program_interpreters(bundle)
+
+    def test_verify_leaves_shared_objects_out_of_the_interpreter_check(self):
+        # A staged .so has no PT_INTERP; the check must skip it rather than
+        # refuse a bundle over a file that legitimately asks for nothing.
+        if not shutil.which("cc"):
+            self.skipTest("C compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            bundle = Path(temp) / "bundle"
+            build_library(bundle / "lib/libpq.so.5", "libpq.so.5")
+            self.bundle._check_program_interpreters(bundle)
 
     def test_verify_refuses_a_launcher_with_no_raw_binary(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -2192,9 +2629,18 @@ class PostgreSQLVerifyTests(unittest.TestCase):
     # -- host loader masking ----------------------------------------------
 
     def test_host_loader_masking_is_detected_or_reported(self):
+        # Host-independent on purpose: this asserts that a strategy is always
+        # named, never a silent "none", so it must not fail merely because the
+        # runner has no bwrap. The mask is probed for real when it can run; the
+        # poison fallback is forced because this fixture's libexec/bin entries
+        # are placeholders, not ELFs readelf can read, so a real probe here
+        # could only report the unreadable-file error rather than the strategy
+        # that would be used. The real mask is covered by
+        # test_the_masking_strategy_makes_the_real_host_loader_unusable.
         with tempfile.TemporaryDirectory() as temp:
             bundle = self.staged(Path(temp))
-            strategy = self.bundle.assert_no_host_loaders(bundle)
+            with mock.patch.object(self.bundle, "_poison_probe", return_value=True):
+                strategy = self.bundle.assert_no_host_loaders(bundle)
         self.assertIn(strategy, ("bwrap", "poison-file"))
         # Never a silent "no isolation available".
         self.assertNotIn("none", strategy.lower())
@@ -2257,6 +2703,31 @@ class PostgreSQLVerifyTests(unittest.TestCase):
         if not self.bundle._bwrap_usable():
             self.skipTest("bwrap cannot create namespaces on this host")
         self.assertEqual(self.bundle._masked_host_loaders_probe(), "bwrap")
+
+    def test_the_bwrap_diagnosis_names_why_the_mask_is_unavailable(self):
+        # The reason decides whether a bundle may be published, so a silent
+        # fallback is not acceptable: an operator has to be able to read the log
+        # and know whether to publish from another host.
+        usable, reason = self.bundle._bwrap_diagnosis()
+        self.assertIs(usable, self.bundle._bwrap_usable())
+        self.assertTrue(reason, "a diagnosis always carries a reason")
+        with mock.patch.object(self.bundle.shutil, "which", return_value=None):
+            self.assertEqual(self.bundle._bwrap_diagnosis(),
+                             (False, "bwrap is not installed"))
+
+    def test_a_poison_fallback_states_its_reason_and_that_it_publishes_nothing(self):
+        # The fallback must be visible where the conclusion is printed. Silence
+        # here is how a runner with a broken mask reads as a clean verification.
+        with tempfile.TemporaryDirectory() as temp:
+            bundle = self.staged(Path(temp))
+            with mock.patch.object(self.bundle, "_bwrap_diagnosis",
+                                   return_value=(False, "apparmor refused the user namespace")), \
+                    mock.patch.object(self.bundle, "_poison_probe", return_value=True), \
+                    contextlib.redirect_stderr(io.StringIO()) as errors:
+                strategy = self.bundle.assert_no_host_loaders(bundle)
+        self.assertEqual(strategy, "poison-file")
+        self.assertIn("apparmor refused the user namespace", errors.getvalue())
+        self.assertIn("not published", errors.getvalue())
 
     # -- lifecycle and relocation -----------------------------------------
 
@@ -2344,6 +2815,12 @@ class PostgreSQLVerifyTests(unittest.TestCase):
     def test_relocated_bundle_reports_paths_inside_itself(self):
         if not shutil.which("cc") or not shutil.which("readelf"):
             self.skipTest("ELF fixture compiler is unavailable")
+        # The strategy is passed explicitly because this test measures where
+        # pg_config says things live, not how the mask hides a host loader.
+        # "poison-file" runs the commands unmasked, so the assertion is identical
+        # whether or not the runner can create the bwrap namespaces; defaulting
+        # to "bwrap" made it fail on every runner without bubblewrap.
+        strategy = "poison-file"
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             bundle = self.staged(root)
@@ -2355,8 +2832,8 @@ class PostgreSQLVerifyTests(unittest.TestCase):
                 self.assertTrue(relocated.is_dir())
                 self.assertTrue((relocated / "bin/psql").is_file())
                 # pg_config must report the copy's own paths, not the original's.
-                original = self.bundle.pg_config_paths(bundle)
-                derived = self.bundle.pg_config_paths(relocated)
+                original = self.bundle.pg_config_paths(bundle, strategy)
+                derived = self.bundle.pg_config_paths(relocated, strategy)
                 self.assertEqual(set(derived), {"bindir", "sharedir", "libdir", "pkglibdir"})
                 for key, value in derived.items():
                     self.assertEqual(value, original[key].replace(str(bundle), str(relocated)), key)

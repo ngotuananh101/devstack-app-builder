@@ -13,6 +13,7 @@ from pathlib import Path, PurePosixPath
 import subprocess
 import sys
 import tarfile
+import time
 
 TAR_SAFE_TYPES = {tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.DIRTYPE}
 
@@ -22,17 +23,84 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+# A build takes about an hour, so waiting minutes on a flaky CDN is cheap next
+# to losing it. The delays are cumulative: 15s, 45s, 1m45s, 3m45s, 6m45s.
+FETCH_RETRY_DELAYS = (15, 30, 60, 120, 180)
+FETCH_ATTEMPTS = len(FETCH_RETRY_DELAYS) + 1
+
+
+# A read-only GitHub release proxy, used only after every direct attempt failed.
+# GitHub's `releases/download` surface has answered 504 for every asset for hours
+# while the rest of the internet served normally. The pin is what makes the
+# substitution safe: the mirror's bytes are verified exactly like the origin's,
+# so a mirror that rewrites, truncates or serves an error page is refused.
+MIRROR = "https://gh-proxy.org/"
+
+
+def mirror_for(url):
+    """The mirror URL for a GitHub release asset, or None for anything else.
+
+    Only `github.com/.../releases/download/...` has the failure mode this exists
+    for. Sending downloads.apache.org or zlib.net through a proxy would turn a
+    clear upstream answer into somebody else's bug report.
+    """
+    if url.startswith("https://github.com/") and "/releases/download/" in url:
+        return MIRROR + url
+    return None
+
+
 def download(url, destination):
+    """Download one pinned source, retrying a transient gateway failure.
+
+    GitHub's release CDN answers 504 for a single asset while the rest of the
+    same release serves normally, and the failing assets recover at different
+    moments; a build needs every one of them at once. Curl's own ``--retry``
+    covers transfer errors but a 504 arrives as an ordinary HTTP status, so the
+    attempts are made here. A digest that does not match its pin is never
+    retried: that is a changed archive, not a flaky connection.
+    """
     if destination.exists():
         raise ValueError("Refusing to reuse an existing download: " + destination.name)
-    subprocess.run(
+    last = None
+    for attempt in range(FETCH_ATTEMPTS):
+        if attempt:
+            time.sleep(FETCH_RETRY_DELAYS[attempt - 1])
+        last = subprocess.run(
+            [
+                "curl", "--fail", "--silent", "--show-error", "--location",
+                "--proto", "=https", "--proto-redir", "=https",
+                "--max-time", "600", "--output", str(destination), url,
+            ],
+            text=True, capture_output=True,
+        )
+        if last.returncode == 0:
+            return
+    # Only now, with every direct attempt spent, is a mirror worth trying.
+    # Doing it earlier would send traffic through a third party on days when
+    # GitHub is perfectly healthy.
+    mirror = mirror_for(url)
+    if mirror is None:
+        destination.unlink(missing_ok=True)
+        raise ValueError(
+            "Cannot download %s after %d attempts: %s"
+            % (url, FETCH_ATTEMPTS, (last.stderr or "").strip()[-1000:])
+        )
+    direct_error = (last.stderr or "").strip()[-400:]
+    last = subprocess.run(
         [
             "curl", "--fail", "--silent", "--show-error", "--location",
             "--proto", "=https", "--proto-redir", "=https",
-            "--max-time", "600", "--output", str(destination), url,
+            "--max-time", "600", "--output", str(destination), mirror,
         ],
-        check=True,
+        text=True, capture_output=True,
     )
+    if last.returncode != 0:
+        destination.unlink(missing_ok=True)
+        raise ValueError(
+            "Cannot download %s after %d attempts, nor from %s: %s (direct: %s)"
+            % (url, FETCH_ATTEMPTS, MIRROR, (last.stderr or "").strip()[-400:],
+               direct_error)
+        )
 
 
 def members(tar):
@@ -96,15 +164,50 @@ def extract(archive, destination):
     return destination / root
 
 
+def content_type(url):
+    """The Content-Type a HEAD request reports, or None.
+
+    Only ever used to explain a digest mismatch. A proxy or a CDN error page can
+    answer ``200`` with an HTML body, and a bare digest comparison cannot tell
+    that apart from an upstream that genuinely replaced the archive.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "curl", "--silent", "--show-error", "--location",
+                "--proto", "=https", "--proto-redir", "=https",
+                "--max-time", "60", "--head", "--write-out", "%{content_type}",
+                "--output", "/dev/null", url,
+            ],
+            text=True, capture_output=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
 def fetch_one(entry, work):
     name = entry["name"]
     archive = work / "downloads" / (name + ".tar.gz")
     download(entry["url"], archive)
     actual = digest(archive)
     if actual != entry["sha256"]:
+        # Report what arrived, not just that it differed. Size and content type
+        # are what separate "upstream replaced the archive" (fix the pin) from
+        # "something in the path answered 200 with an error page" (fix the
+        # route); without them a CI failure is not readable.
+        size = archive.stat().st_size
+        kind = content_type(entry["url"])
+        # Leave nothing behind. `download` refuses to reuse an existing file, so
+        # a kept archive would make the next run fail on the leftover instead of
+        # re-fetching, and a bad archive is not worth the disk either.
+        archive.unlink()
         raise ValueError(
-            "SHA-256 mismatch for %s: expected %s, got %s"
-            % (name, entry["sha256"], actual)
+            "SHA-256 mismatch for %s: expected %s, got %s (%d bytes, "
+            "content-type %s)"
+            % (name, entry["sha256"], actual, size, kind or "unknown")
         )
     return extract(archive, work / "sources" / name)
 

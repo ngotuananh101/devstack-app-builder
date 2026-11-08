@@ -22,7 +22,9 @@ import os
 from pathlib import Path
 import re
 import shutil
+import struct
 import subprocess
+import sys
 import tarfile
 import tempfile
 
@@ -318,6 +320,118 @@ def _needed(path):
     return re.findall(r"\(NEEDED\).*?\[([^\]]+)\]", result.stdout)
 
 
+# The layout of the two headers that locate PT_INTERP, and the segment type
+# that carries it. Read directly rather than through readelf so staging can
+# rewrite the string without a build-host tool and without round-tripping text.
+EHDR = struct.Struct("<16sHHIQQQIHHHHHH")
+PHDR = struct.Struct("<IIQQQQQQ")
+PT_INTERP = 3
+
+
+def program_interpreter(path):
+    """The program interpreter an ELF asks for, or None when it asks for none."""
+    blob = Path(path).read_bytes()
+    if blob[:4] != b"\x7fELF":
+        return None
+    # A file that claims to be an ELF but cannot hold the header is not a
+    # program. Saying so beats a struct.error from deep inside the unpack,
+    # which names no file and no cause.
+    if len(blob) < EHDR.size:
+        return None
+    header = EHDR.unpack_from(blob)
+    phoff, phentsize, phnum = header[5], header[9], header[10]
+    for index in range(phnum):
+        start = phoff + index * phentsize
+        kind, _, offset, _, _, filesize, _, _ = PHDR.unpack_from(blob, start)
+        if kind == PT_INTERP:
+            return blob[offset:offset + filesize].rstrip(b"\x00").decode("utf-8", "replace")
+    return None
+
+
+def set_interpreter(path, wanted):
+    """Rewrite PT_INTERP in place; returns True when the file changed.
+
+    Length-preserving on purpose: the new name goes into the bytes the linker
+    already reserved, NUL-padded, so no segment moves and no offset shifts. A
+    name that does not fit is refused rather than truncated, because a truncated
+    interpreter path leaves a bundle that fails on every machine.
+    """
+    path = Path(path)
+    blob = bytearray(path.read_bytes())
+    if blob[:4] != b"\x7fELF":
+        return False
+    header = EHDR.unpack_from(blob)
+    phoff, phentsize, phnum = header[5], header[9], header[10]
+    encoded = wanted.encode() + b"\x00"
+    for index in range(phnum):
+        start = phoff + index * phentsize
+        kind, _, offset, _, _, filesize, _, _ = PHDR.unpack_from(blob, start)
+        if kind != PT_INTERP:
+            continue
+        if len(encoded) > filesize:
+            raise ValueError(f"{path.name} cannot fit {wanted} in its PT_INTERP slot")
+        replacement = encoded.ljust(filesize, b"\x00")
+        if blob[offset:offset + filesize] == replacement:
+            return False
+        blob[offset:offset + filesize] = replacement
+        path.write_bytes(bytes(blob))
+        path.chmod(path.stat().st_mode)
+        return True
+    raise ValueError(f"{path.name} has no PT_INTERP to rewrite")
+
+
+def portable_interpreter(path):
+    """Point one staged program at the loader name the bundle ships.
+
+    The build's compiler is told ``-Wl,--dynamic-linker=<workspace loader>`` so
+    that `configure` can run the programs it compiles on a host with no musl
+    installed. That name is a build-workspace path, and a shipped ELF carrying
+    it would work on the machine that built the bundle and nowhere else. Nothing
+    reads the name back in a bundle run — the launchers exec the bundled loader
+    with ``--library-path`` — so rewriting it to the portable one costs nothing
+    and removes the workspace from the archive.
+    """
+    current = program_interpreter(path)
+    if current is None:
+        raise ValueError(f"Staged program requests no interpreter: {Path(path).name}")
+    if current == INTERPRETER:
+        return False
+    return set_interpreter(path, INTERPRETER)
+
+
+def portable_interpreters(output):
+    """Rewrite every staged program's interpreter; returns the count changed.
+
+    The walk covers the whole staged tree, not ``bin/`` alone: `install-world-bin`
+    also puts ``pg_regress``, ``pg_isolation_regress`` and ``isolationtester``
+    under ``lib/pgxs``. Those run without a launcher, so a build-workspace path
+    left in one of them is a bundle that works on the build host and nowhere
+    else — the exact thing this rewrite exists to prevent.
+
+    A shared object has no PT_INTERP and is skipped here. The ``bin/`` commands
+    are not: each one must name an interpreter, so a static program is refused
+    by name rather than staged into a bundle that cannot launch it.
+    """
+    output = Path(output)
+    # Compared as tree-relative names so the check does not depend on how the
+    # caller spelled `output` (absolute, relative, or through a symlink).
+    commands = {f"bin/{name}" for name in launchers.commands(output)}
+    changed = 0
+    for path in sorted(output.rglob("*")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        # Four bytes first: most of the tree is data, and one member is a
+        # multi-megabyte source archive that must not be read to be skipped.
+        with path.open("rb") as stream:
+            if stream.read(4) != b"\x7fELF":
+                continue
+        relative = path.relative_to(output).as_posix()
+        if program_interpreter(path) is None and relative not in commands:
+            continue
+        changed += bool(portable_interpreter(path))
+    return changed
+
+
 def binary_version(binary, loader, library_path):
     """Ask a raw bundle binary for its version through the shipped loader.
 
@@ -523,6 +637,11 @@ def stage(install_root, output, request, provenance, repo_root):
 
     output.mkdir(parents=True, exist_ok=False)
     _copy_tree(install_root, output, provenance)
+    # The build named a loader inside its own workspace so `configure` could run
+    # what it compiled. Every staged program is repointed here, before the
+    # manifest records the interpreter, so no workspace path survives into the
+    # archive.
+    portable_interpreters(output)
 
     (output / "lib/musl").mkdir()
     staged_loader = output / launchers.LOADER
@@ -727,21 +846,37 @@ def _mask_arguments(workspace):
     return arguments
 
 
-def _bwrap_usable():
-    """Whether bwrap can create the namespaces the masking needs, right now."""
+def _bwrap_diagnosis():
+    """Whether bwrap can mask right now, and why not when it cannot.
+
+    The reason is not decoration. Which isolation strategy ran decides whether a
+    bundle may be published at all, so a runner that silently falls back leaves
+    nobody able to tell a deliberate fallback from a broken mask. GitHub's
+    hosted runners install bubblewrap and still refuse the user namespace the
+    mask needs, and only bwrap knows which restriction did it; reporting what it
+    said is what tells an operator to publish from a host that can create one.
+    """
     executable = shutil.which("bwrap")
     if executable is None:
-        return False
+        return False, "bwrap is not installed"
     workspace = _workspace()
     try:
         result = subprocess.run(
             [executable, *_mask_arguments(workspace), "--", "/bin/sh", "-c", "exit 0"],
             text=True, capture_output=True, timeout=60)
-    except (OSError, subprocess.TimeoutExpired):
-        return False
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"bwrap could not start: {exc}"
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
-    return result.returncode == 0
+    if result.returncode == 0:
+        return True, "bwrap created the mask"
+    detail = (result.stderr.strip() or result.stdout.strip()).splitlines()
+    return False, f"bwrap exit {result.returncode}: {detail[-1] if detail else 'no output'}"
+
+
+def _bwrap_usable():
+    """Whether bwrap can create the namespaces the masking needs, right now."""
+    return _bwrap_diagnosis()[0]
 
 
 def _masked_host_loaders_probe():
@@ -840,15 +975,23 @@ def assert_no_host_loaders(bundle=None):
     own --library-path instead. Raises when neither can run: reporting PASSED
     with no isolation is the false pass this task exists to prevent, so
     "nothing was available" is a failure, never a quieter PASSED.
+
+    A fallback is logged with its cause. Which strategy ran decides whether the
+    bundle may be published, so the reason has to be in the build log where an
+    operator choosing a publication host will read it.
     """
-    if _bwrap_usable():
+    usable, reason = _bwrap_diagnosis()
+    if usable:
         return _masked_host_loaders_probe()
     if bundle is not None and _poison_probe(bundle):
+        print(f"bwrap unavailable ({reason}); proving the loader with the poison-file "
+              "fallback instead. A bundle verified this way is not published.",
+              file=sys.stderr, flush=True)
         return "poison-file"
     raise ValueError(
-        "Cannot prove host loader independence: bwrap cannot create namespaces and "
-        "the poison-file probe did not run. A PASSED without one of them could be "
-        "a pass produced by the host's own loader.")
+        "Cannot prove host loader independence: bwrap cannot mask here "
+        f"({reason}) and the poison-file probe did not run. A PASSED without one "
+        "of them could be a pass produced by the host's own loader.")
 
 
 def _isolation(workspace, strategy):
@@ -1300,6 +1443,35 @@ def pg_config_paths(root, strategy="bwrap"):
     return dict(zip(("bindir", "sharedir", "libdir", "pkglibdir"), values))
 
 
+def _check_program_interpreters(bundle):
+    """Every staged program names the portable loader, not a build path.
+
+    `_verify_binaries` reads the manifest, and the manifest lists `libexec/bin`
+    only. A build-workspace interpreter left in ``lib/pgxs``'s three programs
+    (`pg_regress`, `pg_isolation_regress`, `isolationtester`) would therefore
+    appear in no record and pass verification, while a relocated bundle could
+    not run them. The tree is walked instead, the same way `stage()` walks it.
+
+    A file with no PT_INTERP is a shared object or plain data and is skipped;
+    this check asks only that a program which *does* name an interpreter names
+    the one the bundle ships.
+    """
+    bundle = Path(bundle)
+    wrong = []
+    for path in sorted(bundle.rglob("*")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        with path.open("rb") as stream:
+            if stream.read(4) != b"\x7fELF":
+                continue
+        current = program_interpreter(path)
+        if current is not None and current != INTERPRETER:
+            wrong.append(f"{path.relative_to(bundle).as_posix()} asks for {current!r}")
+    if wrong:
+        raise ValueError("Staged programs name the wrong interpreter instead of "
+                         f"{INTERPRETER}: " + "; ".join(wrong))
+
+
 def _check_launchers(bundle):
     """bin/ is exactly one shell launcher per raw binary, and never a raw ELF.
 
@@ -1419,6 +1591,10 @@ def verify(bundle):
     _verify_manifest(bundle, manifest)
     _verify_binaries(bundle, manifest)
     _check_launchers(bundle)
+    # The tree, not the manifest: the manifest records libexec/bin, and a
+    # build-workspace interpreter in one of the unlaunched lib/pgxs programs
+    # never reaches it.
+    _check_program_interpreters(bundle)
     # The bundle goes in: on a host where bwrap cannot create namespaces the
     # poison probe is the only proof available, and it needs a bundle to probe.
     # Without this argument that branch is unreachable and every such host

@@ -18,7 +18,7 @@ Arguments accept at most one pinned exact version. Unknown options, profiles, du
 ## Build dependencies
 
 - Host requirements: `make`, `bison`, `flex`, `perl`, `curl`, `readelf`, `strip`, `tar`, `bzip2` and Python 3 (run with `-I`).
-- CI runner (`ubuntu-24.04`) installs only `bison flex perl build-essential binutils curl` — deliberately **no** `musl-tools`.
+- CI runner (`ubuntu-24.04`) installs only `bison flex perl build-essential binutils curl bubblewrap` — deliberately **no** `musl-tools`. Nothing in the build needs `/lib/ld-musl-x86_64.so.1` to exist: build-time programs are linked against the toolchain's own loader (below). `bubblewrap` is not a build dependency; it is how verification hides every host musl loader before starting a server, and publication accepts only a bundle verified that way.
 - Dependencies fetched, verified and vendored (nothing is linked from `/usr/lib`, and no host package is ever installed):
   - **Zig** `0.17.1` (MIT): pinned in `config/sources.json` to provide `zig cc` and `zig c++` targeting `x86_64-linux-musl`, bundling musl `1.2.5`. Zig is a build tool and has no staged notice in `share/licenses/`.
   - **OpenSSL** `3.6.5` (Apache-2.0, shared): builds `libssl.so.3` and `libcrypto.so.3` staged into `lib/`.
@@ -27,7 +27,34 @@ Arguments accept at most one pinned exact version. Unknown options, profiles, du
   - **ICU** `79.1` (Unicode-3.0, static): `-fPIC` static archive.
   - **util-linux** `2.42.4` (LGPL-2.1-or-later, static `libuuid`): `-fPIC` static archive.
 
-All pinned source archives are fetched over HTTPS (PostgreSQL source URL shape `https://ftp.postgresql.org/pub/source/v<version>/postgresql-<version>.tar.bz2`, with checksum sidecar `.sha256` at the same location). Every dependency archive is SHA-256 verified against `config/sources.json` before extraction into a fresh directory, and built into a fresh staging prefix. `BUILD_JOBS` selects build parallelism (default 2).
+All pinned source archives are fetched over HTTPS (PostgreSQL source URL shape `https://ftp.postgresql.org/pub/source/v<version>/postgresql-<version>.tar.bz2`, with checksum sidecar `.sha256` at the same location). Every dependency archive is SHA-256 verified against `config/sources.json` before extraction into a fresh directory, and built into a fresh staging prefix. A download is attempted six times with cumulative backoff (15s, 45s, 1m45s, 3m45s, 6m45s), because GitHub's `releases/download` surface has answered `504` for every asset while its own status page reported all systems operational. A digest that does not match its pin is never retried — that is a changed archive, not a flaky connection. A dependency may only move to an alternative mirror that returns **exactly** the pinned SHA-256; OpenSSL is fetched from `distfiles.macports.org` for that reason, while ICU stays on GitHub because no mirror serves the same archive, and swapping in a different tarball of the same version means re-pinning it.
+
+Only after all six direct attempts have failed is a GitHub release asset retried through `https://gh-proxy.org/`, a read-only release proxy. It is a last resort on purpose: on a day when GitHub is healthy the build never touches a third party, and a non-GitHub host (`ziglang.org`, `zlib.net`, `ftp.postgresql.org`, MacPorts) is never proxied at all — those outages have different causes and a proxy would only obscure them. The proxy is safe for exactly one reason: its bytes pass the same SHA-256 check as the origin's, so a proxy that rewrites, truncates or serves an error page is refused rather than trusted, and the resulting failure still reads `SHA-256 mismatch`. A digest mismatch removes the archive and never falls back, so a bad archive cannot wedge the next attempt. `BUILD_JOBS` selects build parallelism (default 2).
+
+### The toolchain names its own loader while the build runs
+
+`configure` compiles a test program and executes it immediately, so the interpreter in
+its `PT_INTERP` has to exist on the host — and a runner with no musl installed has no
+`/lib/ld-musl-x86_64.so.1`. Every program `zig cc` links therefore carries
+`-Wl,--dynamic-linker=<workspace>/loader/libc.so`, the loader `toolchain build-loader`
+built a moment earlier, which is why `build.sh` builds the loader **before** the
+dependency stack. `toolchain build-dependencies` proves the mechanism works with a
+one-line probe program before it starts any dependency, so a broken link line names
+itself in seconds instead of surfacing as `configure: error: cannot run C compiled
+programs` inside libxml2.
+
+The workspace path must not reach a user's archive, so `bundle.py` rewrites every
+staged program's `PT_INTERP` back to the portable `/lib/ld-musl-x86_64.so.1` (before
+`launchers.install` and before the manifest records the interpreter). The walk covers
+the whole staged tree rather than `bin/` alone, because `install-world-bin` also puts
+`pg_regress`, `pg_isolation_regress` and `isolationtester` under `lib/pgxs`, and those
+run without a launcher. Shared objects carry no `PT_INTERP` and are skipped; a command
+in `bin/` that names none is refused by name.
+The rewrite is length-preserving — it reuses the existing `PT_INTERP` slot, NUL-padded
+— and refuses a name that cannot fit rather than shipping a truncated interpreter path.
+Nothing at run time reads the name back: the launchers exec the bundled loader with
+`--library-path`, so the staged loader is the interpreter and never a program that asks
+for one.
 
 ### Shared versus static linkage rationale
 
@@ -141,10 +168,11 @@ Because `builtin` with `C.UTF-8` requires UTF-8 encoding, `initdb` must always b
 
 The `verify` subcommand is the sole writer of the `verification` field in `manifest.json`. Verification performs:
 1. Re-hashes every file recorded in the manifest against its recorded SHA-256.
-2. Runs a complete cluster lifecycle (`initdb` -> postmaster startup -> client connection via `psql` -> clean shutdown) entirely through the `bin/` launchers.
-3. Relocation test: repeats the complete cluster lifecycle from a copy relocated to a temporary path containing spaces and a `#` character.
-4. Host loader masking: isolates the test environment to prove that the bundle relies on no host musl files. The primary isolation strategy uses `bwrap` (Bubblewrap) with `--dev-bind / /` and zero-byte mounts over host loader locations (`/lib`, `/lib64`, `/usr/lib`, `/usr/lib64` loader names and musl-dev trees), recorded as `verification_strategy: "bwrap"`. If user namespaces cannot be created, it falls back to a poison-file probe. If neither isolation method is available, verification fails.
-5. Per-kind module exercises:
+2. Walks the whole bundle tree and refuses any ELF whose `PT_INTERP` is not `/lib/ld-musl-x86_64.so.1`. This cannot be read off the manifest: the manifest records `libexec/bin`, while `install-world-bin` also puts `pg_regress`, `pg_isolation_regress` and `isolationtester` under `lib/pgxs`, which no launcher wraps and no manifest entry names. A build-workspace loader left in one of those would pass every other check and then fail on any machine but the build host.
+3. Runs a complete cluster lifecycle (`initdb` -> postmaster startup -> client connection via `psql` -> clean shutdown) entirely through the `bin/` launchers.
+4. Relocation test: repeats the complete cluster lifecycle from a copy relocated to a temporary path containing spaces and a `#` character.
+5. Host loader masking: isolates the test environment to prove that the bundle relies on no host musl files. The primary isolation strategy uses `bwrap` (Bubblewrap) with `--dev-bind / /` and zero-byte mounts over host loader locations (`/lib`, `/lib64`, `/usr/lib`, `/usr/lib64` loader names and musl-dev trees), recorded as `verification_strategy: "bwrap"`. If user namespaces cannot be created, it falls back to a poison-file probe. If neither isolation method is available, verification fails.
+6. Per-kind module exercises:
    - `sql`: executes `CREATE EXTENSION <name>;`.
    - `shared`: executes `CREATE EXTENSION <name>;` followed by a SQL query that invokes internal C functions to ensure DSO symbols resolved.
    - `preload`: starts a dedicated postmaster with `shared_preload_libraries` set to the exact list of preloaded modules.
@@ -152,6 +180,10 @@ The `verify` subcommand is the sole writer of the `verification` field in `manif
    - `icu`: verifies `icu:linked` through an ICU-dependent collation probe.
 
 Real check counts recorded in `manifest.json`: **124 checks** for 17.11 and **130 checks** for 18.6.
+
+**Only a `bwrap` verification is publishable.** `publish.py` rejects a PostgreSQL bundle whose `verification_strategy` is `"poison-file"`, because that probe proves strictly less: it shows the bundle's commands resolve every vendored library through the launcher's `--library-path`, but it never enters a sandbox where the host's own loader is unusable. The fallback is a build-host convenience, not publication evidence.
+
+**A GitHub-hosted `ubuntu-24.04` runner does not produce a publishable PostgreSQL bundle.** It installs bubblewrap, but `bwrap` there does not create the user namespace the mask needs, so `verify` takes the poison fallback and prints the reason it read from `bwrap`. The CI build therefore proves the bundle builds, stages and runs a real cluster; publication has to run on a host where `bwrap` works (a self-hosted runner or a workstation), where the same `./build.sh postgresql <version>` records `verification_strategy: "bwrap"`.
 
 ### Assets and the never-overwrite rule
 
