@@ -106,6 +106,47 @@ class ExtractionContracts(unittest.TestCase):
         path.write_bytes(data)
         return path
 
+    def test_download_retries_a_transient_gateway_error(self):
+        # GitHub's release CDN answers 504 for a single asset while the rest of
+        # the same release serves normally, and recovers within seconds. Without
+        # a retry one such answer kills a build that has already spent an hour
+        # compiling.
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "pcre2.tar.gz"
+            attempts = []
+
+            def fake_run(command, **kwargs):
+                attempts.append(command)
+                if len(attempts) == 1:
+                    return subprocess.CompletedProcess(command, 22, "",
+                                                      "curl: (22) 504")
+                Path(command[command.index("--output") + 1]).write_bytes(b"archive")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with mock.patch.object(self.fetch.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(self.fetch.time, "sleep"):
+                self.fetch.download("https://example.invalid/pcre2.tar.gz", destination)
+            self.assertEqual(destination.read_bytes(), b"archive")
+            self.assertEqual(len(attempts), 2)
+            for command in attempts:
+                self.assertIn("=https", command)
+
+    def test_download_gives_up_and_leaves_no_partial_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "pcre2.tar.gz"
+            attempts = []
+
+            def fake_run(command, **kwargs):
+                attempts.append(command)
+                return subprocess.CompletedProcess(command, 22, "", "curl: (22) 504")
+
+            with mock.patch.object(self.fetch.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(self.fetch.time, "sleep"):
+                with self.assertRaisesRegex(ValueError, "Cannot download.*after 4 attempts"):
+                    self.fetch.download("https://example.invalid/pcre2.tar.gz", destination)
+            self.assertGreater(len(attempts), 1)
+            self.assertFalse(destination.exists())
+
     def test_member_times_survive_extraction(self):
         # A generated file that looks newer than its source stops make from
         # trying to regenerate it with the packaged `missing` script, which fails

@@ -13,6 +13,7 @@ from pathlib import Path, PurePosixPath
 import subprocess
 import sys
 import tarfile
+import time
 
 TAR_SAFE_TYPES = {tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.DIRTYPE}
 
@@ -22,16 +23,40 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+FETCH_ATTEMPTS = 4
+FETCH_RETRY_DELAY = 5
+
+
 def download(url, destination):
+    """Download one pinned source, retrying a transient gateway failure.
+
+    GitHub's release CDN answers 504 for a single asset while the rest of the
+    same release serves normally, and the failing assets recover at different
+    moments; a build needs every one of them at once. Curl's own ``--retry``
+    covers transfer errors but a 504 arrives as an ordinary HTTP status, so the
+    attempts are made here. A digest that does not match its pin is never
+    retried: that is a changed archive, not a flaky connection.
+    """
     if destination.exists():
         raise ValueError("Refusing to reuse an existing download: " + destination.name)
-    subprocess.run(
-        [
-            "curl", "--fail", "--silent", "--show-error", "--location",
-            "--proto", "=https", "--proto-redir", "=https",
-            "--max-time", "600", "--output", str(destination), url,
-        ],
-        check=True,
+    last = None
+    for attempt in range(FETCH_ATTEMPTS):
+        if attempt:
+            time.sleep(FETCH_RETRY_DELAY * attempt)
+        last = subprocess.run(
+            [
+                "curl", "--fail", "--silent", "--show-error", "--location",
+                "--proto", "=https", "--proto-redir", "=https",
+                "--max-time", "600", "--output", str(destination), url,
+            ],
+            text=True, capture_output=True,
+        )
+        if last.returncode == 0:
+            return
+    destination.unlink(missing_ok=True)
+    raise ValueError(
+        "Cannot download %s after %d attempts: %s"
+        % (url, FETCH_ATTEMPTS, (last.stderr or "").strip()[-1000:])
     )
 
 

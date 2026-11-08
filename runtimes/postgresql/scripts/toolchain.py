@@ -111,7 +111,20 @@ def archives(work):
     return Path(work) / "archives"
 
 
+FETCH_ATTEMPTS = 4
+FETCH_RETRY_DELAY = 5
+
+
 def _fetch(pin, downloads):
+    """Download one pinned archive, retrying a transient gateway failure.
+
+    GitHub's release CDN answers 504 for a single asset while the rest of the
+    same release serves normally, and the failing assets recover at different
+    moments; a build needs every one of them at once. Curl's own ``--retry``
+    covers the transfer errors but a 504 arrives as an ordinary HTTP status, so
+    the attempts are made here. A digest that does not match its pin is never
+    retried: that is a changed archive, not a flaky connection.
+    """
     downloads.mkdir(parents=True, exist_ok=True)
     archive = downloads / PurePosixPath(pin["url"]).name
     if archive.exists():
@@ -119,14 +132,22 @@ def _fetch(pin, downloads):
             raise ValueError(f"Pinned archive changed on disk: {archive}")
         return archive
     temporary = archive.with_name(archive.name + ".part")
-    result = subprocess.run(
-        ["curl", "--fail", "--location", "--proto", "=https", "--proto-redir", "=https",
-         "--max-time", "600", "--output", str(temporary), pin["url"]],
-        text=True, capture_output=True,
-    )
+    result = None
+    for attempt in range(FETCH_ATTEMPTS):
+        if attempt:
+            time.sleep(FETCH_RETRY_DELAY * attempt)
+        result = subprocess.run(
+            ["curl", "--fail", "--location", "--proto", "=https", "--proto-redir", "=https",
+             "--max-time", "600", "--output", str(temporary), pin["url"]],
+            text=True, capture_output=True,
+        )
+        if result.returncode == 0:
+            break
     if result.returncode != 0:
         temporary.unlink(missing_ok=True)
-        raise ValueError(f"Cannot download {pin['url']}: {result.stderr.strip()[-1000:]}")
+        raise ValueError(
+            f"Cannot download {pin['url']} after {FETCH_ATTEMPTS} attempts: "
+            f"{result.stderr.strip()[-1000:]}")
     if digest(temporary) != pin["sha256"]:
         temporary.unlink()
         raise ValueError(f"SHA-256 mismatch for {pin['url']}")

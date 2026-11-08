@@ -820,6 +820,59 @@ class PostgreSQLToolchainTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 self.toolchain._confined_extract(good, root / "good")
 
+    def test_fetch_retries_a_transient_gateway_error(self):
+        # GitHub's release CDN answers 504 for a single asset while the rest of
+        # the same release serves normally, and recovers within seconds. Without
+        # a retry one such answer kills a build that has already spent an hour
+        # compiling, so the download is attempted more than once.
+        with tempfile.TemporaryDirectory() as temp:
+            downloads = Path(temp)
+            payload = b"archive bytes"
+            pin = {"url": "https://example.invalid/zlib-1.4.tar.gz",
+                   "sha256": hashlib.sha256(payload).hexdigest()}
+            attempts = []
+
+            def fake_run(command, **kwargs):
+                attempts.append(command)
+                target = Path(command[command.index("--output") + 1])
+                if len(attempts) == 1:
+                    target.write_bytes(b"partial")
+                    return subprocess.CompletedProcess(command, 22, "", "504")
+                target.write_bytes(payload)
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with mock.patch.object(self.toolchain.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(self.toolchain.time, "sleep"):
+                archive = self.toolchain._fetch(pin, downloads)
+            self.assertEqual(archive.read_bytes(), payload)
+            self.assertEqual(len(attempts), 2)
+            # Every attempt still pins the protocol: a retry must not be a way
+            # to reach plain HTTP.
+            for command in attempts:
+                self.assertIn("=https", command)
+
+    def test_fetch_gives_up_after_its_attempts_and_says_so(self):
+        # Retrying forever would turn a real outage into a hung build. When
+        # every attempt fails the archive is still absent and the error names
+        # the URL, exactly as before.
+        with tempfile.TemporaryDirectory() as temp:
+            downloads = Path(temp)
+            attempts = []
+
+            def fake_run(command, **kwargs):
+                attempts.append(command)
+                Path(command[command.index("--output") + 1]).write_bytes(b"partial")
+                return subprocess.CompletedProcess(command, 22, "", "504")
+
+            pin = {"url": "https://example.invalid/zlib-1.4.tar.gz", "sha256": "0" * 64}
+            with mock.patch.object(self.toolchain.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(self.toolchain.time, "sleep"):
+                with self.assertRaisesRegex(ValueError, "Cannot download.*example.invalid"):
+                    self.toolchain._fetch(pin, downloads)
+            self.assertGreater(len(attempts), 1)
+            self.assertEqual(list(downloads.glob("*.part")), [])
+            self.assertFalse((downloads / "zlib-1.4.tar.gz").exists())
+
     def test_fetch_reverifies_a_cached_archive_against_its_pin(self):
         with tempfile.TemporaryDirectory() as temp:
             downloads = Path(temp)
