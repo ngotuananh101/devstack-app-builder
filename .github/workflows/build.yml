@@ -52,8 +52,10 @@ jobs:
     outputs:
       matrix: ${{ steps.set.outputs.matrix }}
       redis_matrix: ${{ steps.set.outputs.redis_matrix }}
+      postgres_matrix: ${{ steps.set.outputs.postgres_matrix }}
       has_php_updates: ${{ steps.set.outputs.has_php_updates }}
       has_redis_updates: ${{ steps.set.outputs.has_redis_updates }}
+      has_postgres_updates: ${{ steps.set.outputs.has_postgres_updates }}
       has_updates: ${{ steps.set.outputs.has_updates }}
       publish: ${{ steps.set.outputs.publish }}
       release_tag: ${{ steps.set.outputs.release_tag }}
@@ -141,6 +143,33 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  build-postgresql:
+    if: needs.plan.outputs.has_postgres_updates == 'true'
+    needs: [plan, contracts]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.postgres_matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install CI-only native build dependencies
+        run: |
+          # Zig, OpenSSL, zlib, libxml2, ICU and util-linux are fetched and
+          # digest-verified by the build script; only these host tools are apt's.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bison flex perl build-essential binutils curl
+      - name: Build, verify a real server lifecycle, and package
+        env:
+          BUILD_VERSION: ${{ matrix.postgresql_version }}
+        run: ./build.sh postgresql "$BUILD_VERSION"
+      - name: Upload mode-preserving archives and metadata
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: runtime-postgresql-${{ matrix.postgresql_version }}-musl-dynamic-x86_64
+          path: dist/assets/
+          if-no-files-found: error
+          retention-days: 14
+
   publish:
     # An empty runtime matrix is skipped, but a selected failed/cancelled build blocks publication.
     if: >-
@@ -148,8 +177,10 @@ jobs:
           ((needs.plan.outputs.has_php_updates == 'true' && needs.build-php.result == 'success') ||
            (needs.plan.outputs.has_php_updates == 'false' && needs.build-php.result == 'skipped')) &&
           ((needs.plan.outputs.has_redis_updates == 'true' && needs.build-redis.result == 'success') ||
-           (needs.plan.outputs.has_redis_updates == 'false' && needs.build-redis.result == 'skipped')) }}
-    needs: [plan, build-php, build-redis]
+           (needs.plan.outputs.has_redis_updates == 'false' && needs.build-redis.result == 'skipped')) &&
+          ((needs.plan.outputs.has_postgres_updates == 'true' && needs.build-postgresql.result == 'success') ||
+           (needs.plan.outputs.has_postgres_updates == 'false' && needs.build-postgresql.result == 'skipped')) }}
+    needs: [plan, build-php, build-redis, build-postgresql]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

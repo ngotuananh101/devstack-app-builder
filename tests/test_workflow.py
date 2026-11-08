@@ -20,6 +20,22 @@ from unittest.mock import patch
 from test_build import load
 
 
+WORKFLOW = REPO / ".github/workflows/build.yml"
+
+
+def job_block(text, name):
+    """Slice one job out of the workflow at its two-space job key.
+
+    Splitting on "build-" instead would cut a job at the `build-essential`
+    package name and assert against the wrong region.
+    """
+    match = re.search(rf"^  {re.escape(name)}:\n", text, re.MULTILINE)
+    if match is None:
+        raise AssertionError(f"Missing workflow job: {name}")
+    following = re.compile(r"^  [a-z][a-z0-9-]*:$", re.MULTILINE).search(text, match.end())
+    return text[match.start():following.start() if following else len(text)]
+
+
 class WorkflowContracts(unittest.TestCase):
     def test_manual_inputs_do_not_allow_profile_target_or_series_narrowing(self):
         workflow = (REPO / ".github/workflows/build.yml").read_text()
@@ -34,17 +50,17 @@ class WorkflowContracts(unittest.TestCase):
         self.assertIn("redis_matrix:", planner)
         self.assertIn("BYPASS: ${{ inputs.bypass || false }}", planner)
         self.assertIn("  build-redis:\n", workflow, "Missing native Redis build job")
-        php = workflow.split("  build-php:\n", 1)[1].split("  build-redis:\n", 1)[0]
+        php = job_block(workflow, "build-php")
         self.assertIn('./build.sh php "$BUILD_VERSION"', php)
         self.assertNotIn("BUILD_TARGET", php)
         self.assertNotIn("BUILD_PROFILE", php)
-        redis = workflow.split("  build-redis:\n", 1)[1].split("  publish:\n", 1)[0]
+        redis = job_block(workflow, "build-redis")
         self.assertIn('./build.sh redis "$BUILD_VERSION"', redis)
         self.assertNotIn("BUILD_TARGET", redis)
         self.assertNotIn("BUILD_PROFILE", redis)
         self.assertNotIn("docker", redis.lower())
         publish = workflow.split("  publish:\n", 1)[1]
-        self.assertIn("needs: [plan, build-php, build-redis]", publish)
+        self.assertIn("needs: [plan, build-php, build-redis, build-postgresql]", publish)
         self.assertIn("always()", publish)
         self.assertIn("needs.build-redis.result", publish)
         self.assertIn("pattern: runtime-*", publish)
@@ -248,7 +264,7 @@ class WorkflowContracts(unittest.TestCase):
         php = workflow.split("  build-php:\n", 1)[1].split("  build-redis:\n", 1)[0]
         publish = workflow.split("  publish:\n", 1)[1]
         self.assertIn("if: needs.plan.outputs.has_php_updates == 'true'", php)
-        self.assertIn("needs: [plan, build-php, build-redis]", publish)
+        self.assertIn("needs: [plan, build-php, build-redis, build-postgresql]", publish)
         self.assertIn("name: publication-plan", publish)
         self.assertIn("--plan dist/plans/runtime-update-plan.json", publish)
         self.assertIn("group: runtime-build-publication", workflow)
@@ -264,19 +280,52 @@ class WorkflowContracts(unittest.TestCase):
         expression = expression.removeprefix("${{").removesuffix("}}").strip()
         # Evaluate our emitted boolean expression over the entire small state space.
         states = ("success", "failure", "cancelled", "skipped")
-        for cancelled, plan_result, publish_enabled, php_selected, redis_selected, php_result, redis_result in itertools.product((False, True), states, (False, True), (False, True), (False, True), states, states):
+        for cancelled, plan_result, publish_enabled, php_selected, redis_selected, postgres_selected, php_result, redis_result, postgres_result in itertools.product(
+                (False, True), states, (False, True), (False, True), (False, True), (False, True), states, states, states):
             expected = (not cancelled and plan_result == "success" and publish_enabled
                         and php_result == ("success" if php_selected else "skipped")
-                        and redis_result == ("success" if redis_selected else "skipped"))
+                        and redis_result == ("success" if redis_selected else "skipped")
+                        and postgres_result == ("success" if postgres_selected else "skipped"))
             values = {"needs.plan.result": plan_result, "needs.plan.outputs.publish": str(publish_enabled).lower(),
                       "needs.plan.outputs.has_php_updates": str(php_selected).lower(),
                       "needs.plan.outputs.has_redis_updates": str(redis_selected).lower(),
-                      "needs.build-php.result": php_result, "needs.build-redis.result": redis_result}
+                      "needs.plan.outputs.has_postgres_updates": str(postgres_selected).lower(),
+                      "needs.build-php.result": php_result, "needs.build-redis.result": redis_result,
+                      "needs.build-postgresql.result": postgres_result}
             candidate = expression.replace("always()", "True").replace("!cancelled()", repr(not cancelled))
             for name, value in values.items():
                 candidate = candidate.replace(name, repr(value))
             candidate = candidate.replace("&&", " and ").replace("||", " or ")
             self.assertEqual(eval(candidate, {"__builtins__": {}}, {}), expected, values)
+
+    def test_workflow_builds_postgresql_with_explicit_ci_dependencies(self):
+        text = WORKFLOW.read_text()
+        job = job_block(text, "build-postgresql")
+        for package in ("bison", "flex", "perl", "build-essential", "binutils", "curl"):
+            self.assertIn(package, job, package)
+        # Zig and every library archive come from the build script, digest-verified.
+        self.assertNotIn("musl-tools", job)
+        self.assertIn("${{ matrix.postgresql_version }}", job)
+        self.assertIn("if-no-files-found: error", job)
+        self.assertIn("if: needs.plan.outputs.has_postgres_updates == 'true'", job)
+        self.assertIn("needs: [plan, contracts]", job)
+        self.assertIn("matrix: ${{ fromJson(needs.plan.outputs.postgres_matrix) }}", job)
+        self.assertIn('./build.sh postgresql "$BUILD_VERSION"', job)
+        # Without these plan outputs the job's matrix is empty and invalid.
+        plan_job = job_block(text, "plan")
+        self.assertIn("postgres_matrix: ${{ steps.set.outputs.postgres_matrix }}", plan_job)
+        self.assertIn("has_postgres_updates: ${{ steps.set.outputs.has_postgres_updates }}", plan_job)
+        # The uploaded artifact must still be picked up by the publish download.
+        artifact = re.search(r"^          name: (runtime-postgresql-.+)$", job, re.MULTILINE)[1]
+        pattern = re.search(r"^          pattern: (.+)$", job_block(text, "publish"), re.MULTILINE)[1]
+        self.assertTrue(fnmatch.fnmatchcase(artifact.replace("${{ matrix.postgresql_version }}", "18.6"), pattern))
+
+    def test_publish_gate_requires_every_selected_runtime_to_succeed(self):
+        gate = job_block(WORKFLOW.read_text(), "publish")
+        # Names match what scripts/updates.py writes to $GITHUB_OUTPUT.
+        for runtime in ("php", "redis", "postgres"):
+            self.assertIn(f"has_{runtime}_updates", gate, runtime)
+        self.assertIn("build-postgresql", gate, "publish must depend on the postgresql build")
 
     def test_asset_download_pattern_excludes_the_publication_plan(self):
         workflow = (REPO / ".github/workflows/build.yml").read_text()
