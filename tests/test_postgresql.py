@@ -892,6 +892,35 @@ class PostgreSQLToolchainTests(unittest.TestCase):
             # transfer can never be mistaken for the verified archive.
             self.assertEqual(list(downloads.glob("*.part")), [])
 
+    def test_a_digest_mismatch_says_what_arrived_instead(self):
+        # A bare "SHA-256 mismatch for <url>" is not diagnosable: it cannot
+        # distinguish a changed upstream archive from a proxy that answered
+        # HTTP 200 with an HTML error page, and that difference decides whether
+        # the pin or the network is at fault. The message must carry the digest
+        # that actually arrived, the size, and the content type.
+        with tempfile.TemporaryDirectory() as temp:
+            downloads = Path(temp)
+            payload = b"<html>Service Unavailable</html>"
+
+            def fake_run(command, **kwargs):
+                Path(command[command.index("--output") + 1]).write_bytes(payload)
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            pin = {"url": "https://example.invalid/zlib-1.4.tar.gz", "sha256": "0" * 64}
+            with mock.patch.object(self.toolchain.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(self.toolchain, "_content_type",
+                                      return_value="text/html"):
+                with self.assertRaises(ValueError) as caught:
+                    self.toolchain._fetch(pin, downloads)
+            message = str(caught.exception)
+            self.assertIn("SHA-256", message)
+            self.assertIn(hashlib.sha256(payload).hexdigest(), message)
+            self.assertIn(f"{len(payload)} bytes", message)
+            self.assertIn("text/html", message)
+            # The mismatching download is not kept: it is not the pinned archive.
+            self.assertFalse((downloads / "zlib-1.4.tar.gz").exists())
+            self.assertEqual(list(downloads.glob("*.part")), [])
+
     def test_licence_files_match_the_spdx_the_pin_declares(self):
         pins = module("source").dependencies()
         expected = {

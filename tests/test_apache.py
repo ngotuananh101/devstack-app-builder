@@ -149,6 +149,34 @@ class ExtractionContracts(unittest.TestCase):
             self.assertGreater(len(attempts), 1)
             self.assertFalse(destination.exists())
 
+    def test_a_digest_mismatch_says_what_arrived_instead(self):
+        # A bare "expected X, got Y" is not diagnosable: it cannot distinguish a
+        # changed upstream archive from a proxy that answered 200 with an HTML
+        # error page, and that difference decides whether the pin or the route
+        # is at fault. The message must carry the size and the content type.
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            (work / "downloads").mkdir()
+            payload = b"<html>Service Unavailable</html>"
+
+            def fake_run(command, **kwargs):
+                Path(command[command.index("--output") + 1]).write_bytes(payload)
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            entry = {"name": "pcre2", "url": "https://example.invalid/pcre2-10.49.tar.gz",
+                     "sha256": "0" * 64}
+            with mock.patch.object(self.fetch.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(self.fetch, "content_type",
+                                      return_value="text/html"):
+                with self.assertRaises(ValueError) as caught:
+                    self.fetch.fetch_one(entry, work)
+            message = str(caught.exception)
+            self.assertIn(hashlib.sha256(payload).hexdigest(), message)
+            self.assertIn(f"{len(payload)} bytes", message)
+            self.assertIn("text/html", message)
+            # Nothing was extracted from an archive that failed its pin.
+            self.assertFalse((work / "sources" / "pcre2").exists())
+
     def test_member_times_survive_extraction(self):
         # A generated file that looks newer than its source stops make from
         # trying to regenerate it with the packaged `missing` script, which fails

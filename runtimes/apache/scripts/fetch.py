@@ -123,15 +123,45 @@ def extract(archive, destination):
     return destination / root
 
 
+def content_type(url):
+    """The Content-Type a HEAD request reports, or None.
+
+    Only ever used to explain a digest mismatch. A proxy or a CDN error page can
+    answer ``200`` with an HTML body, and a bare digest comparison cannot tell
+    that apart from an upstream that genuinely replaced the archive.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "curl", "--silent", "--show-error", "--location",
+                "--proto", "=https", "--proto-redir", "=https",
+                "--max-time", "60", "--head", "--write-out", "%{content_type}",
+                "--output", "/dev/null", url,
+            ],
+            text=True, capture_output=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
 def fetch_one(entry, work):
     name = entry["name"]
     archive = work / "downloads" / (name + ".tar.gz")
     download(entry["url"], archive)
     actual = digest(archive)
     if actual != entry["sha256"]:
+        # Report what arrived, not just that it differed. Size and content type
+        # are what separate "upstream replaced the archive" (fix the pin) from
+        # "something in the path answered 200 with an error page" (fix the
+        # route); without them a CI failure is not readable.
         raise ValueError(
-            "SHA-256 mismatch for %s: expected %s, got %s"
-            % (name, entry["sha256"], actual)
+            "SHA-256 mismatch for %s: expected %s, got %s (%d bytes, "
+            "content-type %s)"
+            % (name, entry["sha256"], actual, archive.stat().st_size,
+               content_type(entry["url"]) or "unknown")
         )
     return extract(archive, work / "sources" / name)
 

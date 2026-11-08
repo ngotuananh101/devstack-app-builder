@@ -117,6 +117,28 @@ FETCH_RETRY_DELAYS = (15, 30, 60, 120, 180)
 FETCH_ATTEMPTS = len(FETCH_RETRY_DELAYS) + 1
 
 
+def _content_type(url):
+    """The Content-Type a HEAD request reports, or None.
+
+    Only ever used to explain a digest mismatch. A proxy or a CDN error page can
+    answer ``200`` with an HTML body, and "expected X, got Y" alone cannot tell
+    that apart from an upstream that genuinely replaced the archive.
+    """
+    try:
+        result = subprocess.run(
+            ["curl", "--silent", "--show-error", "--location",
+             "--proto", "=https", "--proto-redir", "=https",
+             "--max-time", "60", "--head", "--write-out", "%{content_type}",
+             "--output", "/dev/null", url],
+            text=True, capture_output=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
 def _fetch(pin, downloads):
     """Download one pinned archive, retrying a transient gateway failure.
 
@@ -152,8 +174,18 @@ def _fetch(pin, downloads):
             f"Cannot download {pin['url']} after {FETCH_ATTEMPTS} attempts: "
             f"{result.stderr.strip()[-1000:]}")
     if digest(temporary) != pin["sha256"]:
+        # Report what arrived, not just that it differed. The size and content
+        # type are what separate "upstream replaced the archive" (fix the pin)
+        # from "something in the path answered 200 with an error page" (fix the
+        # route); a message without them leaves a CI failure nobody can read.
+        actual = digest(temporary)
+        size = temporary.stat().st_size
+        kind = _content_type(pin["url"]) or "unknown"
         temporary.unlink()
-        raise ValueError(f"SHA-256 mismatch for {pin['url']}")
+        raise ValueError(
+            f"SHA-256 mismatch for {pin['url']}: "
+            f"expected {pin['sha256']}, got {actual} "
+            f"({size} bytes, content-type {kind})")
     temporary.rename(archive)
     return archive
 
