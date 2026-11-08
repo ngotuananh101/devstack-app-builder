@@ -1385,6 +1385,76 @@ class PostgreSQLBundleTests(unittest.TestCase):
             self.assertIsNone(
                 self.bundle.program_interpreter(output / "lib/musl/ld-musl-x86_64.so.1"))
 
+    def test_stage_rewrites_programs_outside_bin_too(self):
+        # `install-world-bin` also puts pg_regress, pg_isolation_regress and
+        # isolationtester under lib/pgxs. Those are programs, not modules: a
+        # rewrite limited to bin/ would leave the build-workspace loader name in
+        # three files that no launcher wraps, and the archive would be correct
+        # only on the machine that built it.
+        if not shutil.which("cc") or not shutil.which("readelf"):
+            self.skipTest("ELF fixture compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            install = self.fixture(root)
+            record = self.provenance(root, install)
+            workspace_loader = record["loader"]["path"]
+            pgxs = install / "lib/pgxs/src/test/regress"
+            pgxs.mkdir(parents=True)
+            build_elf(root, pgxs / "pg_regress", needed=("libcrypto.so.3",),
+                      search=root / "shared", interpreter=workspace_loader)
+            (pgxs / "pg_regress").chmod(0o755)
+            output = root / "bundle"
+            self.bundle.stage(install, output, self.request(root), record, ROOT)
+            self.assertEqual(
+                self.bundle.program_interpreter(
+                    output / "lib/pgxs/src/test/regress/pg_regress"),
+                self.bundle.INTERPRETER)
+
+    def test_stage_leaves_shared_objects_alone_while_walking(self):
+        # The wider walk must not refuse a file that legitimately asks for no
+        # interpreter. A staged .so has no PT_INTERP; only a *command* in bin/
+        # is required to have one.
+        if not shutil.which("cc") or not shutil.which("readelf"):
+            self.skipTest("ELF fixture compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            install = self.fixture(root)
+            record = self.provenance(root, install)
+            output = root / "bundle"
+            manifest = self.bundle.stage(install, output, self.request(root), record, ROOT)
+            for name in ("libpq.so.5", "utf8_and_euc_jp.so"):
+                self.assertIsNone(self.bundle.program_interpreter(output / "lib" / name))
+            self.assertTrue(manifest["binaries"])
+
+    def test_the_walk_refuses_a_static_command_but_not_a_shared_object(self):
+        # The walk skips files with no interpreter so a .so is not refused, but
+        # a command in bin/ must be launchable. stage() already refuses a static
+        # command earlier (its version probe prints nothing), so this guard is
+        # the one that keeps that true if the ordering ever changes.
+        if not shutil.which("cc"):
+            self.skipTest("C compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "static.c"
+            source.write_text(
+                "void _start(void)\n"
+                "{\n"
+                "\t__asm__ volatile (\"syscall\" : : \"a\" (60), \"D\" (0)\n"
+                "\t                  : \"rcx\", \"r11\", \"memory\");\n"
+                "\t__builtin_unreachable();\n"
+                "}\n")
+            bundle = root / "bundle"
+            (bundle / "bin").mkdir(parents=True)
+            (bundle / "lib").mkdir()
+            static = bundle / "bin/postgres"
+            subprocess.run(["cc", "-nostdlib", "-static", "-Wl,-e,_start",
+                            "-o", str(static), str(source)],
+                           check=True, capture_output=True)
+            static.chmod(0o755)
+            build_library(bundle / "lib/libpq.so.5", "libpq.so.5")
+            with self.assertRaisesRegex(ValueError, "requests no interpreter"):
+                self.bundle.portable_interpreters(bundle)
+
     def test_stage_refuses_a_binary_the_install_tree_cannot_resolve(self):
         # The counterpart of the test above: a NEEDED library present in no
         # searched directory must abort staging rather than be skipped, so the

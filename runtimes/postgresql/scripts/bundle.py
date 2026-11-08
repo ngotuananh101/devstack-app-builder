@@ -395,15 +395,33 @@ def portable_interpreter(path):
 
 
 def portable_interpreters(output):
-    """Rewrite every staged command's interpreter; returns the count changed.
+    """Rewrite every staged program's interpreter; returns the count changed.
 
-    Only ``bin/`` is touched. The ``lib/*.so`` modules are shared objects with
-    no PT_INTERP, and the staged loader is the interpreter rather than a program
-    that asks for one.
+    The walk covers the whole staged tree, not ``bin/`` alone: `install-world-bin`
+    also puts ``pg_regress``, ``pg_isolation_regress`` and ``isolationtester``
+    under ``lib/pgxs``. Those run without a launcher, so a build-workspace path
+    left in one of them is a bundle that works on the build host and nowhere
+    else — the exact thing this rewrite exists to prevent.
+
+    A shared object has no PT_INTERP and is skipped here. The ``bin/`` commands
+    are not: each one must name an interpreter, so a static program is refused
+    by name rather than staged into a bundle that cannot launch it.
     """
     output = Path(output)
-    return sum(bool(portable_interpreter(output / "bin" / command))
-               for command in launchers.commands(output))
+    commands = {output / "bin" / name for name in launchers.commands(output)}
+    changed = 0
+    for path in sorted(output.rglob("*")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        # Four bytes first: most of the tree is data, and one member is a
+        # multi-megabyte source archive that must not be read to be skipped.
+        with path.open("rb") as stream:
+            if stream.read(4) != b"\x7fELF":
+                continue
+        if program_interpreter(path) is None and path not in commands:
+            continue
+        changed += bool(portable_interpreter(path))
+    return changed
 
 
 def binary_version(binary, loader, library_path):
@@ -612,7 +630,7 @@ def stage(install_root, output, request, provenance, repo_root):
     output.mkdir(parents=True, exist_ok=False)
     _copy_tree(install_root, output, provenance)
     # The build named a loader inside its own workspace so `configure` could run
-    # what it compiled. Every staged command is repointed here, before the
+    # what it compiled. Every staged program is repointed here, before the
     # manifest records the interpreter, so no workspace path survives into the
     # archive.
     portable_interpreters(output)

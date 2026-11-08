@@ -42,8 +42,12 @@ itself in seconds instead of surfacing as `configure: error: cannot run C compil
 programs` inside libxml2.
 
 The workspace path must not reach a user's archive, so `bundle.py` rewrites every
-staged command's `PT_INTERP` back to the portable `/lib/ld-musl-x86_64.so.1` (in
-`bin/`, before `launchers.install` and before the manifest records the interpreter).
+staged program's `PT_INTERP` back to the portable `/lib/ld-musl-x86_64.so.1` (before
+`launchers.install` and before the manifest records the interpreter). The walk covers
+the whole staged tree rather than `bin/` alone, because `install-world-bin` also puts
+`pg_regress`, `pg_isolation_regress` and `isolationtester` under `lib/pgxs`, and those
+run without a launcher. Shared objects carry no `PT_INTERP` and are skipped; a command
+in `bin/` that names none is refused by name.
 The rewrite is length-preserving — it reuses the existing `PT_INTERP` slot, NUL-padded
 — and refuses a name that cannot fit rather than shipping a truncated interpreter path.
 Nothing at run time reads the name back: the launchers exec the bundled loader with
