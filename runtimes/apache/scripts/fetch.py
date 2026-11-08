@@ -29,6 +29,26 @@ FETCH_RETRY_DELAYS = (15, 30, 60, 120, 180)
 FETCH_ATTEMPTS = len(FETCH_RETRY_DELAYS) + 1
 
 
+# A read-only GitHub release proxy, used only after every direct attempt failed.
+# GitHub's `releases/download` surface has answered 504 for every asset for hours
+# while the rest of the internet served normally. The pin is what makes the
+# substitution safe: the mirror's bytes are verified exactly like the origin's,
+# so a mirror that rewrites, truncates or serves an error page is refused.
+MIRROR = "https://gh-proxy.org/"
+
+
+def mirror_for(url):
+    """The mirror URL for a GitHub release asset, or None for anything else.
+
+    Only `github.com/.../releases/download/...` has the failure mode this exists
+    for. Sending downloads.apache.org or zlib.net through a proxy would turn a
+    clear upstream answer into somebody else's bug report.
+    """
+    if url.startswith("https://github.com/") and "/releases/download/" in url:
+        return MIRROR + url
+    return None
+
+
 def download(url, destination):
     """Download one pinned source, retrying a transient gateway failure.
 
@@ -55,11 +75,32 @@ def download(url, destination):
         )
         if last.returncode == 0:
             return
-    destination.unlink(missing_ok=True)
-    raise ValueError(
-        "Cannot download %s after %d attempts: %s"
-        % (url, FETCH_ATTEMPTS, (last.stderr or "").strip()[-1000:])
+    # Only now, with every direct attempt spent, is a mirror worth trying.
+    # Doing it earlier would send traffic through a third party on days when
+    # GitHub is perfectly healthy.
+    mirror = mirror_for(url)
+    if mirror is None:
+        destination.unlink(missing_ok=True)
+        raise ValueError(
+            "Cannot download %s after %d attempts: %s"
+            % (url, FETCH_ATTEMPTS, (last.stderr or "").strip()[-1000:])
+        )
+    direct_error = (last.stderr or "").strip()[-400:]
+    last = subprocess.run(
+        [
+            "curl", "--fail", "--silent", "--show-error", "--location",
+            "--proto", "=https", "--proto-redir", "=https",
+            "--max-time", "600", "--output", str(destination), mirror,
+        ],
+        text=True, capture_output=True,
     )
+    if last.returncode != 0:
+        destination.unlink(missing_ok=True)
+        raise ValueError(
+            "Cannot download %s after %d attempts, nor from %s: %s (direct: %s)"
+            % (url, FETCH_ATTEMPTS, MIRROR, (last.stderr or "").strip()[-400:],
+               direct_error)
+        )
 
 
 def members(tar):
@@ -157,11 +198,16 @@ def fetch_one(entry, work):
         # are what separate "upstream replaced the archive" (fix the pin) from
         # "something in the path answered 200 with an error page" (fix the
         # route); without them a CI failure is not readable.
+        size = archive.stat().st_size
+        kind = content_type(entry["url"])
+        # Leave nothing behind. `download` refuses to reuse an existing file, so
+        # a kept archive would make the next run fail on the leftover instead of
+        # re-fetching, and a bad archive is not worth the disk either.
+        archive.unlink()
         raise ValueError(
             "SHA-256 mismatch for %s: expected %s, got %s (%d bytes, "
             "content-type %s)"
-            % (name, entry["sha256"], actual, archive.stat().st_size,
-               content_type(entry["url"]) or "unknown")
+            % (name, entry["sha256"], actual, size, kind or "unknown")
         )
     return extract(archive, work / "sources" / name)
 

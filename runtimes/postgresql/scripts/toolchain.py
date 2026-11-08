@@ -117,6 +117,27 @@ FETCH_RETRY_DELAYS = (15, 30, 60, 120, 180)
 FETCH_ATTEMPTS = len(FETCH_RETRY_DELAYS) + 1
 
 
+# A read-only GitHub release proxy, used only after every direct attempt failed.
+# GitHub's `releases/download` surface has answered 504 for every asset for hours
+# while the rest of the internet served normally; this is the only dependency in
+# the build that can disappear that way. The pin is what makes the substitution
+# safe — the mirror's bytes are verified exactly like the origin's, so a mirror
+# that rewrites, truncates or serves an error page is refused, not trusted.
+MIRROR = "https://gh-proxy.org/"
+
+
+def _mirror_for(url):
+    """The mirror URL for a GitHub release asset, or None for anything else.
+
+    Only `github.com/.../releases/download/...` has the failure mode this
+    exists for. Sending zlib.net or openssl.org through a proxy would turn a
+    clear upstream answer into somebody else's bug report.
+    """
+    if url.startswith("https://github.com/") and "/releases/download/" in url:
+        return MIRROR + url
+    return None
+
+
 def _content_type(url):
     """The Content-Type a HEAD request reports, or None.
 
@@ -169,10 +190,28 @@ def _fetch(pin, downloads):
         if result.returncode == 0:
             break
     if result.returncode != 0:
-        temporary.unlink(missing_ok=True)
-        raise ValueError(
-            f"Cannot download {pin['url']} after {FETCH_ATTEMPTS} attempts: "
-            f"{result.stderr.strip()[-1000:]}")
+        # Only now, with every direct attempt spent, is a mirror worth trying.
+        # Doing it earlier would send traffic through a third party on days when
+        # GitHub is perfectly healthy.
+        mirror = _mirror_for(pin["url"])
+        if mirror is None:
+            temporary.unlink(missing_ok=True)
+            raise ValueError(
+                f"Cannot download {pin['url']} after {FETCH_ATTEMPTS} attempts: "
+                f"{result.stderr.strip()[-1000:]}")
+        direct_error = result.stderr.strip()[-400:]
+        result = subprocess.run(
+            ["curl", "--fail", "--silent", "--show-error", "--location",
+             "--proto", "=https", "--proto-redir", "=https",
+             "--max-time", "600", "--output", str(temporary), mirror],
+            text=True, capture_output=True,
+        )
+        if result.returncode != 0:
+            temporary.unlink(missing_ok=True)
+            raise ValueError(
+                f"Cannot download {pin['url']} after {FETCH_ATTEMPTS} attempts, "
+                f"nor from {MIRROR}: {result.stderr.strip()[-400:]} "
+                f"(direct: {direct_error})")
     if digest(temporary) != pin["sha256"]:
         # Report what arrived, not just that it differed. The size and content
         # type are what separate "upstream replaced the archive" (fix the pin)

@@ -32,6 +32,16 @@ A download is attempted six times with cumulative backoff (15s, 45s, 1m45s, 3m45
 while its own status page reported all systems operational. A digest that does not match
 its pin is never retried — that is a changed archive, not a flaky connection.
 
+Only after all six direct attempts have failed is a GitHub release asset retried through
+`https://gh-proxy.org/`, a read-only release proxy. It is a last resort on purpose: on a
+day when GitHub is healthy the build never touches a third party, and a non-GitHub host
+(`curl.se`, MacPorts, SourceForge, `zlib.net`) is never proxied at all — those outages
+have different causes and a proxy would only obscure them. The proxy is safe for exactly
+one reason: its bytes pass the same SHA-256 check as the origin's, so a proxy that
+rewrites, truncates or serves an error page is refused rather than trusted, and the
+resulting failure still reads `SHA-256 mismatch`. A digest mismatch removes the archive
+and never falls back, so a bad archive cannot wedge the next attempt.
+
 `curl`, `jansson` and `expat` are fetched from their upstream mirrors (`curl.se`,
 MacPorts, SourceForge) rather than from GitHub releases, verified byte-identical at the
 time of the change. A dependency may only move to a mirror that returns **exactly** the

@@ -921,6 +921,77 @@ class PostgreSQLToolchainTests(unittest.TestCase):
             self.assertFalse((downloads / "zlib-1.4.tar.gz").exists())
             self.assertEqual(list(downloads.glob("*.part")), [])
 
+    def test_a_github_failure_falls_back_to_the_mirror(self):
+        # GitHub's release CDN can answer 504 for hours while every other host
+        # is healthy, and a build needs all of its archives at once. The mirror
+        # is tried only after the direct attempts are exhausted, and only its
+        # bytes that match the pin are accepted: the mirror is never trusted,
+        # it is merely another source for an archive whose digest is already
+        # known.
+        with tempfile.TemporaryDirectory() as temp:
+            downloads = Path(temp)
+            payload = b"archive bytes"
+            pin = {"url": "https://github.com/example/zlib/releases/download/v1/zlib-1.4.tar.gz",
+                   "sha256": hashlib.sha256(payload).hexdigest()}
+            attempts = []
+
+            def fake_run(command, **kwargs):
+                attempts.append(command)
+                if "gh-proxy.org" in command[-1]:
+                    Path(command[command.index("--output") + 1]).write_bytes(payload)
+                    return subprocess.CompletedProcess(command, 0, "", "")
+                return subprocess.CompletedProcess(command, 22, "", "504")
+
+            with mock.patch.object(self.toolchain.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(self.toolchain.time, "sleep"):
+                archive = self.toolchain._fetch(pin, downloads)
+            self.assertEqual(archive.read_bytes(), payload)
+            # Every direct attempt came first; the mirror is the last resort.
+            direct = [c for c in attempts if "gh-proxy.org" not in c[-1]]
+            self.assertEqual(len(direct), self.toolchain.FETCH_ATTEMPTS)
+            self.assertEqual(len(attempts), self.toolchain.FETCH_ATTEMPTS + 1)
+            self.assertEqual(attempts[-1][-1], self.toolchain.MIRROR + pin["url"])
+
+    def test_the_mirror_is_not_tried_for_a_host_that_is_not_github(self):
+        # Only GitHub's release CDN has this failure mode. A 404 on an upstream
+        # mirror is a real answer, and routing it through a proxy would hide it.
+        with tempfile.TemporaryDirectory() as temp:
+            downloads = Path(temp)
+            pin = {"url": "https://zlib.net/zlib-1.4.tar.gz", "sha256": "0" * 64}
+            attempts = []
+
+            def fake_run(command, **kwargs):
+                attempts.append(command)
+                return subprocess.CompletedProcess(command, 22, "404", "")
+
+            with mock.patch.object(self.toolchain.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(self.toolchain.time, "sleep"):
+                with self.assertRaises(ValueError):
+                    self.toolchain._fetch(pin, downloads)
+            self.assertFalse(any("gh-proxy.org" in c[-1] for c in attempts))
+
+    def test_a_mirror_that_returns_different_bytes_is_refused(self):
+        # The whole point of pinning is that a mirror cannot be trusted by name.
+        with tempfile.TemporaryDirectory() as temp:
+            downloads = Path(temp)
+            pin = {"url": "https://github.com/example/zlib/releases/download/v1/zlib-1.4.tar.gz",
+                   "sha256": "a" * 64}
+
+            def fake_run(command, **kwargs):
+                if "gh-proxy.org" in command[-1]:
+                    Path(command[command.index("--output") + 1]).write_bytes(b"tampered")
+                    return subprocess.CompletedProcess(command, 0, "", "")
+                return subprocess.CompletedProcess(command, 22, "", "504")
+
+            with mock.patch.object(self.toolchain.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(self.toolchain.time, "sleep"), \
+                    mock.patch.object(self.toolchain, "_content_type",
+                                      return_value="application/x-gzip"):
+                with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+                    self.toolchain._fetch(pin, downloads)
+            self.assertFalse((downloads / "zlib-1.4.tar.gz").exists())
+            self.assertEqual(list(downloads.glob("*.part")), [])
+
     def test_licence_files_match_the_spdx_the_pin_declares(self):
         pins = module("source").dependencies()
         expected = {

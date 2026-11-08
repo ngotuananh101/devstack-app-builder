@@ -177,6 +177,81 @@ class ExtractionContracts(unittest.TestCase):
             # Nothing was extracted from an archive that failed its pin.
             self.assertFalse((work / "sources" / "pcre2").exists())
 
+    def test_a_github_failure_falls_back_to_the_mirror(self):
+        # GitHub's release surface has answered 504 for hours at a time while the
+        # rest of the internet served normally. The direct attempts are still
+        # made first and in full: the mirror is a last resort, not the normal path.
+        url = ("https://github.com/nghttp2/nghttp2/releases/download/"
+               "v1.71.0/nghttp2-1.71.0.tar.gz")
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "nghttp2.tar.gz"
+            attempts = []
+
+            def fake_run(command, **kwargs):
+                attempts.append(command)
+                if len(attempts) <= self.fetch.FETCH_ATTEMPTS:
+                    return subprocess.CompletedProcess(command, 22, "", "curl: (22) 504")
+                Path(command[command.index("--output") + 1]).write_bytes(b"archive")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with mock.patch.object(self.fetch.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(self.fetch.time, "sleep"):
+                self.fetch.download(url, destination)
+            self.assertEqual(destination.read_bytes(), b"archive")
+            direct = [c[-1] for c in attempts[:-1]]
+            self.assertEqual(len(direct), self.fetch.FETCH_ATTEMPTS)
+            for attempted in direct:
+                self.assertEqual(attempted, url)
+            self.assertEqual(attempts[-1][-1], self.fetch.MIRROR + url)
+
+    def test_the_mirror_is_not_tried_for_a_host_that_is_not_github(self):
+        # Only GitHub's release surface fails this way. Proxying zlib.net would
+        # turn a clear upstream answer into somebody else's outage.
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "zlib.tar.gz"
+            attempts = []
+
+            def fake_run(command, **kwargs):
+                attempts.append(command)
+                return subprocess.CompletedProcess(command, 22, "", "curl: (22) 504")
+
+            with mock.patch.object(self.fetch.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(self.fetch.time, "sleep"):
+                with self.assertRaisesRegex(ValueError, "Cannot download"):
+                    self.fetch.download("https://zlib.net/zlib-1.4.tar.gz", destination)
+            self.assertEqual(len(attempts), self.fetch.FETCH_ATTEMPTS)
+            for command in attempts:
+                self.assertNotIn("gh-proxy.org", command[-1])
+
+    def test_a_mirror_that_returns_different_bytes_is_refused(self):
+        # The pin is the whole reason a third-party mirror is safe to use: a mirror
+        # that rewrites, truncates or serves an error page must fail exactly like
+        # an upstream that changed the archive.
+        url = ("https://github.com/pcre2project/pcre2/releases/download/"
+               "pcre2-10.49/pcre2-10.49.tar.gz")
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            (work / "downloads").mkdir()
+            attempts = []
+
+            def fake_run(command, **kwargs):
+                attempts.append(command)
+                if len(attempts) <= self.fetch.FETCH_ATTEMPTS:
+                    return subprocess.CompletedProcess(command, 22, "", "curl: (22) 504")
+                Path(command[command.index("--output") + 1]).write_bytes(b"<html>nope</html>")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            entry = {"name": "pcre2", "url": url, "sha256": "0" * 64}
+            with mock.patch.object(self.fetch.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(self.fetch.time, "sleep"), \
+                    mock.patch.object(self.fetch, "content_type", return_value="text/html"):
+                with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+                    self.fetch.fetch_one(entry, work)
+            self.assertEqual(attempts[-1][-1], self.fetch.MIRROR + url)
+            # Nothing survives an archive that failed its pin.
+            self.assertFalse((work / "downloads" / "pcre2.tar.gz").exists())
+            self.assertFalse((work / "sources" / "pcre2").exists())
+
     def test_member_times_survive_extraction(self):
         # A generated file that looks newer than its source stops make from
         # trying to regenerate it with the packaged `missing` script, which fails
