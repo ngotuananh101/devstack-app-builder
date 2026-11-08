@@ -1,20 +1,23 @@
 # DevStack Runtime Builder
 
-Build Linux x86_64 standalone PHP CLI/FPM bundles and native Redis core binaries for DevStack. Consumers download versioned archives rather than compiling locally. Supported PHP series: **8.5, 8.4 (default), 8.3, 8.2**.
+Build Linux x86_64 standalone PHP CLI/FPM bundles, native Redis core binaries, and PostgreSQL server bundles for DevStack. Consumers download versioned archives rather than compiling locally. Supported PHP series: **8.5, 8.4 (default), 8.3, 8.2**; PostgreSQL series: **18 (default 18.6), 17 (17.11)**.
 
-Both runtimes are musl-only and have no profiles:
+All three runtimes are musl-only and have no profiles:
 
 - **PHP** is a `musl-dynamic` bundle: the main binaries and the fixed static baseline link against musl, and a fixed set of 20 extensions ships as shared modules (PHP 8.5 compiles OPcache into the binary instead, leaving 19 shared). The bundle carries its own musl loader (`lib/musl/ld-musl-x86_64.so.1`), which is also `libc.so`, so it needs no host libc and no host interpreter.
 - **Redis** is a fully static musl build: no interpreter, no `NEEDED` entries.
+- **PostgreSQL** is a `musl-dynamic` server bundle (18.x and 17.x): 37 client/server binaries and 85 extension modules link against the bundled musl loader, with OpenSSL shared and static zlib, libxml2, ICU, and libuuid. Locale collation uses the `builtin` provider with `C.UTF-8` (deterministic Unicode code-point order; alternate `PG_UNICODE_FAST` on 18.x), as musl does not provide glibc-compatible locale collation.
 
 ```bash
 ./build.sh php            # PHP 8.4, musl-dynamic
 ./build.sh php 8.3
 ./build.sh redis          # Redis 8.10.3, fully static musl
 ./build.sh redis 8.10.3
+./build.sh postgresql     # PostgreSQL 18.6, musl-dynamic
+./build.sh postgresql 17.11
 ```
 
-Native build dependencies must already be installed; the builder never installs host packages and never uses Docker. See [Redis build contracts](docs/runtimes/redis.md) and [PHP build contracts](docs/runtimes/php.md).
+Native build dependencies must already be installed; the builder never installs host packages and never uses Docker. See [Redis build contracts](docs/runtimes/redis.md), [PHP build contracts](docs/runtimes/php.md), and [PostgreSQL build contracts](docs/runtimes/postgresql.md).
 
 > CI run [42384737455](https://github.com/ngotuananh101/devstack-app-builder/actions/runs/42384737455) built and verified PHP 8.2.35, 8.3.36, 8.4.27 and 8.5.12 plus Redis 7.2.17, 7.4.12 and 8.10.3 on 2026-11-07 and published [Release `runtimes-20261107-musl-c95d643`](https://github.com/ngotuananh101/devstack-app-builder/releases/tag/runtimes-20261107-musl-c95d643). A native local PHP 8.4.27 run also covered functional checks for all 20 shared modules. Production input/legal gates remain unvalidated; see [local evidence](docs/runtimes/php.md#local-validation-evidence).
 
@@ -75,6 +78,7 @@ bundle/
   manifest.json
   spc-build-manifest.json
   share/licenses/{builder,musl}.txt
+  # postgresql: dist/postgresql/<version>/musl-dynamic/ (sample configs live in share/, no etc/)
 ```
 
 ## Test and distribute
@@ -83,7 +87,7 @@ bundle/
 python3 -I -m unittest discover -s tests -v
 ```
 
-Build output: `dist/php/<requested-version>/musl-dynamic/`. Verified archives: `dist/assets/php-<actual-patch>-musl-dynamic-<arch>-<build-id>.tar.gz` plus SHA-256 and JSON manifest sidecars. Tar preserves executable modes. Manifest includes actual patch/API/TS/modes, the static/shared split, loader provenance, relative paths, SPC/source provenance and ELF inventory.
+Build output: `dist/php/<requested-version>/musl-dynamic/` and `dist/postgresql/<version>/musl-dynamic/`. Verified archives: `dist/assets/php-<actual-patch>-musl-dynamic-<arch>-<build-id>.tar.gz` plus SHA-256 and JSON manifest sidecars. Tar preserves executable modes. Manifest includes actual patch/API/TS/modes, the static/shared split, loader provenance, relative paths, SPC/source provenance and ELF inventory.
 
 CI runs real PHP CLI/FPM module toggles, actual FastCGI requests, relocation with spaces, loader-digest/version checks, a hostile `LD_*` environment and ELF dependency checks before packaging. The workflow has no runtime, PHP-series, libc or profile input, and every trigger — daily schedule and manual alike — plans PHP **8.2–8.5** on `musl-dynamic` and every pinned Redis version (**8.10.3, 7.4.12, 7.2.17**) on `musl` (7 bundles). Push triggers remain disabled.
 
@@ -97,7 +101,9 @@ Scheduled builds automatically publish after **all selected PHP/Redis bundles** 
 
 - [Redis native builds and artifact contracts](docs/runtimes/redis.md)
 - [PHP architecture, launcher/manifest/download contracts](docs/runtimes/php.md)
+- [PostgreSQL architecture, launcher/manifest/locale contracts](docs/runtimes/postgresql.md)
 - [Runtime module](runtimes/php/README.md)
+- [PostgreSQL runtime module](runtimes/postgresql/README.md)
 - [Builder framework](docs/architecture.md)
 
 ## Adding a runtime

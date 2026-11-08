@@ -44,8 +44,8 @@ jobs:
       - name: Unit and installed contracts
         run: |
           python3 -I -m unittest discover -s tests -v
-          bash -n build.sh scripts/build.sh runtimes/php/scripts/*.sh runtimes/redis/scripts/*.sh
-          for script in runtimes/php/packaging/*; do sh -n "$script"; done
+          bash -n build.sh scripts/build.sh runtimes/php/scripts/*.sh runtimes/redis/scripts/*.sh runtimes/postgresql/scripts/*.sh
+          for script in runtimes/php/packaging/* runtimes/postgresql/packaging/*; do sh -n "$script"; done
 
   plan:
     runs-on: ubuntu-24.04
