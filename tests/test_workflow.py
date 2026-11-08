@@ -32,21 +32,29 @@ class WorkflowContracts(unittest.TestCase):
         self.assertNotIn("PROFILE_INPUT", planner)
         self.assertIn("scripts/updates.py", planner)
         self.assertIn("redis_matrix:", planner)
+        self.assertIn("apache_matrix:", planner)
         self.assertIn("BYPASS: ${{ inputs.bypass || false }}", planner)
         self.assertIn("  build-redis:\n", workflow, "Missing native Redis build job")
+        self.assertIn("  build-apache:\n", workflow, "Missing Apache build job")
         php = workflow.split("  build-php:\n", 1)[1].split("  build-redis:\n", 1)[0]
         self.assertIn('./build.sh php "$BUILD_VERSION"', php)
         self.assertNotIn("BUILD_TARGET", php)
         self.assertNotIn("BUILD_PROFILE", php)
-        redis = workflow.split("  build-redis:\n", 1)[1].split("  publish:\n", 1)[0]
+        redis = workflow.split("  build-redis:\n", 1)[1].split("  build-apache:\n", 1)[0]
         self.assertIn('./build.sh redis "$BUILD_VERSION"', redis)
         self.assertNotIn("BUILD_TARGET", redis)
         self.assertNotIn("BUILD_PROFILE", redis)
         self.assertNotIn("docker", redis.lower())
+        apache = workflow.split("  build-apache:\n", 1)[1].split("  publish:\n", 1)[0]
+        self.assertIn('./build.sh apache "$BUILD_VERSION"', apache)
+        self.assertNotIn("BUILD_TARGET", apache)
+        self.assertNotIn("BUILD_PROFILE", apache)
+        self.assertNotIn("docker", apache.lower(), "Apache builds must not use Docker")
         publish = workflow.split("  publish:\n", 1)[1]
-        self.assertIn("needs: [plan, build-php, build-redis]", publish)
+        self.assertIn("needs: [plan, build-php, build-redis, build-apache]", publish)
         self.assertIn("always()", publish)
         self.assertIn("needs.build-redis.result", publish)
+        self.assertIn("needs.build-apache.result", publish)
         self.assertIn("pattern: runtime-*", publish)
 
     def test_bypass_input_is_manual_only_and_defaults_to_version_checks(self):
@@ -189,20 +197,23 @@ class WorkflowContracts(unittest.TestCase):
         from test_updates import REPOSITORY
         # Scheduled and default manual runs check public versions; only bypass rebuilds
         # the whole matrix regardless of what is already published.
-        scenarios = (("schedule", False, False, False, 4, 3),
-                     ("schedule", True, False, False, 0, 3),
-                     ("schedule", False, True, False, 4, 0),
-                     ("schedule", True, True, False, 0, 0),
-                     ("workflow_dispatch", True, True, False, 0, 0),
-                     ("workflow_dispatch", False, True, False, 4, 0),
-                     ("workflow_dispatch", True, True, True, 4, 3),
-                     ("workflow_dispatch", False, False, True, 4, 3))
-        for event, php_current, redis_current, bypass, php_count, redis_count in scenarios:
+        apache_pins = sorted(json.loads((REPO / "runtimes/apache/config/sources.json").read_text())["versions"])
+        apache_count = len(apache_pins)
+        scenarios = (("schedule", False, False, False, False, 4, 3, apache_count),
+                     ("schedule", True, False, False, True, 0, 3, 0),
+                     ("schedule", False, True, False, False, 4, 0, apache_count),
+                     ("schedule", True, True, False, True, 0, 0, 0),
+                     ("workflow_dispatch", True, True, False, True, 0, 0, 0),
+                     ("workflow_dispatch", False, True, False, False, 4, 0, apache_count),
+                     ("workflow_dispatch", True, True, True, True, 4, 3, apache_count),
+                     ("workflow_dispatch", False, False, True, False, 4, 3, apache_count))
+        for event, php_current, redis_current, bypass, apache_current, php_count, redis_count, apache_rows in scenarios:
             with self.subTest(event=event, php_current=php_current, redis_current=redis_current, bypass=bypass), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 output = root / "output"
                 history = {(series, "musl-dynamic", "x86_64"): version for series, version in upstream.items()} if php_current else {}
                 redis_history = {(version, "musl", "x86_64"): version for version in ("8.10.3", "7.4.12", "7.2.17")} if redis_current else {}
+                apache_history = {(version, "musl-dynamic", "x86_64"): version for version in apache_pins} if apache_current else {}
                 env = {**os.environ, "PUBLISH": "false", "RELEASE_TAG": "", "BYPASS": str(bypass).lower(),
                        "GITHUB_OUTPUT": str(output), "GITHUB_EVENT_NAME": event, "GITHUB_REPOSITORY": REPOSITORY,
                        "GITHUB_SHA": "a" * 40, "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}
@@ -212,17 +223,21 @@ class WorkflowContracts(unittest.TestCase):
                 argv = args[2:]
                 argv[argv.index("--output") + 1] = str(root / "runtime-update-plan.json")
                 argv[argv.index("--github-output") + 1] = str(output)
-                with patch.dict(os.environ, env, clear=True), patch("sys.argv", argv), patch.object(planner.php, "latest_php", side_effect=upstream.__getitem__), patch.object(planner.php, "published_versions", return_value=history), patch.object(planner, "published_redis", return_value=redis_history):
+                with patch.dict(os.environ, env, clear=True), patch("sys.argv", argv), patch.object(planner.php, "latest_php", side_effect=upstream.__getitem__), patch.object(planner.php, "published_versions", return_value=history), patch.object(planner, "published_redis", return_value=redis_history), patch.object(planner, "published_apache", return_value=apache_history):
                     planner.main()
                 policy = json.loads((root / "runtime-update-plan.json").read_text())
                 outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
                 rows = policy["matrix"]["include"]
-                self.assertEqual(outputs["has_updates"], "true" if php_count or redis_count else "false")
+                selected = bool(php_count or redis_count or apache_rows)
+                self.assertEqual(outputs["has_updates"], "true" if selected else "false")
                 self.assertEqual(outputs["has_php_updates"], "true" if php_count else "false")
                 self.assertEqual(outputs["has_redis_updates"], "true" if redis_count else "false")
-                self.assertEqual(outputs["publish"], "true" if event == "schedule" and (php_count or redis_count) else "false")
+                self.assertEqual(outputs["has_apache_updates"], "true" if apache_rows else "false")
+                self.assertEqual(outputs["publish"], "true" if event == "schedule" and selected else "false")
                 self.assertEqual(json.loads(outputs["matrix"]), policy["matrix"])
                 self.assertEqual(json.loads(outputs["redis_matrix"]), policy["redis_matrix"])
+                self.assertEqual(json.loads(outputs["apache_matrix"]), policy["apache_matrix"])
+                self.assertEqual(len(policy["apache_matrix"]["include"]), apache_rows)
                 self.assertEqual(len(rows), php_count)
                 self.assertEqual(len(policy["redis_matrix"]["include"]), redis_count)
                 if rows:
@@ -237,7 +252,7 @@ class WorkflowContracts(unittest.TestCase):
         php = workflow.split("  build-php:\n", 1)[1].split("  build-redis:\n", 1)[0]
         publish = workflow.split("  publish:\n", 1)[1]
         self.assertIn("if: needs.plan.outputs.has_php_updates == 'true'", php)
-        self.assertIn("needs: [plan, build-php, build-redis]", publish)
+        self.assertIn("needs: [plan, build-php, build-redis, build-apache]", publish)
         self.assertIn("name: publication-plan", publish)
         self.assertIn("--plan dist/plans/runtime-update-plan.json", publish)
         self.assertIn("group: runtime-build-publication", workflow)
@@ -253,14 +268,17 @@ class WorkflowContracts(unittest.TestCase):
         expression = expression.removeprefix("${{").removesuffix("}}").strip()
         # Evaluate our emitted boolean expression over the entire small state space.
         states = ("success", "failure", "cancelled", "skipped")
-        for cancelled, plan_result, publish_enabled, php_selected, redis_selected, php_result, redis_result in itertools.product((False, True), states, (False, True), (False, True), (False, True), states, states):
+        for cancelled, plan_result, publish_enabled, php_selected, redis_selected, apache_selected, php_result, redis_result, apache_result in itertools.product((False, True), states, (False, True), (False, True), (False, True), (False, True), states, states, states):
             expected = (not cancelled and plan_result == "success" and publish_enabled
                         and php_result == ("success" if php_selected else "skipped")
-                        and redis_result == ("success" if redis_selected else "skipped"))
+                        and redis_result == ("success" if redis_selected else "skipped")
+                        and apache_result == ("success" if apache_selected else "skipped"))
             values = {"needs.plan.result": plan_result, "needs.plan.outputs.publish": str(publish_enabled).lower(),
                       "needs.plan.outputs.has_php_updates": str(php_selected).lower(),
                       "needs.plan.outputs.has_redis_updates": str(redis_selected).lower(),
-                      "needs.build-php.result": php_result, "needs.build-redis.result": redis_result}
+                      "needs.plan.outputs.has_apache_updates": str(apache_selected).lower(),
+                      "needs.build-php.result": php_result, "needs.build-redis.result": redis_result,
+                      "needs.build-apache.result": apache_result}
             candidate = expression.replace("always()", "True").replace("!cancelled()", repr(not cancelled))
             for name, value in values.items():
                 candidate = candidate.replace(name, repr(value))

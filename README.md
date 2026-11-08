@@ -1,20 +1,23 @@
 # DevStack Runtime Builder
 
-Build Linux x86_64 standalone PHP CLI/FPM bundles and native Redis core binaries for DevStack. Consumers download versioned archives rather than compiling locally. Supported PHP series: **8.5, 8.4 (default), 8.3, 8.2**.
+Build Linux x86_64 standalone PHP CLI/FPM bundles, native Redis core binaries and Apache httpd bundles for DevStack. Consumers download versioned archives rather than compiling locally. Supported PHP series: **8.5, 8.4 (default), 8.3, 8.2**.
 
-Both runtimes are musl-only and have no profiles:
+All runtimes are musl-only and have no profiles:
 
 - **PHP** is a `musl-dynamic` bundle: the main binaries and the fixed static baseline link against musl, and a fixed set of 20 extensions ships as shared modules (PHP 8.5 compiles OPcache into the binary instead, leaving 19 shared). The bundle carries its own musl loader (`lib/musl/ld-musl-x86_64.so.1`), which is also `libc.so`, so it needs no host libc and no host interpreter.
 - **Redis** is a fully static musl build: no interpreter, no `NEEDED` entries.
+- **Apache httpd 2.4.70** is a `musl-dynamic` bundle shaped like the Windows Apache Lounge build: 126 shared modules, all three MPMs, and every dependency (OpenSSL, PCRE2, brotli, nghttp2, jansson, curl, expat, libxml2, Lua, OpenLDAP, sqlite3, unixODBC, APR, APR-util) built from a pinned source into the bundle.
 
 ```bash
 ./build.sh php            # PHP 8.4, musl-dynamic
 ./build.sh php 8.3
 ./build.sh redis          # Redis 8.10.3, fully static musl
 ./build.sh redis 8.10.3
+./build.sh apache         # Apache httpd 2.4.70, musl-dynamic
+./build.sh apache 2.4.70 --mpm worker
 ```
 
-Native build dependencies must already be installed; the builder never installs host packages and never uses Docker. See [Redis build contracts](docs/runtimes/redis.md) and [PHP build contracts](docs/runtimes/php.md).
+Native build dependencies must already be installed; the builder never installs host packages and never uses Docker. See [Redis build contracts](docs/runtimes/redis.md), [PHP build contracts](docs/runtimes/php.md) and [Apache httpd build contracts](docs/runtimes/apache.md).
 
 > CI run [42384737455](https://github.com/ngotuananh101/devstack-app-builder/actions/runs/42384737455) built and verified PHP 8.2.35, 8.3.36, 8.4.27 and 8.5.12 plus Redis 7.2.17, 7.4.12 and 8.10.3 on 2026-11-07 and published [Release `runtimes-20261107-musl-c95d643`](https://github.com/ngotuananh101/devstack-app-builder/releases/tag/runtimes-20261107-musl-c95d643). A native local PHP 8.4.27 run also covered functional checks for all 20 shared modules. Production input/legal gates remain unvalidated; see [local evidence](docs/runtimes/php.md#local-validation-evidence).
 
@@ -77,6 +80,22 @@ bundle/
   share/licenses/{builder,musl}.txt
 ```
 
+## Apache bundle usage
+
+```bash
+RUNTIME="/home/me/.local/share/devstack/Apache 2.4"
+"$RUNTIME/bin/httpd" -V              # always passes -d "$ROOT": the bundle's own ServerRoot
+"$RUNTIME/bin/httpd" -t              # config test
+"$RUNTIME/bin/apachectl" start       # wrapper around bin/httpd -k; not a service manager
+"$RUNTIME/bin/openssl" version
+
+# Port 80 (what the shipped httpd.conf says) needs a capability on the loader,
+# because the loader, not the shell launcher, is the file the kernel executes:
+sudo setcap cap_net_bind_service=+ep "$RUNTIME/lib/musl/ld-musl-x86_64.so.1"
+```
+
+Real ELFs live in `libexec/bin/` and are never run directly; `bin/` holds `sh` launchers that start the bundled loader with the bundle's own library path. `conf/httpd.conf` is Lounge's shape — `Define SRVROOT "${APACHE_SERVER_ROOT}"`, `Listen 80`, `${SRVROOT}/htdocs`, `#LoadModule x_module modules/mod_x.so` — and is relocatable with the tree. `suexec` ships unlaunched in `libexec/bin/` because it must be a root-owned setuid binary. `mod_proxy_fcgi` ships and is verified but is not wired to PHP for you; configuring a DevStack site is the consumer's job.
+
 ## Test and distribute
 
 ```bash
@@ -85,11 +104,13 @@ python3 -I -m unittest discover -s tests -v
 
 Build output: `dist/php/<requested-version>/musl-dynamic/`. Verified archives: `dist/assets/php-<actual-patch>-musl-dynamic-<arch>-<build-id>.tar.gz` plus SHA-256 and JSON manifest sidecars. Tar preserves executable modes. Manifest includes actual patch/API/TS/modes, the static/shared split, loader provenance, relative paths, SPC/source provenance and ELF inventory.
 
-CI runs real PHP CLI/FPM module toggles, actual FastCGI requests, relocation with spaces, loader-digest/version checks, a hostile `LD_*` environment and ELF dependency checks before packaging. The workflow has no runtime, PHP-series, libc or profile input, and every trigger — daily schedule and manual alike — plans PHP **8.2–8.5** on `musl-dynamic` and every pinned Redis version (**8.10.3, 7.4.12, 7.2.17**) on `musl` (7 bundles). Push triggers remain disabled.
+CI runs real PHP CLI/FPM module toggles, actual FastCGI requests, relocation with spaces, loader-digest/version checks, a hostile `LD_*` environment and ELF dependency checks before packaging. The workflow has no runtime, PHP-series, libc or profile input, and every trigger — daily schedule and manual alike — plans PHP **8.2–8.5** on `musl-dynamic`, every pinned Redis version (**8.10.3, 7.4.12, 7.2.17**) on `musl`, and the pinned Apache httpd version on `musl-dynamic`. Push triggers remain disabled.
 
-The planner always compares against public releases. PHP compares each php.net stable patch with the highest public `musl-dynamic`/x86_64 bundle for the same series across paginated runtime releases; retired static `glibc`/`musl` archives are recognised and ignored. Redis selects pinned exact-version bundles that are not yet published; it does not discover or approve unpinned upstream releases. Only newer/missing PHP bundles and missing Redis bundles build, so a manual run behaves exactly like the daily check by default. Each runtime can independently be a no-op; both being current skips all builds/publication, and a manual run over already-published versions builds nothing. The manual-only `bypass=true` input skips that comparison and rebuilds every series and pinned Redis version. API or malformed relevant metadata failures fail closed.
+The Apache job builds all 16 vendored dependencies, runs the server, and checks HTTP, TLS 1.2/1.3 with HTTP/2 ALPN, FastCGI, DAV, a sqlite3 DBD login, Lua and the compressors in the relocated bundle before anything is packaged.
 
-Scheduled builds automatically publish after **all selected PHP/Redis bundles** pass, including a Redis-only or PHP-only update. The shared exact-patch plan is preserved as `runtime-update-plan.json`; skipped empty matrices are allowed, but a failed or cancelled required build blocks publication. The `runtime-releases` job has `contents: write` and retains its environment (required reviewers, if configured, delay automation). Tags are unique `runtimes-<UTC-date>-<run-id>-<attempt>`. Publication checks the persisted plan, creates a draft, uploads archive/checksum/manifest sets, and only then makes the Release public; failures leave a draft and never overwrite assets. English notes describe actual PHP/Redis versions, PHP module inventories, Redis static-musl requirements, checksums and build/workflow links. Drafts/prereleases are not a version baseline. Manual publication remains opt-in (`publish=true`, a new `runtimes-...` tag). The first public Release, `runtimes-20261107-musl-c95d643`, was published on 2026-11-07 from CI run 42384737455 with 21 assets. Consumers use the public Releases API/asset URLs without GitHub credentials and verify checksums before extracting into a new directory.
+The planner always compares against public releases. PHP compares each php.net stable patch with the highest public `musl-dynamic`/x86_64 bundle for the same series across paginated runtime releases; retired static `glibc`/`musl` archives are recognised and ignored. Redis and Apache select pinned exact-version bundles that are not yet published; neither discovers or approves unpinned upstream releases. Only newer/missing PHP bundles and missing Redis/Apache bundles build, so a manual run behaves exactly like the daily check by default. Each of the three runtimes can independently be a no-op; all being current skips all builds/publication, and a manual run over already-published versions builds nothing. The manual-only `bypass=true` input skips that comparison and rebuilds every series and every pinned Redis/Apache version. API or malformed relevant metadata failures fail closed.
+
+Scheduled builds automatically publish after **all selected PHP/Redis/Apache bundles** pass, including when only one runtime has an update. The shared exact-patch plan is preserved as `runtime-update-plan.json`; skipped empty matrices are allowed, but a failed or cancelled required build blocks publication. The `runtime-releases` job has `contents: write` and retains its environment (required reviewers, if configured, delay automation). Tags are unique `runtimes-<UTC-date>-<run-id>-<attempt>`. Publication checks the persisted plan, creates a draft, uploads archive/checksum/manifest sets, and only then makes the Release public; failures leave a draft and never overwrite assets. English notes describe actual PHP/Redis/Apache versions, PHP module inventories, Redis static-musl requirements, the Apache module/MPM inventory, checksums and build/workflow links. Drafts/prereleases are not a version baseline. Manual publication remains opt-in (`publish=true`, a new `runtimes-...` tag). The first public Release, `runtimes-20261107-musl-c95d643`, was published on 2026-11-07 from CI run 42384737455 with 21 assets. Consumers use the public Releases API/asset URLs without GitHub credentials and verify checksums before extracting into a new directory.
 
 **Remaining production gates:** simultaneous distinct PHP minors installed side by side, a reviewed pre-extraction version/URL/SHA-256 policy for libraries/extensions and the exact toolchain, complete prepared-toolchain provenance, and third-party legal notices. The full musl-dynamic extension matrix did run in CI (PHP 8.2–8.5 plus every pinned Redis version), but that does not satisfy the input gates below. Stable PHP has upstream php.net checksum validation, not a repository-pinned exact-patch lock. SPDX/signing/attestation are not supplied. Post-build source hashing is not pre-build authentication; do not approve production builds/releases until these input gates are in place.
 
@@ -97,6 +118,7 @@ Scheduled builds automatically publish after **all selected PHP/Redis bundles** 
 
 - [Redis native builds and artifact contracts](docs/runtimes/redis.md)
 - [PHP architecture, launcher/manifest/download contracts](docs/runtimes/php.md)
+- [Apache httpd builds, module set and bundle contract](docs/runtimes/apache.md)
 - [Runtime module](runtimes/php/README.md)
 - [Builder framework](docs/architecture.md)
 

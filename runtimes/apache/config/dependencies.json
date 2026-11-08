@@ -1,0 +1,133 @@
+{
+  "comment": "Every dependency is built from source into the bundle. Digests were reviewed against the publisher checksum where the project publishes one.",
+  "dependencies": [
+    {
+      "name": "musl",
+      "version": "1.2.5",
+      "url": "https://musl.libc.org/releases/musl-1.2.5.tar.gz",
+      "sha256": "a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4",
+      "license": "MIT",
+      "role": "loader"
+    },
+    {
+      "name": "zlib",
+      "version": "1.3.2",
+      "url": "https://zlib.net/fossils/zlib-1.3.2.tar.gz",
+      "sha256": "bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16",
+      "license": "Zlib",
+      "role": "link"
+    },
+    {
+      "name": "openssl",
+      "version": "3.0.22",
+      "url": "https://github.com/openssl/openssl/releases/download/openssl-3.0.22/openssl-3.0.22.tar.gz",
+      "sha256": "67ebca7e50d17383028045486653492195b83db95f8558709701bb47b5c1ef81",
+      "license": "Apache-2.0",
+      "role": "link"
+    },
+    {
+      "name": "pcre2",
+      "version": "10.49",
+      "url": "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.49/pcre2-10.49.tar.gz",
+      "sha256": "929f0b20e62879252a15886b06c89f1edef61a363cbd5826fb041080a5e557ae",
+      "license": "BSD-3-Clause",
+      "role": "link"
+    },
+    {
+      "name": "brotli",
+      "version": "1.2.1",
+      "url": "https://github.com/google/brotli/archive/refs/tags/v1.2.1.tar.gz",
+      "sha256": "98d35d11a78dc453aebb7d10c3748f3f73ff78c8267c0dc697b8631f67bf7e8f",
+      "license": "MIT",
+      "role": "link"
+    },
+    {
+      "name": "nghttp2",
+      "version": "1.71.0",
+      "url": "https://github.com/nghttp2/nghttp2/releases/download/v1.71.0/nghttp2-1.71.0.tar.gz",
+      "sha256": "0cdd35ecec77919b4b7b245f87fe8d2216e3d62da854eb0838c594ff058042fc",
+      "license": "MIT",
+      "role": "link"
+    },
+    {
+      "name": "jansson",
+      "version": "2.14",
+      "url": "https://github.com/akheron/jansson/releases/download/v2.14/jansson-2.14.tar.gz",
+      "sha256": "5798d010e41cf8d76b66236cfb2f2543c8d082181d16bc3085ab49538d4b9929",
+      "license": "MIT",
+      "role": "link"
+    },
+    {
+      "name": "expat",
+      "version": "2.10.0",
+      "url": "https://github.com/libexpat/libexpat/releases/download/R_2_10_0/expat-2.10.0.tar.gz",
+      "sha256": "5466a341f9c692ef7a958a6881311be597f8e1ce345984cf78414f54793dea4c",
+      "license": "MIT",
+      "role": "link"
+    },
+    {
+      "name": "libxml2",
+      "version": "2.15.4",
+      "url": "https://download.gnome.org/sources/libxml2/2.15/libxml2-2.15.4.tar.xz",
+      "sha256": "98087fd181d9070724f3fbc65c7377db03038eb92bd882374daff44940138821",
+      "license": "MIT",
+      "role": "link"
+    },
+    {
+      "name": "lua",
+      "version": "5.4.9",
+      "url": "https://www.lua.org/ftp/lua-5.4.9.tar.gz",
+      "sha256": "2335b6c582a52654f94612bf10d2f4672805d05329aa6568b1d8cd9e5c6fb8e6",
+      "license": "MIT",
+      "role": "link"
+    },
+    {
+      "name": "openldap",
+      "version": "2.6.16",
+      "url": "https://www.openldap.org/software/download/OpenLDAP/openldap-release/openldap-2.6.16.tgz",
+      "sha256": "8d8452bc3f56aa7a392c62dd377733f83d1314eed6c52fe44028439a3bb4df18",
+      "license": "OpenLDAP",
+      "role": "link"
+    },
+    {
+      "name": "sqlite",
+      "version": "3.54.1",
+      "url": "https://www.sqlite.org/2026/sqlite-autoconf-3540100.tar.gz",
+      "sha256": "926ef8d3eab93fbf6e06011901273eec076b25594a4e1cdadd50c987f4f6d64e",
+      "license": "Public Domain",
+      "role": "dbd"
+    },
+    {
+      "name": "unixodbc",
+      "version": "2.3.14",
+      "url": "https://www.unixodbc.org/unixODBC-2.3.14.tar.gz",
+      "sha256": "4e2814de3e01fc30b0b9f75e83bb5aba91ab0384ee951286504bb70205524771",
+      "license": "LGPL-2.1",
+      "role": "dbd"
+    },
+    {
+      "name": "curl",
+      "version": "8.23.0",
+      "url": "https://github.com/curl/curl/releases/download/curl-8_23_0/curl-8.23.0.tar.gz",
+      "sha256": "e3de77cfa6367083c776a26647fc9f633b538c06c3baa73d931a252ac8f72b49",
+      "license": "curl",
+      "role": "link"
+    },
+    {
+      "name": "apr",
+      "version": "1.7.6",
+      "url": "https://downloads.apache.org/apr/apr-1.7.6.tar.gz",
+      "sha256": "6a10e7f7430510600af25fabf466e1df61aaae910bf1dc5d10c44a4433ccc81d",
+      "license": "Apache-2.0",
+      "role": "core"
+    },
+    {
+      "name": "apr-util",
+      "version": "1.6.6",
+      "url": "https://downloads.apache.org/apr/apr-util-1.6.6.tar.gz",
+      "sha256": "acd5f38440eda830e40c4fe35c2a6b8119493cfdba9c9d73d985c317beb4e4f8",
+      "license": "Apache-2.0",
+      "role": "core"
+    }
+  ]
+}

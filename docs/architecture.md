@@ -25,11 +25,15 @@ devstack-runtime-builder/
 │   │       └── musl-dynamic/
 │   ├── redis/
 │   │   └── <version>/musl/
+│   ├── apache/
+│   │   └── <version>/musl-dynamic/
 │   └── <runtime>/
 ├── docs/                     # Documentation and architecture guides
 │   ├── architecture.md
 │   └── runtimes/
-│       └── php.md
+│       ├── php.md
+│       ├── redis.md
+│       └── apache.md
 └── .github/
     └── workflows/
         └── build.yml         # Matrix build CI workflow
@@ -52,6 +56,7 @@ Every runtime directory under `runtimes/<name>` adheres to the following contrac
 ## Supported Runtimes
 
 - [Redis](runtimes/redis.md): Native Linux x86_64 source builds, fully static musl only; no profiles, Docker or service configuration.
+- [Apache httpd (2.4.x)](runtimes/apache.md): `musl-dynamic` bundle shaped like the Windows Apache Lounge build — 126 shared modules, all three MPMs, every dependency (OpenSSL, PCRE2, brotli, nghttp2, jansson, curl, expat, libxml2, Lua, OpenLDAP, sqlite3, unixODBC, APR, APR-util) built from a pinned source, and a bundled musl loader. One pinned exact version; no profiles.
 - [PHP (8.5, 8.4, 8.3, 8.2)](runtimes/php.md): Single `musl-dynamic` target — musl-linked binaries with a fixed static baseline, 20 shared `.so` extensions (19 on PHP 8.5, which compiles OPcache into the binary), and a bundled musl loader — with independent CLI and FPM SAPI support. Custom PHP versions can be specified at build time.
 
 ## Adding New Runtimes
