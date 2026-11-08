@@ -30,6 +30,27 @@ def _load_exclusions() -> dict[str, str]:
 EXCLUSIONS: dict[str, str] = _load_exclusions()
 
 
+def _load_major_exclusions() -> dict[str, dict[str, str]]:
+    if CONFIG.is_file():
+        data = json.loads(CONFIG.read_text())
+        return {major: dict(reasons)
+                for major, reasons in data.get("major_exclusions", {}).items()}
+    return {}
+
+
+def exclusions_for(major: str) -> dict[str, str]:
+    """The exclusions that apply to one major, flat ones first.
+
+    Some modules exist in one major only — `pg_logicalinspect` arrived in 18,
+    `pg_overexplain` in 18 — so a single flat map cannot describe what a
+    bundle of a given major lacks. Recording such a module flatly would make
+    the other major's manifest claim it was excluded while also including it.
+    """
+    if not isinstance(major, str) or major not in MAJORS:
+        raise ValueError(f"Unsupported major {major!r}; supported majors are {MAJORS}")
+    return {**EXCLUSIONS, **_load_major_exclusions().get(major, {})}
+
+
 def inventory(install_root: Path) -> list[dict]:
     """Inventory installed extensions and tools for either built or staged bundles."""
     install_root = Path(install_root)

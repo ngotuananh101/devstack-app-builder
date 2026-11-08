@@ -585,7 +585,7 @@ def stage(install_root, output, request, provenance, repo_root):
         "modules": {
             "included": inventory,
             "skipped": [{"name": name, "reason": reason}
-                        for name, reason in sorted(modules.EXCLUSIONS.items())],
+                        for name, reason in sorted(modules.exclusions_for(major).items())],
         },
         "binaries": [
             {"path": f"libexec/bin/{path.name}", "sha256": digest(path), **elf(path)}
@@ -1364,9 +1364,14 @@ def package(bundle, output):
     manifest = json.loads((bundle / "manifest.json").read_text())
     if manifest.get("runtime") != "postgresql" or manifest.get("verification") != "PASSED":
         raise ValueError("Real PostgreSQL verification must pass before packaging")
-    parts = [manifest["postgresql"]["version"], manifest["target"],
-             manifest["architecture"], manifest["build_id"]]
-    if any(not re.fullmatch(r"[a-zA-Z0-9_.-]+", str(part)) for part in parts):
+    version = manifest.get("postgresql")
+    version = version.get("version") if isinstance(version, dict) else None
+    parts = [version, manifest.get("target"), manifest.get("architecture"),
+             manifest.get("build_id")]
+    # A part that is missing or not a string is a broken manifest, not an
+    # archive name: str() would happily turn None into "None" here.
+    if any(not isinstance(part, str) or not re.fullmatch(r"[a-zA-Z0-9_.-]+", part)
+           for part in parts):
         raise ValueError("Invalid PostgreSQL archive identity")
     name = "postgresql-" + "-".join(parts)
     output.mkdir(parents=True, exist_ok=True)

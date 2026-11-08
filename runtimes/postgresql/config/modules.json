@@ -1,5 +1,5 @@
 {
-  "generated_from": "18.6/17.11 design contract",
+  "generated_from": "17.11 and 18.6 install trees",
   "17": {
     "sql": [
       "amcheck",
@@ -26,7 +26,6 @@
       "pageinspect",
       "pg_buffercache",
       "pg_freespacemap",
-      "pg_logicalinspect",
       "pg_prewarm",
       "pg_stat_statements",
       "pg_surgery",
@@ -56,7 +55,44 @@
       "basic_archive",
       "passwordcheck"
     ],
-    "shared": [],
+    "shared": [
+      "_int",
+      "cyrillic_and_mic",
+      "dict_snowball",
+      "euc2004_sjis2004",
+      "euc_cn_and_mic",
+      "euc_jp_and_sjis",
+      "euc_kr_and_mic",
+      "euc_tw_and_big5",
+      "latin2_and_win1250",
+      "latin_and_mic",
+      "libcrypto",
+      "libecpg",
+      "libecpg_compat",
+      "libpgtypes",
+      "libpq",
+      "libpqwalreceiver",
+      "libssl",
+      "pgoutput",
+      "pgxml",
+      "test_decoding",
+      "utf8_and_big5",
+      "utf8_and_cyrillic",
+      "utf8_and_euc2004",
+      "utf8_and_euc_cn",
+      "utf8_and_euc_jp",
+      "utf8_and_euc_kr",
+      "utf8_and_euc_tw",
+      "utf8_and_gb18030",
+      "utf8_and_gbk",
+      "utf8_and_iso8859",
+      "utf8_and_iso8859_1",
+      "utf8_and_johab",
+      "utf8_and_sjis",
+      "utf8_and_sjis2004",
+      "utf8_and_uhc",
+      "utf8_and_win"
+    ],
     "cli": [
       "oid2name",
       "vacuumlo"
@@ -173,5 +209,10 @@
     "ltree_plpython": "Python embedding is not part of this bundle.",
     "pltcl": "Tcl embedding is not part of this bundle.",
     "sepgsql": "Requires a SELinux policy; meaningless in a portable bundle."
+  },
+  "major_exclusions": {
+    "17": {
+      "pg_logicalinspect": "Added upstream in PostgreSQL 18; 17 has no such contrib module."
+    }
   }
 }

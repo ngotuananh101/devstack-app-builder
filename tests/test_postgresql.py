@@ -414,6 +414,59 @@ class PostgreSQLModulesTests(unittest.TestCase):
             self.assertIn(name, self.modules.EXCLUSIONS)
             self.assertTrue(self.modules.EXCLUSIONS[name].strip())
 
+    def test_a_major_specific_exclusion_never_leaks_into_the_other_major(self):
+        # pg_logicalinspect arrived upstream in 18 (release-18.sgml: "Add
+        # contrib/pg_logicalinspect"), so 17 must not expect it. Recording it
+        # as a flat exclusion would be wrong in the other direction: 18 does
+        # include it, and a manifest that listed it as skipped while also
+        # listing it as included would contradict itself.
+        expected17 = self.modules.load_expected("17")
+        expected18 = self.modules.load_expected("18")
+        self.assertNotIn("pg_logicalinspect", expected17["sql"])
+        self.assertIn("pg_logicalinspect", expected18["sql"])
+        self.assertEqual(self.modules.exclusions_for("17")["pg_logicalinspect"],
+                         "Added upstream in PostgreSQL 18; 17 has no such contrib module.")
+        # Everything the flat map holds applies to both majors, and per-major
+        # reasons are visible through the per-major view too.
+        for major in ("17", "18"):
+            with self.subTest(major=major):
+                view = self.modules.exclusions_for(major)
+                for name, reason in self.modules.EXCLUSIONS.items():
+                    self.assertEqual(view[name], reason, name)
+
+    def test_manifest_skipped_lists_only_what_that_major_actually_lacks(self):
+        # The per-major view is what stage() records, so a 18 bundle must not
+        # claim pg_logicalinspect was excluded.
+        for major in ("17", "18"):
+            with self.subTest(major=major):
+                skipped = self.modules.exclusions_for(major)
+                if major == "18":
+                    self.assertNotIn("pg_logicalinspect", skipped)
+                else:
+                    self.assertIn("pg_logicalinspect", skipped)
+
+    def test_major_exclusions_are_well_formed_and_never_contradict_an_expected_module(self):
+        # A per-major exclusion naming a module that major's expected set still
+        # contains would make the manifest assert both "skipped" and "included"
+        # for it. Refuse that shape rather than trust whoever edits the file.
+        data = json.loads(self.modules.CONFIG.read_text())
+        major_exclusions = data.get("major_exclusions", {})
+        for major, reasons in major_exclusions.items():
+            with self.subTest(major=major):
+                self.assertIn(major, self.modules.MAJORS)
+                self.assertIsInstance(reasons, dict)
+                expected = self.modules.load_expected(major)
+                for name, reason in reasons.items():
+                    self.assertIsInstance(reason, str)
+                    self.assertTrue(reason.strip(), name)
+                    self.assertNotIn(name, expected["sql"])
+                    self.assertNotIn(name, expected["preload"])
+        # And exclusions_for refuses a major it cannot answer for, rather than
+        # quietly returning the flat map.
+        for major in ("16", "19", "", None):
+            with self.subTest(major=major), self.assertRaises(ValueError):
+                self.modules.exclusions_for(major)
+
     def test_seventeen_expects_no_pg_overexplain(self):
         expected17 = self.modules.load_expected("17")
         self.assertNotIn("pg_overexplain", expected17["preload"])
@@ -1474,6 +1527,20 @@ class PostgreSQLPackageTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         self.bundle.package(bundle, root / "assets")
 
+    def test_packaging_refuses_a_manifest_missing_an_identity_part(self):
+        # A missing key must be a refusal naming the identity, not a KeyError
+        # and not an archive called "postgresql-None-...".
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for key in ("postgresql", "target", "architecture", "build_id"):
+                with self.subTest(key=key):
+                    bundle, manifest = self.staged(root / key)
+                    self.mark_passed(bundle, manifest)
+                    manifest.pop(key)
+                    (bundle / "manifest.json").write_text(json.dumps(manifest))
+                    with self.assertRaisesRegex(ValueError, "identity"):
+                        self.bundle.package(bundle, root / "assets")
+
     def test_packaging_preserves_executable_modes_and_launchers(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -1641,9 +1708,11 @@ class PostgreSQLConfigReconciliationTests(unittest.TestCase):
     def test_the_committed_config_matches_every_installed_bundle(self):
         # Only meaningful where the real bundles exist (this branch's build
         # host); a clean checkout skips rather than asserting on absent trees.
+        # The manifest is the marker: stage() writes it last, so a directory
+        # without one is a refused or interrupted build, not a bundle.
         for version in ("17.11", "18.6"):
             tree = ROOT / "dist/postgresql" / version / "musl-dynamic"
-            if not tree.is_dir():
+            if not (tree / "manifest.json").is_file():
                 continue
             manifest = json.loads((tree / "manifest.json").read_text())
             major = manifest["postgresql"]["major"]
