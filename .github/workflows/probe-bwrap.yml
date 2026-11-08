@@ -1,0 +1,71 @@
+name: Probe bwrap on the runner
+
+# Temporary diagnostic. Establishes, on a real GitHub-hosted ubuntu-24.04
+# runner, which restriction stops `bwrap` from creating the user namespace that
+# PostgreSQL verification needs, and whether anything a workflow step may do
+# lifts it. Delete this file once the answer is recorded in the docs.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Baseline
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends bubblewrap
+          echo "bwrap: $(bwrap --version 2>&1)"
+          echo "kernel: $(uname -r)"
+          echo "--- apparmor restrict:"; sysctl kernel.apparmor_restrict_unprivileged_userns 2>&1 || echo "(no such sysctl)"
+          echo "--- apparmor_restrict_unprivileged_unconfined:"; sysctl kernel.apparmor_restrict_unprivileged_unconfined 2>&1 || echo "(no such sysctl)"
+          echo "--- baseline bwrap:"
+          bwrap --dev-bind / / -- /bin/true 2>&1 | tail -3; echo "exit=$?"
+          echo "--- baseline unshare:"
+          unshare -Ur -- /bin/true 2>&1 | tail -3; echo "exit=$?"
+
+      - name: After disabling the sysctl
+        run: |
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          elif sysctl kernel.apparmor_restrict_unprivileged_unconfined >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_unconfined=0
+          else
+            echo "(no apparmor userns sysctl present)"
+          fi
+          echo "--- bwrap after sysctl:"
+          bwrap --dev-bind / / -- /bin/true 2>&1 | tail -3; echo "exit=$?"
+          echo "--- unshare after sysctl:"
+          unshare -Ur -- /bin/true 2>&1 | tail -3; echo "exit=$?"
+          echo "--- with a filesystem mask, the shape verification uses:"
+          w=$(mktemp -d)
+          : > "$w/poison"
+          bwrap --dev-bind / / --ro-bind "$w/poison" /lib/ld-musl-x86_64.so.1 -- /bin/sh -c 'exit 0' 2>&1 | tail -3; echo "exit=$?"
+          rm -rf "$w"
+
+      - name: AppArmor profile for bwrap
+        run: |
+          sudo tee /etc/apparmor.d/bwrap-userns-restrict >/dev/null <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+          profile bwrap-userns-restrict /usr/bin/bwrap flags=(unconfined) {
+            userns,
+            include if exists <local/bwrap-userns-restrict>
+          }
+          PROFILE
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict 2>&1 || echo "apparmor_parser failed"
+          echo "--- bwrap with a profile (sysctl still off):"
+          bwrap --dev-bind / / -- /bin/true 2>&1 | tail -3; echo "exit=$?"
+
+      - name: After restoring the sysctl, with the profile loaded
+        run: |
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1
+          fi
+          echo "--- sysctl restored to: $(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo n/a)"
+          echo "--- bwrap with the profile loaded:"
+          bwrap --dev-bind / / -- /bin/true 2>&1 | tail -3; echo "exit=$?"
