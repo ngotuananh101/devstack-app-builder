@@ -14,6 +14,7 @@ exercises every included module with a query that fails if the module did not
 link. It reports PASSED only after all of that returns.
 """
 import argparse
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -1046,6 +1047,12 @@ def smoke(root, manifest, env=None):
         exercised.extend(_round_trip(root, env, plan))
         # Step 7: ICU ordering, or its absence as a checked fact.
         exercised.append(_icu(root, manifest, env))
+        # Step 7b: the alternate builtin collation, when the manifest promises
+        # one. 18 records PG_UNICODE_FAST; 17 records null, so this contributes
+        # no row at all and the check count stays flat.
+        alternate = _alternate_locale(root, manifest, env)
+        if alternate is not None:
+            exercised.append(alternate)
         # Step 8: every planned preload row. Under bwrap the server already
         # started with exactly this list in shared_preload_libraries, and a
         # bogus entry makes start-up fail — measured on this bundle — so a
@@ -1185,6 +1192,50 @@ def _icu(root, manifest, env):
             raise ValueError(f"ICU is absent but the collation failed for another reason: {exc}")
         return "icu:absent"
     raise ValueError("ICU is recorded as absent but CREATE COLLATION provider = icu succeeded")
+
+
+def _alternate_locale(root, manifest, env):
+    """Prove the alternate builtin collation the manifest promises, if any.
+
+    18 records `locale.alternate: PG_UNICODE_FAST`, so a bundle that quietly
+    fell back to the default C.UTF-8 would still ship a manifest promising a
+    collation it never created. Ordering cannot catch that: `'B' < 'a'` is true
+    under PG_UNICODE_FAST exactly as it is under "C", so an ordering assertion
+    would pass for a collation that was never used. Case mapping can: Unicode
+    uppercases sharp s to SS, while both byte order and C.UTF-8 leave it at one
+    character.
+
+    The collation is created with the builtin provider because the name is
+    otherwise unaddressable — the cluster's own default is catalogued as
+    `pg_c_utf8`, and `COLLATE "C.UTF-8"` is an error on a fresh database
+    (measured on this bundle). Nothing here names a locale-derived collation,
+    for the same reason _icu does not.
+
+    A manifest with no alternate (`17.11` records null) sends nothing and
+    returns None, so this adds no check to a major that has no such promise.
+    """
+    alternate = manifest["locale"].get("alternate")
+    if not alternate:
+        return None
+    script = (f"CREATE COLLATION verify_alternate (provider = builtin, "
+              f"locale = '{alternate}');\n"
+              # U&'\00DF' rather than a literal ß: the same character, but it
+              # survives any client encoding on the way to the server.
+              "SELECT upper(U&'\\00DF' COLLATE verify_alternate) AS alternate_upper,\n"
+              "       length(upper(U&'\\00DF' COLLATE verify_alternate)) AS alternate_length;\n")
+    try:
+        output = _psql(root / "bin/psql", ["-f", "-"], env, stdin=script)
+    except ValueError as exc:
+        raise ValueError(f"The alternate locale {alternate!r} the manifest promises "
+                         f"could not be used: {exc}") from exc
+    # Unaligned mode separates the two columns with a pipe: SS|2 is the
+    # Unicode answer, ß|1 is the default collation answering instead.
+    fields = output.strip().replace("|", " ").split()
+    if fields != ["SS", "2"]:
+        raise ValueError(f"The alternate locale {alternate!r} did not change case "
+                         f"mapping ({output.strip()!r}, expected 'SS|2'); it is "
+                         "recorded in the manifest but not being used")
+    return f"locale:{alternate}"
 
 
 def relocate(bundle):
@@ -1364,8 +1415,8 @@ def package(bundle, output):
     manifest = json.loads((bundle / "manifest.json").read_text())
     if manifest.get("runtime") != "postgresql" or manifest.get("verification") != "PASSED":
         raise ValueError("Real PostgreSQL verification must pass before packaging")
-    version = manifest.get("postgresql")
-    version = version.get("version") if isinstance(version, dict) else None
+    version_record = manifest.get("postgresql")
+    version = version_record.get("version") if isinstance(version_record, dict) else None
     parts = [version, manifest.get("target"), manifest.get("architecture"),
              manifest.get("build_id")]
     # A part that is missing or not a string is a broken manifest, not an
@@ -1397,7 +1448,11 @@ def package(bundle, output):
                     metadata.write(json.dumps(manifest, indent=2) + "\n")
     except Exception:
         for path in created:
-            path.unlink()
+            # Never let cleanup replace the failure that caused it: a path that
+            # vanished between the open and here must not become the exception
+            # a caller reports.
+            with contextlib.suppress(OSError):
+                path.unlink(missing_ok=True)
         raise
     return archive
 
