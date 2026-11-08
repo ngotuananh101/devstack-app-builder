@@ -1607,20 +1607,61 @@ class PostgreSQLPackageTests(unittest.TestCase):
                              ["unrelated.tar.gz"])
             self.assertEqual(pre_existing.read_text(), "not mine\n")
 
-    def test_archive_identity_parts_are_filesystem_safe(self):
-        for part in ("18.6", "musl-dynamic", "x86_64", "abc123"):
-            self.assertRegex(part, r"^[a-zA-Z0-9_.-]+$")
-        # Anything that could escape the output directory or split the name is
-        # refused before a single byte is written.
+    def test_a_failed_cleanup_never_masks_the_original_failure(self):
+        # The unwind runs while an exception is already in flight, so a sidecar
+        # that vanished underneath it must not become the exception a caller
+        # reports: the OSError that caused the unwind is the one that matters.
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            for build_id in ("../../etc/passwd", "abc/123", "abc 123", "abc\n123", ""):
+            bundle, manifest = self.staged(root)
+            self.mark_passed(bundle, manifest)
+            real_unlink = Path.unlink
+            vanished = []
+
+            def disappearing(path, *arguments, **keywords):
+                if path.suffix == ".sha256":
+                    vanished.append(path.name)
+                    raise FileNotFoundError(2, "No such file or directory", str(path))
+                return real_unlink(path, *arguments, **keywords)
+
+            with mock.patch.object(self.bundle.tarfile, "open",
+                                   side_effect=OSError("disk went away")), \
+                    mock.patch.object(Path, "unlink", disappearing):
+                with self.assertRaisesRegex(OSError, "disk went away"):
+                    self.bundle.package(bundle, root / "assets")
+            self.assertEqual(len(vanished), 1, "the sidecar cleanup was not exercised")
+            # The archive and the sidecar manifest are gone; only the sidecar
+            # that refused to be removed is left, which is the simulated leak.
+            self.assertEqual([p.name for p in (root / "assets").iterdir()],
+                             [f"postgresql-18.6-musl-dynamic-x86_64-abc123"
+                              ".tar.gz.sha256"])
+
+    def test_archive_identity_parts_are_filesystem_safe(self):
+        # Anything that could escape the output directory or split the name is
+        # refused before a single byte is written, while a build_id made of the
+        # characters the module allows still packages — so the refusal below is
+        # about the characters, not about the call.
+        unsafe = ("../../etc/passwd", "abc/123", "abc 123", "abc\n123", "")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for index, build_id in enumerate(unsafe):
                 with self.subTest(build_id=build_id):
-                    bundle, manifest = self.staged(root / build_id.replace("/", "_"),
+                    bundle, manifest = self.staged(root / f"unsafe{index}",
                                                    build_id=build_id)
                     self.mark_passed(bundle, manifest)
                     with self.assertRaises(ValueError):
                         self.bundle.package(bundle, root / "assets")
+                    self.assertFalse((root / "assets").exists(),
+                                     "a refused identity must write nothing")
+            for build_id in ("x", "abc123", "a.b_c-1"):
+                with self.subTest(build_id=build_id):
+                    bundle, manifest = self.staged(root / f"safe_{build_id}",
+                                                   build_id=build_id)
+                    self.mark_passed(bundle, manifest)
+                    archive = self.bundle.package(bundle, root / "assets")
+                    self.assertEqual(
+                        archive.name,
+                        f"postgresql-18.6-musl-dynamic-x86_64-{build_id}.tar.gz")
 
     def test_package_cli_writes_the_assets_and_prints_the_archive(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1694,6 +1735,44 @@ class PostgreSQLConfigReconciliationTests(unittest.TestCase):
                         text=True, capture_output=True, env={**os.environ, "PYTHONPATH": ""})
                     self.assertNotEqual(run.returncode, 0)
 
+    def test_generate_refuses_an_install_tree_that_is_not_there(self):
+        # An empty object is trivially sorted and `load_expected` accepts it, so
+        # emitting one for a mistyped path would silently make every module
+        # guard a no-op — the same defect class as the `shared: []` this task
+        # repaired. The refusal is a ValueError, like every other bad input here.
+        with tempfile.TemporaryDirectory() as temp:
+            missing = Path(temp) / "no such tree"
+            run = subprocess.run(
+                ["python3", "-I", str(SCRIPTS / "modules.py"),
+                 "--generate", str(missing), "18"],
+                text=True, capture_output=True, env={**os.environ, "PYTHONPATH": ""})
+            self.assertNotEqual(run.returncode, 0)
+            self.assertIn("Traceback", run.stderr)
+            self.assertIn("ValueError", run.stderr)
+            self.assertIn("no such tree", run.stderr)
+            self.assertEqual(run.stdout, "")
+            with self.assertRaises(ValueError):
+                self.modules.generate(missing, "18")
+
+    def test_generate_refuses_a_tree_with_nothing_in_it(self):
+        # An existing but empty directory is the same trap with the failure one
+        # step later: the tree is there, the inventory is not.
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / "share/extension").mkdir(parents=True)
+            (Path(temp) / "lib").mkdir()
+            (Path(temp) / "bin").mkdir()
+            with self.assertRaises(ValueError):
+                self.modules.generate(Path(temp), "18")
+            empty = Path(temp) / "empty"
+            empty.mkdir()
+            run = subprocess.run(
+                ["python3", "-I", str(SCRIPTS / "modules.py"),
+                 "--generate", str(empty), "18"],
+                text=True, capture_output=True, env={**os.environ, "PYTHONPATH": ""})
+            self.assertNotEqual(run.returncode, 0)
+            self.assertIn("ValueError", run.stderr)
+            self.assertEqual(run.stdout, "")
+
     def test_the_committed_shared_lists_are_generated_not_empty(self):
         # The exact defect this reconciliation exists to fix: `shared: []`
         # against a tree with 36 shared libraries.
@@ -1705,21 +1784,83 @@ class PostgreSQLConfigReconciliationTests(unittest.TestCase):
                              "utf8_and_euc_jp", "utf8_and_win", "test_decoding"):
                     self.assertIn(name, expected["shared"], name)
 
-    def test_the_committed_config_matches_every_installed_bundle(self):
-        # Only meaningful where the real bundles exist (this branch's build
-        # host); a clean checkout skips rather than asserting on absent trees.
-        # The manifest is the marker: stage() writes it last, so a directory
-        # without one is a refused or interrupted build, not a bundle.
+    def reconcile_staged_bundles(self, root):
+        """Reconcile every staged bundle under `root` against the committed config.
+
+        Returns the versions that were checked. Raises SkipTest when there were
+        none: this is the gate the whole reconciliation exists to build, and a
+        clean checkout must report "nothing to check" rather than a green test
+        that asserted nothing. A partial set still asserts on each bundle that
+        is present — one real bundle is enough to catch a stale list.
+        """
+        checked = []
         for version in ("17.11", "18.6"):
-            tree = ROOT / "dist/postgresql" / version / "musl-dynamic"
-            if not (tree / "manifest.json").is_file():
+            tree = root / "dist/postgresql" / version / "musl-dynamic"
+            manifest_path = tree / "manifest.json"
+            # The manifest is the marker: stage() writes it last, so a
+            # directory without one is a refused or interrupted build, not a
+            # bundle.
+            if not manifest_path.is_file():
                 continue
-            manifest = json.loads((tree / "manifest.json").read_text())
+            manifest = json.loads(manifest_path.read_text())
             major = manifest["postgresql"]["major"]
-            with self.subTest(version=version):
-                self.assertEqual(
-                    self.modules.compare(self.modules.inventory(tree),
-                                         self.modules.load_expected(major)), [])
+            differences = self.modules.compare(self.modules.inventory(tree),
+                                               self.modules.load_expected(major))
+            checked.append(version)
+            # Not inside subTest: a subtest captures its own failure, and this
+            # helper's contract is that a stale bundle raises here.
+            self.assertEqual(differences, [], f"{version} bundle: {differences}")
+        if not checked:
+            self.skipTest("no staged PostgreSQL bundle to reconcile against; expected "
+                          "dist/postgresql/{17.11,18.6}/musl-dynamic/manifest.json")
+        return checked
+
+    def staged_tree(self, root, version, major):
+        """A bundle directory whose inventory is exactly the committed config."""
+        tree = root / "dist/postgresql" / version / "musl-dynamic"
+        for kind, names in self.modules.load_expected(major).items():
+            for name in names:
+                if kind == "sql":
+                    (tree / "share/extension").mkdir(parents=True, exist_ok=True)
+                    (tree / "share/extension" / f"{name}.control").write_text("")
+                elif kind == "cli":
+                    (tree / "bin").mkdir(parents=True, exist_ok=True)
+                    (tree / "bin" / name).write_text("")
+                else:
+                    (tree / "lib").mkdir(parents=True, exist_ok=True)
+                    (tree / "lib" / f"{name}.so").write_text("")
+        (tree / "manifest.json").write_text(
+            json.dumps({"postgresql": {"version": version, "major": major}}))
+        return tree
+
+    def test_the_reconciliation_gate_skips_instead_of_passing_vacuously(self):
+        # A `continue` over every absent bundle left this green while asserting
+        # nothing, which is precisely the gate this task exists to build.
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaises(unittest.SkipTest) as raised:
+                self.reconcile_staged_bundles(Path(temp))
+        self.assertIn("17.11", str(raised.exception))
+        self.assertIn("18.6", str(raised.exception))
+
+    def test_the_reconciliation_gate_still_checks_a_partial_set(self):
+        # One bundle present and one absent must assert on the present one.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.staged_tree(root, "18.6", "18")
+            self.assertEqual(self.reconcile_staged_bundles(root), ["18.6"])
+
+    def test_the_reconciliation_gate_fails_on_a_stale_bundle(self):
+        # The reason it must not skip silently: a bundle that no longer matches
+        # the config has to fail here, not in a manifest nobody re-reads.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            tree = self.staged_tree(root, "17.11", "17")
+            (tree / "lib/stowaway.so").write_text("")
+            with self.assertRaises(AssertionError):
+                self.reconcile_staged_bundles(root)
+
+    def test_the_committed_config_matches_every_installed_bundle(self):
+        self.reconcile_staged_bundles(ROOT)
 
 
 class PostgreSQLVerifyTests(unittest.TestCase):
@@ -1825,6 +1966,10 @@ class PostgreSQLVerifyTests(unittest.TestCase):
         def respond(psql, arguments, env, stdin=None, timeout=300):
             if any("version()" in str(argument) for argument in arguments):
                 return f"PostgreSQL {version} on x86_64-pc-linux-gnu\n"
+            if stdin and "PG_UNICODE_FAST" in stdin:
+                # What the real bundle prints: Unicode case mapping uppercases
+                # sharp s to two characters, byte order leaves it at one.
+                return "SS|2\n"
             if stdin and "COLLATE" in stdin:
                 # What the real bundle prints: ICU orders B before a, byte order
                 # (COLLATE "C") does not, so the pair is f then t.
@@ -2300,6 +2445,102 @@ class PostgreSQLVerifyTests(unittest.TestCase):
         with mock.patch.object(self.bundle, "_psql", side_effect=refuse):
             self.assertEqual(self.bundle._icu(Path("/nonexistent"), absent,
                                               {"PATH": "/usr/bin:/bin"}), "icu:absent")
+        # The absent branch sends one -c invocation and no stdin script, so it
+        # never names a collation at all — nothing host-derived can creep in.
+        self.assertEqual(statements, [])
+
+    def test_the_alternate_locale_proof_uses_case_mapping_not_ordering(self):
+        # PG_UNICODE_FAST is a post-18 collation the manifest promises. Ordering
+        # cannot prove it: 'B' < 'a' is true there exactly as it is under "C".
+        # Case mapping can — Unicode uppercases sharp s to SS, byte order does
+        # not — so the proof must read that column, create the collation with
+        # the builtin provider, and never name a locale-derived collation such
+        # as "C.UTF-8" (which a fresh database cannot even resolve: the builtin
+        # collation is catalogued as pg_c_utf8 and answers
+        # `collation "C.UTF-8" for encoding "UTF8" does not exist`).
+        manifest = self.manifest()
+        statements = []
+
+        def record(psql, arguments, env, stdin=None, timeout=300):
+            statements.append((list(arguments), stdin))
+            return "SS|2\n"
+
+        with mock.patch.object(self.bundle, "_psql", side_effect=record):
+            self.assertEqual(
+                self.bundle._alternate_locale(Path("/nonexistent"), manifest,
+                                              {"PATH": "/usr/bin:/bin"}),
+                "locale:PG_UNICODE_FAST")
+        self.assertEqual(len(statements), 1)
+        arguments, script = statements[0]
+        self.assertIn("provider = builtin", script)
+        self.assertIn("PG_UNICODE_FAST", script)
+        # Case mapping, not ordering: no comparison operator in the statement.
+        self.assertIn("upper(", script)
+        self.assertNotIn("<", script)
+        self.assertNotIn("C.UTF-8", script)
+        self.assertNotIn("C.utf8", script)
+        # The name comes from the manifest, not from a constant beside it.
+        manifest["locale"]["alternate"] = "PG_UNICODE_FAST_OTHER"
+        statements.clear()
+        with mock.patch.object(self.bundle, "_psql", side_effect=record):
+            self.bundle._alternate_locale(Path("/nonexistent"), manifest,
+                                          {"PATH": "/usr/bin:/bin"})
+        self.assertIn("PG_UNICODE_FAST_OTHER", statements[0][1])
+
+    def test_the_alternate_locale_proof_rejects_the_byte_order_answer(self):
+        # The discriminant: SS twice over means the collation was ignored and
+        # the database default answered, which is the failure this catches.
+        manifest = self.manifest()
+
+        def answer(output):
+            with mock.patch.object(self.bundle, "_psql", return_value=output):
+                return self.bundle._alternate_locale(Path("/nonexistent"), manifest,
+                                                     {"PATH": "/usr/bin:/bin"})
+
+        self.assertEqual(answer("SS|2\n"), "locale:PG_UNICODE_FAST")
+        for wrong in ("ß|1\n", "SS|1\n", "t|1\n", "\n"):
+            with self.subTest(output=wrong):
+                with self.assertRaisesRegex(ValueError, "alternate locale"):
+                    answer(wrong)
+
+    def test_a_null_alternate_locale_sends_nothing_at_all(self):
+        # 17.11 records `alternate: null`; the check must not invent work — and
+        # must not fail a major that legitimately has no alternate collation.
+        manifest = self.manifest()
+        manifest["locale"]["alternate"] = None
+        with mock.patch.object(self.bundle, "_psql") as psql:
+            self.assertIsNone(self.bundle._alternate_locale(
+                Path("/nonexistent"), manifest, {"PATH": "/usr/bin:/bin"}))
+        self.assertFalse(psql.called)
+        # Absent keys behave the same as an explicit null.
+        manifest["locale"].pop("alternate")
+        with mock.patch.object(self.bundle, "_psql") as psql:
+            self.assertIsNone(self.bundle._alternate_locale(
+                Path("/nonexistent"), manifest, {"PATH": "/usr/bin:/bin"}))
+        self.assertFalse(psql.called)
+
+    def test_smoke_runs_the_alternate_locale_check_only_when_one_is_promised(self):
+        # The check has to reach the checks list smoke() returns, or verify
+        # would never count it: 128 rows on 18, 124 on 17.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            manifest = self.manifest()
+            bundle = self.staged(root)
+            with mock.patch.object(self.bundle, "_run", return_value=""), \
+                    mock.patch.object(self.bundle, "_psql", side_effect=self.psql()), \
+                    mock.patch.object(self.bundle, "_alternate_locale",
+                                      return_value="locale:PG_UNICODE_FAST") as alternate:
+                promised = self.bundle.smoke(bundle, manifest, self.environment(root))
+            self.assertIn("locale:PG_UNICODE_FAST", promised)
+            self.assertTrue(alternate.called)
+            manifest["locale"]["alternate"] = None
+            with mock.patch.object(self.bundle, "_run", return_value=""), \
+                    mock.patch.object(self.bundle, "_psql", side_effect=self.psql()):
+                unpromised = self.bundle.smoke(bundle, manifest, self.environment(root))
+        # Exactly one row apart: the alternate check is the only difference
+        # between a major that promises PG_UNICODE_FAST and one that does not.
+        self.assertEqual(set(unpromised),
+                         set(promised) - {"locale:PG_UNICODE_FAST"})
 
     # -- workspace hygiene on the failure paths ----------------------------
 
