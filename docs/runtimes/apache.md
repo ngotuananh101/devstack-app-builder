@@ -25,10 +25,19 @@ a version means adding the pin and its checksum first.
 Nothing comes from the build host except a C compiler and its kernel UAPI headers.
 Each dependency is downloaded over HTTPS, digest-verified **before** extraction into
 its own fresh directory, built with the pinned musl toolchain into one staging
-prefix, and installed into the bundle's `lib/`. A download is attempted up to four
-times with linear backoff, because GitHub's release CDN answers `504` for a single
-asset while the rest of the same release serves normally; a digest that does not match
-its pin is never retried.
+prefix, and installed into the bundle's `lib/`.
+
+A download is attempted six times with cumulative backoff (15s, 45s, 1m45s, 3m45s,
+6m45s), because GitHub's `releases/download` surface has answered `504` for every asset
+while its own status page reported all systems operational. A digest that does not match
+its pin is never retried — that is a changed archive, not a flaky connection.
+
+`curl`, `jansson` and `expat` are fetched from their upstream mirrors (`curl.se`,
+MacPorts, SourceForge) rather than from GitHub releases, verified byte-identical at the
+time of the change. A dependency may only move to a mirror that returns **exactly** the
+pinned SHA-256: swapping in a different tarball of the same version means re-pinning it,
+and the pin is the only thing that makes a mirror substitution safe. `openssl`, `pcre2`,
+`nghttp2` and `brotli` stay on GitHub because no official mirror serves the same bytes.
 
 | Dependency | Version | Role | Needed by |
 |---|---|---|---|
