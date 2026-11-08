@@ -1,5 +1,5 @@
 {
-  "generated_from": "17.11 and 18.6 install trees",
+  "generated_from": "verify-time inventories of the staged 17.11 and 18.6 bundles (install trees plus the vendored OpenSSL staging copies into lib/)",
   "17": {
     "sql": [
       "amcheck",

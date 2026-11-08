@@ -41,10 +41,12 @@ def _load_major_exclusions() -> dict[str, dict[str, str]]:
 def exclusions_for(major: str) -> dict[str, str]:
     """The exclusions that apply to one major, flat ones first.
 
-    Some modules exist in one major only — `pg_logicalinspect` arrived in 18,
-    `pg_overexplain` in 18 — so a single flat map cannot describe what a
-    bundle of a given major lacks. Recording such a module flatly would make
-    the other major's manifest claim it was excluded while also including it.
+    Some modules exist in one major only, so a single flat map cannot describe
+    what a bundle of a given major lacks: recording such a module flatly would
+    make the other major's manifest claim it was excluded while also including
+    it. `pg_logicalinspect` (contrib, added in 18) is the one such module here.
+    `pg_overexplain` is 18-only too, but it needs no entry: 17's expected list
+    simply does not name it, and the flat map never mentioned it either.
     """
     if not isinstance(major, str) or major not in MAJORS:
         raise ValueError(f"Unsupported major {major!r}; supported majors are {MAJORS}")
@@ -159,19 +161,35 @@ def generate(install_root: Path, major: str) -> dict:
 
     `shared` cannot be written by hand: it is whatever staging put in `lib/`,
     including the vendored shared OpenSSL libraries the staging step copies
-    there, so guessing it produces a list that `compare` then reports as
-    "unexpected shared" for every entry. This makes the config a generated
-    artefact of the build it describes.
+    there. Hand-writing it is wrong in both directions, and only one of them is
+    loud. An over-guess (a module the tree does not have) is a `missing` line,
+    and `stage()` refuses to build. An under-guess (a module the tree does have)
+    is an `unexpected` line, and both `stage()` and `_check_module_inventory`
+    drop everything that is not `missing` — so it is reported to nobody. That
+    silence is why `shared: []` survived against a tree with 36 shared
+    libraries, and why this makes the config a generated artefact of the build
+    it describes instead.
 
     `major` is validated even though nothing here reads it: emitting a block
     for a major `load_expected` would reject only moves the failure to the
     paste-in step, and the exclusions this file carries are per-runtime.
+
+    A path that is not a directory, or a tree with nothing recognisable in it,
+    is refused rather than returned as an empty object: an empty block is
+    trivially sorted, `load_expected` accepts it, and every module guard would
+    then pass while checking nothing.
     """
     if not isinstance(major, str) or major not in MAJORS:
         raise ValueError(f"Unsupported major {major!r}; supported majors are {MAJORS}")
+    install_root = Path(install_root)
+    if not install_root.is_dir():
+        raise ValueError(f"Install tree {str(install_root)!r} is not a directory")
     generated: dict[str, list[str]] = {kind: [] for kind in KINDS}
     for row in inventory(install_root):
         generated[row["kind"]].append(row["name"])
+    if not any(generated.values()):
+        raise ValueError(f"Install tree {str(install_root)!r} has no modules; "
+                         "refusing to generate an empty expected-module list")
     # Sorted because load_expected rejects an unsorted list; KINDS order because
     # that is the order the config file carries the blocks in.
     return {kind: sorted(generated[kind]) for kind in KINDS}
