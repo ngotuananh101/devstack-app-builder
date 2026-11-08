@@ -2132,8 +2132,12 @@ class PostgreSQLVerifyTests(unittest.TestCase):
             bundle = self.staged(root)
             manifest = self.manifest()
             self.write(bundle, manifest)
+            # "poison-file" rather than "bwrap": the mask is a host capability
+            # this test does not need. Claiming "bwrap" on a runner without
+            # bubblewrap made verify() abort in _isolation — "bwrap disappeared" —
+            # before the module gate this test exists to check was ever reached.
             with mock.patch.object(self.bundle, "lifecycle"), \
-                    mock.patch.object(self.bundle, "assert_no_host_loaders", return_value="bwrap"), \
+                    mock.patch.object(self.bundle, "assert_no_host_loaders", return_value="poison-file"), \
                     mock.patch.object(self.bundle.modules, "inventory", return_value=[]):
                 with self.assertRaisesRegex(ValueError, "missing sql: hstore"):
                     self.bundle.verify(bundle)
@@ -2152,7 +2156,7 @@ class PostgreSQLVerifyTests(unittest.TestCase):
             inventory = (self.modules.inventory(bundle)
                          + [{"name": "stowaway", "kind": "shared"}])
             with mock.patch.object(self.bundle, "lifecycle"), \
-                    mock.patch.object(self.bundle, "assert_no_host_loaders", return_value="bwrap"), \
+                    mock.patch.object(self.bundle, "assert_no_host_loaders", return_value="poison-file"), \
                     mock.patch.object(self.bundle.modules, "inventory", return_value=inventory):
                 with self.assertRaisesRegex(ValueError, "unexpected shared: stowaway"):
                     self.bundle.verify(bundle)
@@ -2192,9 +2196,18 @@ class PostgreSQLVerifyTests(unittest.TestCase):
     # -- host loader masking ----------------------------------------------
 
     def test_host_loader_masking_is_detected_or_reported(self):
+        # Host-independent on purpose: this asserts that a strategy is always
+        # named, never a silent "none", so it must not fail merely because the
+        # runner has no bwrap. The mask is probed for real when it can run; the
+        # poison fallback is forced because this fixture's libexec/bin entries
+        # are placeholders, not ELFs readelf can read, so a real probe here
+        # could only report the unreadable-file error rather than the strategy
+        # that would be used. The real mask is covered by
+        # test_the_masking_strategy_makes_the_real_host_loader_unusable.
         with tempfile.TemporaryDirectory() as temp:
             bundle = self.staged(Path(temp))
-            strategy = self.bundle.assert_no_host_loaders(bundle)
+            with mock.patch.object(self.bundle, "_poison_probe", return_value=True):
+                strategy = self.bundle.assert_no_host_loaders(bundle)
         self.assertIn(strategy, ("bwrap", "poison-file"))
         # Never a silent "no isolation available".
         self.assertNotIn("none", strategy.lower())
@@ -2344,6 +2357,12 @@ class PostgreSQLVerifyTests(unittest.TestCase):
     def test_relocated_bundle_reports_paths_inside_itself(self):
         if not shutil.which("cc") or not shutil.which("readelf"):
             self.skipTest("ELF fixture compiler is unavailable")
+        # The strategy is passed explicitly because this test measures where
+        # pg_config says things live, not how the mask hides a host loader.
+        # "poison-file" runs the commands unmasked, so the assertion is identical
+        # whether or not the runner can create the bwrap namespaces; defaulting
+        # to "bwrap" made it fail on every runner without bubblewrap.
+        strategy = "poison-file"
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             bundle = self.staged(root)
@@ -2355,8 +2374,8 @@ class PostgreSQLVerifyTests(unittest.TestCase):
                 self.assertTrue(relocated.is_dir())
                 self.assertTrue((relocated / "bin/psql").is_file())
                 # pg_config must report the copy's own paths, not the original's.
-                original = self.bundle.pg_config_paths(bundle)
-                derived = self.bundle.pg_config_paths(relocated)
+                original = self.bundle.pg_config_paths(bundle, strategy)
+                derived = self.bundle.pg_config_paths(relocated, strategy)
                 self.assertEqual(set(derived), {"bindir", "sharedir", "libdir", "pkglibdir"})
                 for key, value in derived.items():
                     self.assertEqual(value, original[key].replace(str(bundle), str(relocated)), key)
