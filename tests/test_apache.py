@@ -142,7 +142,9 @@ class ExtractionContracts(unittest.TestCase):
 
             with mock.patch.object(self.fetch.subprocess, "run", side_effect=fake_run), \
                     mock.patch.object(self.fetch.time, "sleep"):
-                with self.assertRaisesRegex(ValueError, "Cannot download.*after 4 attempts"):
+                with self.assertRaisesRegex(
+                        ValueError, "Cannot download.*after %d attempts"
+                        % self.fetch.FETCH_ATTEMPTS):
                     self.fetch.download("https://example.invalid/pcre2.tar.gz", destination)
             self.assertGreater(len(attempts), 1)
             self.assertFalse(destination.exists())

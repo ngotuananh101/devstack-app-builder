@@ -111,8 +111,10 @@ def archives(work):
     return Path(work) / "archives"
 
 
-FETCH_ATTEMPTS = 4
-FETCH_RETRY_DELAY = 5
+# A build takes about an hour, so waiting minutes on a flaky CDN is cheap next
+# to losing it. The delays are cumulative: 15s, 45s, 1m45s, 3m45s, 6m45s.
+FETCH_RETRY_DELAYS = (15, 30, 60, 120, 180)
+FETCH_ATTEMPTS = len(FETCH_RETRY_DELAYS) + 1
 
 
 def _fetch(pin, downloads):
@@ -135,7 +137,7 @@ def _fetch(pin, downloads):
     result = None
     for attempt in range(FETCH_ATTEMPTS):
         if attempt:
-            time.sleep(FETCH_RETRY_DELAY * attempt)
+            time.sleep(FETCH_RETRY_DELAYS[attempt - 1])
         result = subprocess.run(
             ["curl", "--fail", "--location", "--proto", "=https", "--proto-redir", "=https",
              "--max-time", "600", "--output", str(temporary), pin["url"]],

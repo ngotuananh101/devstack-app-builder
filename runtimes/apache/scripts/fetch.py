@@ -23,8 +23,10 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-FETCH_ATTEMPTS = 4
-FETCH_RETRY_DELAY = 5
+# A build takes about an hour, so waiting minutes on a flaky CDN is cheap next
+# to losing it. The delays are cumulative: 15s, 45s, 1m45s, 3m45s, 6m45s.
+FETCH_RETRY_DELAYS = (15, 30, 60, 120, 180)
+FETCH_ATTEMPTS = len(FETCH_RETRY_DELAYS) + 1
 
 
 def download(url, destination):
@@ -42,7 +44,7 @@ def download(url, destination):
     last = None
     for attempt in range(FETCH_ATTEMPTS):
         if attempt:
-            time.sleep(FETCH_RETRY_DELAY * attempt)
+            time.sleep(FETCH_RETRY_DELAYS[attempt - 1])
         last = subprocess.run(
             [
                 "curl", "--fail", "--silent", "--show-error", "--location",
