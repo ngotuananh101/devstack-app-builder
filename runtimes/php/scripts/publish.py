@@ -9,6 +9,32 @@ import subprocess
 import tarfile
 from urllib.parse import quote
 
+# The pinned PostgreSQL sources are authoritative: a plan may only name a
+# version the repository has already authenticated an archive digest for.
+POSTGRES_SOURCES = Path(__file__).resolve().parents[2] / "postgresql/config/sources.json"
+POSTGRES_EXECUTABLES = ("bin/postgres", "bin/initdb", "bin/pg_ctl", "bin/psql", "bin/pg_dump", "bin/pg_config")
+
+
+def _pinned_postgres_versions() -> list:
+    """The pinned PostgreSQL versions a plan is allowed to name.
+
+    The pin file is repository input the planner already validated, but this
+    script reads it independently, so a missing or malformed file must fail as
+    a ValueError naming the path rather than as a traceback out of the JSON
+    parser in the middle of plan validation.
+    """
+    try:
+        versions = json.loads(POSTGRES_SOURCES.read_text())["versions"]
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise ValueError(f"Cannot read the PostgreSQL source pins from {POSTGRES_SOURCES}") from error
+    # sources.json keys `versions` by version string; a plain list is accepted
+    # too so this does not pin the shape of a file another module owns.
+    if isinstance(versions, dict):
+        versions = list(versions)
+    if not isinstance(versions, list) or not versions:
+        raise ValueError(f"No pinned PostgreSQL versions in {POSTGRES_SOURCES}")
+    return versions
+
 # What an Apache archive must carry to be the bundle this builder promises: every
 # launcher startable, and the modules that make the documented feature set real.
 APACHE_PROGRAMS = ("bin/httpd", "bin/apachectl", "bin/openssl", "libexec/bin/httpd")
@@ -130,6 +156,29 @@ def validate_assets(directory):
                     for relative in APACHE_REQUIRED:
                         if not members.get(root + "/" + relative):
                             raise ValueError(f"Archive is missing a required Apache file: {relative}")
+                elif runtime == "postgresql":
+                    parts = [manifest["postgresql"]["version"], manifest["target"], manifest["architecture"], manifest["build_id"]]
+                    executables = POSTGRES_EXECUTABLES
+                    valid = (re.fullmatch(r"1[78]\.[0-9]+(?:\.[0-9]+)?", parts[0]) and parts[1] == "musl-dynamic"
+                             and parts[2] == "x86_64"
+                             and manifest.get("linkage") == "dynamic" and "profile" not in manifest
+                             # The recorded major is part of the identity: a
+                             # bundle that calls itself 18 while carrying a 17
+                             # tree would be published under a name the build
+                             # plan never selected.
+                             and manifest["postgresql"].get("major") == parts[0].split(".")[0]
+                             # A poison-file fallback proves far less than the
+                             # bwrap mask, and a bundle verified that way is not
+                             # the same evidence as one that was not. Publication
+                             # accepts only the mask.
+                             and manifest.get("verification_strategy") == "bwrap"
+                             and isinstance(manifest.get("loader"), dict)
+                             and manifest["loader"].get("path") == "lib/musl/ld-musl-x86_64.so.1")
+                    # A musl-dynamic server without its bundled loader cannot boot
+                    # on a host that has no musl of its own.
+                    loader = members.get(root + "/lib/musl/ld-musl-x86_64.so.1")
+                    if not loader or not loader.isfile() or loader.size == 0 or loader.mode & 0o111 != 0o111:
+                        raise ValueError("Archive lost the bundled musl loader")
                 else:
                     raise ValueError("Unsupported archive runtime")
             except (KeyError, TypeError) as error:
@@ -162,7 +211,13 @@ def validate_plan(plan, manifests, tag, repository, commit):
     apache_matrix = plan.get("apache_matrix", {"include": []})
     if not isinstance(apache_matrix, dict) or not isinstance(apache_matrix.get("include"), list):
         raise ValueError("Empty/invalid publication matrix")
-    if not (matrix["include"] or redis_matrix["include"] or apache_matrix["include"]):
+    postgres_matrix = plan.get("postgres_matrix", {"include": []})
+    if not isinstance(postgres_matrix, dict) or not isinstance(postgres_matrix.get("include"), list):
+        raise ValueError("Empty/invalid publication matrix")
+    # Any one runtime with rows is a real release: a PostgreSQL-only plan is not
+    # an empty matrix, so this guard is a four-way or rather than a pair.
+    if not (matrix["include"] or redis_matrix["include"] or apache_matrix["include"]
+            or postgres_matrix["include"]):
         raise ValueError("Empty/invalid publication matrix")
     expected = set()
     for row in matrix["include"]:
@@ -205,6 +260,22 @@ def validate_plan(plan, manifests, tag, repository, commit):
         if identity in expected:
             raise ValueError("Duplicate publication matrix row")
         expected.add(identity)
+    # Read through a guarded helper so a missing or malformed pin file is a
+    # ValueError naming it, not a traceback from deep inside plan validation.
+    pinned = set(_pinned_postgres_versions())
+    for row in postgres_matrix["include"]:
+        version = row.get("postgresql_version") if isinstance(row, dict) else None
+        if (not isinstance(version, str) or not re.fullmatch(r"1[78]\.[0-9]+(?:\.[0-9]+)?", version)
+                or version not in pinned
+                or row.get("target") != "musl-dynamic" or row.get("architecture") != "x86_64" or "profile" in row):
+            raise ValueError("Invalid PostgreSQL publication matrix")
+        previous = row.get("previous_version")
+        if previous is not None and previous != version:
+            raise ValueError("Invalid previous PostgreSQL version")
+        identity = ("postgresql", version, row["target"], row["architecture"])
+        if identity in expected:
+            raise ValueError("Duplicate publication matrix row")
+        expected.add(identity)
     actual = set()
     for manifest in manifests:
         try:
@@ -219,6 +290,15 @@ def validate_plan(plan, manifests, tag, repository, commit):
                 if manifest.get("linkage") != "dynamic":
                     raise ValueError("Invalid planned runtime")
                 identity = (runtime, manifest["apache"]["version"], manifest["target"], manifest["architecture"])
+            elif runtime == "postgresql" and "profile" not in manifest and manifest.get("linkage") == "dynamic":
+                # Same identity rule as validate_assets: the recorded major must
+                # be this version's own, so a plan cannot be satisfied by a
+                # bundle that is not the one it selected.
+                if manifest["postgresql"].get("major") != manifest["postgresql"]["version"].split(".")[0]:
+                    raise ValueError("PostgreSQL manifest major disagrees with its version")
+                if manifest.get("verification_strategy") != "bwrap":
+                    raise ValueError("PostgreSQL bundles verified without the bwrap mask are not published")
+                identity = (runtime, manifest["postgresql"]["version"], manifest["target"], manifest["architecture"])
             else:
                 raise ValueError("Invalid planned runtime")
             builder_commit = manifest["builder"]["commit"]
@@ -231,73 +311,9 @@ def validate_plan(plan, manifests, tag, repository, commit):
         raise ValueError("Published bundles do not exactly match the build plan")
 
 
-def release_notes(manifests, repository, commit, plan=None):
-    php_manifests = [manifest for manifest in manifests if manifest.get("runtime") == "php"]
-    redis_manifests = [manifest for manifest in manifests if manifest.get("runtime") == "redis"]
-    apache_manifests = [manifest for manifest in manifests if manifest.get("runtime") == "apache"]
-    if apache_manifests:
-        lines = ["# DevStack runtime bundles", "",
-                 "Verified PHP, Redis and/or Apache archives from the exact build plan.", ""]
-        if php_manifests:
-            lines.append(release_notes(php_manifests, repository, commit, plan))
-        if redis_manifests:
-            lines.append(release_notes(redis_manifests, repository, commit, plan))
-        lines += ["## Apache httpd bundles", "",
-                  "Full Apache Lounge-equivalent module set, built against vendored dependencies; "
-                  "the only libc needed on the host is the one in the bundle.", "",
-                  "| Apache | Target | Architecture | MPM | Modules (shared) | Build ID |",
-                  "| --- | --- | --- | --- | --- | --- |"]
-        for manifest in sorted(apache_manifests,
-                               key=lambda m: (tuple(map(int, m["apache"]["version"].split("."))), m["target"])):
-            if manifest.get("linkage") != "dynamic":
-                raise ValueError("Apache bundles must be dynamic musl bundles")
-            modules = manifest.get("modules", {}).get("dso")
-            if not isinstance(modules, list):
-                raise ValueError("Apache bundles must record their module inventory")
-            mpm = manifest.get("mpm", {}).get("default")
-            if not isinstance(mpm, str) or mpm not in {"event", "worker", "prefork"}:
-                raise ValueError("Apache bundles must record their MPM")
-            lines.append("| " + " | ".join((manifest["apache"]["version"], manifest["target"],
-                                            manifest["architecture"], mpm, str(len(modules)),
-                                            manifest["build_id"])) + " |")
-        lines += ["",
-                  "- Launch through `bin/`, never through `bin/httpd`'s `libexec/` target: the launchers "
-                  "start the bundled musl loader with the bundle's own library path.",
-                  "- `bin/httpd` always passes the bundle's own `ServerRoot`; `bin/apachectl` wraps it.",
-                  "- `bin/apachectl` is a config/control wrapper, not a service manager; run it as the "
-                  "user that owns the bundle.",
-                  "- Listening on a privileged port needs `setcap cap_net_bind_service+ep` on "
-                  "`lib/musl/ld-musl-x86_64.so.1`; port 8080 and above need nothing.",
-                  "- Configuration and documents live under `conf/` and `htdocs/`; certificates are yours "
-                  "to supply (`ssl/openssl.cnf` is only the OpenSSL CLI's default configuration).",
-                  "- The bundle is relocatable: copy it anywhere and the launchers follow.",
-                  "- This release does not configure or run a DevStack site.",
-                  f"- Builder commit: https://github.com/{repository}/commit/{commit}"]
-        if plan:
-            lines.append(f'- Workflow: https://github.com/{repository}/actions/runs/{plan["run_id"]} (attempt {plan["run_attempt"]})')
-        return "\n".join(lines) + "\n"
-    if redis_manifests:
-        lines = ["# DevStack runtime bundles", "", "Verified PHP and/or Redis archives from the exact build plan.", ""]
-        if php_manifests:
-            lines.append(release_notes(php_manifests, repository, commit, plan))
-        lines += ["## Redis native bundles", "", "No profiles; Redis core built with native compilers, without Docker or TLS.", "",
-                  "| Redis | Target | Architecture | Linkage | Build ID |", "| --- | --- | --- | --- | --- |"]
-        for manifest in sorted(redis_manifests, key=lambda m: (tuple(map(int, m["redis"]["version"].split("."))), m["target"])):
-            libc = manifest.get("libc", {})
-            static = libc.get("static")
-            if static is not True:
-                raise ValueError("Redis bundles must be fully static musl binaries")
-            lines.append("| " + " | ".join((manifest["redis"]["version"], manifest["target"], manifest["architecture"], "fully static musl", manifest["build_id"])) + " |")
-        lines += ["", "- Binaries: `redis-server`, `redis-cli`, `redis-benchmark`, `redis-sentinel`, `redis-check-rdb`, `redis-check-aof`.",
-                  "- Redis bundles are fully static musl x86_64 binaries; they need no libc on the host.",
-                  "- Verify SHA-256 before extraction; retain upstream source archives and license notices.",
-                  "- This release does not configure or start Redis in DevStack.",
-                  f"- Builder commit: https://github.com/{repository}/commit/{commit}"]
-        if plan:
-            lines.append(f'- Workflow: https://github.com/{repository}/actions/runs/{plan["run_id"]} (attempt {plan["run_attempt"]})')
-        return "\n".join(lines) + "\n"
-    lines = ["# PHP runtime bundles", "", "Verified PHP CLI/FPM archives built from the selected stable patches.", "",
-             "## Included bundles", "", "| PHP | Previous published patch | Target | Architecture | Build ID |",
+def _php_section(manifests, plan):
+    lines = ["## PHP runtime bundles", "", "Verified PHP CLI/FPM archives built from the selected stable patches.", "",
+             "### Included bundles", "", "| PHP | Previous published patch | Target | Architecture | Build ID |",
              "| --- | --- | --- | --- | --- |"]
     previous = {}
     if plan:
@@ -307,7 +323,7 @@ def release_notes(manifests, repository, commit, plan=None):
         identity = (manifest["php"]["version"], manifest["target"], manifest["architecture"])
         prior = previous.get(identity) or ("Not previously published" if plan else "Not recorded")
         lines.append("| " + " | ".join((identity[0], prior, identity[1], identity[2], manifest["build_id"])) + " |")
-    lines += ["", "## Extension inventory", ""]
+    lines += ["", "### Extension inventory", ""]
     for manifest in manifests:
         label = f'{manifest["php"]["version"]} / {manifest["target"]}'
         modules = manifest["php"].get("static_modules")
@@ -338,7 +354,7 @@ def release_notes(manifests, repository, commit, plan=None):
                 value = state.get(sapi)
                 return "enabled" if value is True else "disabled" if value is False else "not recorded"
             lines.append(f'  - Shared `{module["name"]}`: initial CLI {enabled("cli")}, FPM {enabled("fpm")}.')
-    lines += ["", "## Installation and verification", "",
+    lines += ["", "### Installation and verification", "",
               "- Download the matching `.tar.gz`, `.tar.gz.sha256`, and `.manifest.json` assets.",
               "- Verify SHA-256 before extracting into a new empty installation directory.",
               "- Use bundled `bin/php`, `bin/php-fpm`, and `bin/php-ext`, not raw `libexec` binaries.",
@@ -346,10 +362,168 @@ def release_notes(manifests, repository, commit, plan=None):
               "- `musl-dynamic` bundles link against musl libc and ship their own loader in `lib/musl/`; launch through `bin/` so the bundled loader is used.",
               "- Publication validates archive checksums, identity, packaged manifests, executable modes, and `verification=PASSED`.",
               "- This does not certify an oldest-host run, distinct-minor coexistence, complete source/toolchain authentication, legal inventory, or independent artifact signing.",
-              "", "## Build references", "", f"- Builder commit: https://github.com/{repository}/commit/{commit}"]
+              "- PHP release information: https://www.php.net/releases/"]
+    return lines
+
+
+def _redis_section(manifests):
+    lines = ["## Redis native bundles", "", "No profiles; Redis core built with native compilers, without Docker or TLS.", "",
+             "| Redis | Target | Architecture | Linkage | Build ID |", "| --- | --- | --- | --- | --- |"]
+    for manifest in sorted(manifests, key=lambda m: (tuple(map(int, m["redis"]["version"].split("."))), m["target"])):
+        libc = manifest.get("libc", {})
+        static = libc.get("static")
+        if static is not True:
+            raise ValueError("Redis bundles must be fully static musl binaries")
+        lines.append("| " + " | ".join((manifest["redis"]["version"], manifest["target"], manifest["architecture"], "fully static musl", manifest["build_id"])) + " |")
+    lines += ["", "- Binaries: `redis-server`, `redis-cli`, `redis-benchmark`, `redis-sentinel`, `redis-check-rdb`, `redis-check-aof`.",
+              "- Redis bundles are fully static musl x86_64 binaries; they need no libc on the host.",
+              "- Verify SHA-256 before extraction; retain upstream source archives and license notices.",
+              "- This release does not configure or start Redis in DevStack."]
+    return lines
+
+
+def _postgres_section(manifests):
+    ordered = sorted(manifests, key=lambda m: (tuple(map(int, m["postgresql"]["version"].split("."))), m["target"]))
+    lines = ["## PostgreSQL server bundles", "",
+             "No profiles; a complete server built with musl and its own loader, without Perl, Python, or Tcl embedding.", "",
+             "| PostgreSQL | Target | Architecture | Linkage | Build ID |", "| --- | --- | --- | --- | --- |"]
+    for manifest in ordered:
+        lines.append("| " + " | ".join((manifest["postgresql"]["version"], manifest["target"], manifest["architecture"],
+                                       "dynamic musl", manifest["build_id"])) + " |")
+    lines += ["", "### Module inventory", ""]
+    for manifest in ordered:
+        label = f'{manifest["postgresql"]["version"]} / {manifest["target"]}'
+        modules = manifest.get("modules")
+        if not isinstance(modules, dict):
+            raise ValueError("Invalid PostgreSQL module inventory")
+        included, skipped = modules.get("included"), modules.get("skipped")
+        if not isinstance(included, list) or not isinstance(skipped, list):
+            raise ValueError("Invalid PostgreSQL module inventory")
+        grouped = {}
+        for module in included:
+            if (not isinstance(module, dict) or not isinstance(module.get("name"), str)
+                    or not re.fullmatch(r"[A-Za-z0-9_-]+", module["name"])
+                    or not isinstance(module.get("kind"), str) or not re.fullmatch(r"[a-z]+", module["kind"])):
+                raise ValueError("Invalid PostgreSQL module inventory")
+            grouped.setdefault(module["kind"], []).append(module["name"])
+        lines.append(f"- **{label}** built modules, grouped by kind:")
+        for kind in sorted(grouped):
+            lines.append(f"  - `{kind}`: " + ", ".join(f"`{name}`" for name in sorted(grouped[kind])))
+        if not grouped:
+            lines.append("  - No optional modules packaged.")
+        reasons = []
+        for module in skipped:
+            if (not isinstance(module, dict) or not isinstance(module.get("name"), str)
+                    or not re.fullmatch(r"[A-Za-z0-9_-]+", module["name"])
+                    or not isinstance(module.get("reason"), str) or not module["reason"]):
+                raise ValueError("Invalid PostgreSQL module inventory")
+            reasons.append(f'`{module["name"]}` ({module["reason"]})')
+        lines.append("  - Not packaged: " + ("; ".join(sorted(reasons)) if reasons else "nothing was excluded."))
+    lines += ["", "### Locale", ""]
+    providers = set()
+    for manifest in ordered:
+        locale = manifest.get("locale")
+        if (not isinstance(locale, dict) or not isinstance(locale.get("default_provider"), str)
+                or not isinstance(locale.get("default_locale"), str)
+                or locale.get("alternate") is not None and not isinstance(locale.get("alternate"), str)):
+            raise ValueError("Invalid PostgreSQL locale record")
+        providers.add(locale["default_provider"])
+        label = f'{manifest["postgresql"]["version"]} / {manifest["target"]}'
+        description = (f'- **{label}** records the `{locale["default_provider"]}` provider with '
+                       f'`{locale["default_locale"]}` as its default locale')
+        if locale.get("alternate"):
+            description += f' and `{locale["alternate"]}` as its alternate locale'
+        lines.append(description + ".")
+    # Describe only the providers these manifests actually record: 18.x offers
+    # an alternate collation that 17.x does not carry.
+    lines.append("")
+    if providers == {"builtin"}:
+        lines.append("Ordering under the `builtin` provider is deterministic code-point order: it never consults a "
+                     "host libc's `strcoll`, so the same database sorts identically on every host. Collations are "
+                     "named by provider and locale (the built-in `C.UTF-8` entry is catalogued as `pg_c_utf8`), "
+                     "never by a bare SQL locale literal.")
+    else:
+        lines.append("Collations are named by provider and locale, never by a bare SQL locale literal; the default "
+                     "provider recorded above determines whether ordering consults a host libc's `strcoll`.")
+    lines += ["", "### Installation and verification", "",
+              "- Download the matching `.tar.gz`, `.tar.gz.sha256`, and `.manifest.json` assets.",
+              "- Verify SHA-256 before extracting into a new empty installation directory.",
+              "- Launch through `bin/` (`postgres`, `initdb`, `pg_ctl`, `psql`, `pg_dump`, `pg_config`), not the raw ELFs in `libexec/bin/`.",
+              "- A server must run as a non-root caller with an explicit caller-owned data directory and socket.",
+              "- `musl-dynamic` bundles link against musl libc and ship their own loader in `lib/musl/`; launch through `bin/` so the bundled loader is used.",
+              "- Publication validates archive checksums, identity, packaged manifests, executable modes, and `verification=PASSED`.",
+              "- This release does not configure or start PostgreSQL in DevStack."]
+    return lines
+
+
+def _apache_section(manifests):
+    lines = ["## Apache httpd bundles", "",
+             "Full Apache Lounge-equivalent module set, built against vendored dependencies; "
+             "the only libc needed on the host is the one in the bundle.", "",
+             "| Apache | Target | Architecture | MPM | Modules (shared) | Build ID |",
+             "| --- | --- | --- | --- | --- | --- |"]
+    for manifest in sorted(manifests,
+                           key=lambda m: (tuple(map(int, m["apache"]["version"].split("."))), m["target"])):
+        if manifest.get("linkage") != "dynamic":
+            raise ValueError("Apache bundles must be dynamic musl bundles")
+        modules = manifest.get("modules", {}).get("dso")
+        if not isinstance(modules, list):
+            raise ValueError("Apache bundles must record their module inventory")
+        mpm = manifest.get("mpm", {}).get("default")
+        if not isinstance(mpm, str) or mpm not in {"event", "worker", "prefork"}:
+            raise ValueError("Apache bundles must record their MPM")
+        lines.append("| " + " | ".join((manifest["apache"]["version"], manifest["target"],
+                                        manifest["architecture"], mpm, str(len(modules)),
+                                        manifest["build_id"])) + " |")
+    lines += ["",
+              "- Launch through `bin/`, never through `bin/httpd`'s `libexec/` target: the launchers "
+              "start the bundled musl loader with the bundle's own library path.",
+              "- `bin/httpd` always passes the bundle's own `ServerRoot`; `bin/apachectl` wraps it.",
+              "- `bin/apachectl` is a config/control wrapper, not a service manager; run it as the "
+              "user that owns the bundle.",
+              "- Listening on a privileged port needs `setcap cap_net_bind_service+ep` on "
+              "`lib/musl/ld-musl-x86_64.so.1`; port 8080 and above need nothing.",
+              "- Configuration and documents live under `conf/` and `htdocs/`; certificates are yours "
+              "to supply (`ssl/openssl.cnf` is only the OpenSSL CLI's default configuration).",
+              "- The bundle is relocatable: copy it anywhere and the launchers follow.",
+              "- This release does not configure or run a DevStack site."]
+    return lines
+
+
+def release_notes(manifests, repository, commit, plan=None):
+    """Describe exactly the bundles in this release, one section per runtime.
+
+    The sections are chosen, not appended in place: a PostgreSQL-only release
+    must not inherit the PHP header, and a mixed release states each runtime's
+    own contract in a stable order.
+    """
+    php_manifests = [manifest for manifest in manifests if manifest.get("runtime") == "php"]
+    redis_manifests = [manifest for manifest in manifests if manifest.get("runtime") == "redis"]
+    apache_manifests = [manifest for manifest in manifests if manifest.get("runtime") == "apache"]
+    postgres_manifests = [manifest for manifest in manifests if manifest.get("runtime") == "postgresql"]
+    sections = []
+    if php_manifests:
+        sections.append(_php_section(php_manifests, plan))
+    if redis_manifests:
+        sections.append(_redis_section(redis_manifests))
+    if apache_manifests:
+        sections.append(_apache_section(apache_manifests))
+    if postgres_manifests:
+        sections.append(_postgres_section(postgres_manifests))
+    if not sections:
+        raise ValueError("No recognized runtime bundles to describe")
+    runtimes = [label for label, present in (("PHP", php_manifests), ("Redis", redis_manifests),
+                                             ("Apache", apache_manifests), ("PostgreSQL", postgres_manifests))
+                if present]
+    lines = ["# DevStack runtime bundles", "",
+             "Verified " + "/".join(runtimes) + " archives from the exact build plan.", ""]
+    for index, section in enumerate(sections):
+        if index:
+            lines.append("")
+        lines += section
+    lines += ["", "## Build references", "", f"- Builder commit: https://github.com/{repository}/commit/{commit}"]
     if plan:
         lines.append(f'- Workflow: https://github.com/{repository}/actions/runs/{plan["run_id"]} (attempt {plan["run_attempt"]})')
-    lines.append(f"- PHP release information: https://www.php.net/releases/")
     return "\n".join(lines) + "\n"
 
 

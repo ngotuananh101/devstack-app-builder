@@ -4,12 +4,13 @@ on:
   schedule:
     # 21:37 UTC = 04:37 Asia/Ho_Chi_Minh the next day, ahead of dev-stack's 00:00 UTC catalog.
     # GitHub schedules are best-effort; independent workflows have no ordering guarantee.
-    # Daily checks build/publish newer or missing PHP full bundles and missing pinned Redis bundles.
+    # Daily checks build/publish newer or missing PHP full bundles and missing pinned
+    # Redis, PostgreSQL and Apache bundles.
     - cron: "37 21 * * *"
   workflow_dispatch:
     inputs:
       bypass:
-        description: "Ignore published versions and rebuild every PHP series and pinned Redis version (manual only)"
+        description: "Ignore published versions and rebuild every PHP series and pinned Redis/PostgreSQL/Apache version (manual only)"
         required: false
         type: boolean
         default: false
@@ -44,18 +45,20 @@ jobs:
       - name: Unit and installed contracts
         run: |
           python3 -I -m unittest discover -s tests -v
-          bash -n build.sh scripts/build.sh runtimes/php/scripts/*.sh runtimes/redis/scripts/*.sh runtimes/apache/scripts/*.sh
-          for script in runtimes/php/packaging/* runtimes/apache/packaging/*; do sh -n "$script"; done
-          python3 -I -m py_compile runtimes/apache/scripts/*.py
+          bash -n build.sh scripts/build.sh runtimes/php/scripts/*.sh runtimes/redis/scripts/*.sh runtimes/postgresql/scripts/*.sh runtimes/apache/scripts/*.sh
+          for script in runtimes/php/packaging/* runtimes/postgresql/packaging/* runtimes/apache/packaging/*; do sh -n "$script"; done
+          python3 -I -m py_compile runtimes/postgresql/scripts/*.py runtimes/apache/scripts/*.py
 
   plan:
     runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.set.outputs.matrix }}
       redis_matrix: ${{ steps.set.outputs.redis_matrix }}
+      postgres_matrix: ${{ steps.set.outputs.postgres_matrix }}
       apache_matrix: ${{ steps.set.outputs.apache_matrix }}
       has_php_updates: ${{ steps.set.outputs.has_php_updates }}
       has_redis_updates: ${{ steps.set.outputs.has_redis_updates }}
+      has_postgres_updates: ${{ steps.set.outputs.has_postgres_updates }}
       has_apache_updates: ${{ steps.set.outputs.has_apache_updates }}
       has_updates: ${{ steps.set.outputs.has_updates }}
       publish: ${{ steps.set.outputs.publish }}
@@ -144,6 +147,36 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  build-postgresql:
+    if: needs.plan.outputs.has_postgres_updates == 'true'
+    needs: [plan, contracts]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.postgres_matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install CI-only native build dependencies
+        run: |
+          # Zig, OpenSSL, zlib, libxml2, ICU and util-linux are fetched and
+          # digest-verified by the build script; only these host tools are apt's.
+          # bubblewrap is not a build dependency: it is how verification hides
+          # every host musl loader before starting a server, and publication
+          # accepts only a bundle verified that way.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bison flex perl build-essential binutils curl bubblewrap
+      - name: Build, verify a real server lifecycle, and package
+        env:
+          BUILD_VERSION: ${{ matrix.postgresql_version }}
+        run: ./build.sh postgresql "$BUILD_VERSION"
+      - name: Upload mode-preserving archives and metadata
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: runtime-postgresql-${{ matrix.postgresql_version }}-musl-dynamic-x86_64
+          path: dist/assets/
+          if-no-files-found: error
+          retention-days: 14
+
   build-apache:
     if: needs.plan.outputs.has_apache_updates == 'true'
     needs: [plan, contracts]
@@ -186,9 +219,11 @@ jobs:
            (needs.plan.outputs.has_php_updates == 'false' && needs.build-php.result == 'skipped')) &&
           ((needs.plan.outputs.has_redis_updates == 'true' && needs.build-redis.result == 'success') ||
            (needs.plan.outputs.has_redis_updates == 'false' && needs.build-redis.result == 'skipped')) &&
+          ((needs.plan.outputs.has_postgres_updates == 'true' && needs.build-postgresql.result == 'success') ||
+           (needs.plan.outputs.has_postgres_updates == 'false' && needs.build-postgresql.result == 'skipped')) &&
           ((needs.plan.outputs.has_apache_updates == 'true' && needs.build-apache.result == 'success') ||
            (needs.plan.outputs.has_apache_updates == 'false' && needs.build-apache.result == 'skipped')) }}
-    needs: [plan, build-php, build-redis, build-apache]
+    needs: [plan, build-php, build-redis, build-postgresql, build-apache]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

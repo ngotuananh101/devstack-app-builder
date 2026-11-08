@@ -46,6 +46,61 @@ def packaged(directory):
     return directory / "assets"
 
 
+def redis_metadata():
+    return {"schema_version": 1, "runtime": "redis", "redis": {"version": "8.10.3", "tls": False},
+            "target": "musl", "architecture": "x86_64", "build_id": "redisfixture", "verification": "PASSED",
+            "builder": {"commit": COMMIT}, "libc": {"family": "musl", "minimum_version": None, "static": True}}
+
+
+POSTGRES_EXECUTABLES = ("bin/postgres", "bin/initdb", "bin/pg_ctl", "bin/psql", "bin/pg_dump", "bin/pg_config")
+
+
+def postgres_module(name):
+    from test_postgresql import module as load_postgres
+    return load_postgres(name)
+
+
+def postgres_metadata(version="18.6", build_id="pgfixture"):
+    record = {"schema_version": 1, "runtime": "postgresql",
+              "postgresql": {"version": version, "major": version.split(".")[0]},
+              "target": "musl-dynamic", "architecture": "x86_64", "linkage": "dynamic",
+              "build_id": build_id, "verification": "PASSED",
+              "loader": {"path": LOADER, "sha256": "0" * 64, "musl_version": "1.2.5"},
+              "locale": {"default_provider": "builtin", "default_locale": "C.UTF-8",
+                         "alternate": "PG_UNICODE_FAST" if version.startswith("18") else None},
+              "modules": {"included": [{"name": "oid2name", "kind": "cli"},
+                                       {"name": "auto_explain", "kind": "preload"},
+                                       {"name": "pgoutput", "kind": "shared"},
+                                       {"name": "hstore", "kind": "sql"}],
+                          "skipped": [{"name": "plperl", "reason": "Perl embedding is not part of this bundle."}]},
+              "icu": {"decision": "with_icu", "reason": "zig c++ compiled ICU 79.1"},
+              "libraries": [], "binaries": [], "checks": ["server-version"],
+              "verification_strategy": "bwrap", "builder": {"commit": COMMIT},
+              "source_archive": f"share/sources/postgresql-{version}.tar.bz2"}
+    return record
+
+
+def postgres_bundle(directory, manifest=None):
+    bundle = directory / "postgres-bundle"
+    for executable in POSTGRES_EXECUTABLES:
+        path = bundle / executable
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\nexit 0\n")
+        path.chmod(0o755)
+    loader = bundle / LOADER
+    loader.parent.mkdir(parents=True, exist_ok=True)
+    loader.write_bytes(b"loader fixture")
+    loader.chmod(0o755)
+    (bundle / "manifest.json").write_text(json.dumps(manifest or postgres_metadata()))
+    return bundle
+
+
+def packaged_postgres(directory, manifest=None, output="assets"):
+    bundle = postgres_bundle(directory, manifest)
+    postgres_module("bundle").package(bundle, directory / output)
+    return directory / output
+
+
 class PublishContracts(unittest.TestCase):
     def setUp(self):
         self.module = load("publish")
@@ -142,6 +197,201 @@ class PublishContracts(unittest.TestCase):
             packager.package(redis, root / "bad-assets")
             with self.assertRaises(ValueError):
                 self.module.validate_assets(root / "bad-assets")
+
+    def test_assets_accept_only_postgresql_identity_and_required_commands(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assets = packaged_postgres(root)
+            self.assertEqual(len(self.module.validate_assets(assets)), 3)
+            defects = {
+                "version_shape": lambda manifest: manifest["postgresql"].update(version="16.4"),
+                "target": lambda manifest: manifest.update(target="musl"),
+                "architecture": lambda manifest: manifest.update(architecture="aarch64"),
+                "linkage": lambda manifest: manifest.update(linkage="static"),
+                "profile": lambda manifest: manifest.update(profile="minimal"),
+                "loader_path": lambda manifest: manifest["loader"].update(path="lib/ld-musl-x86_64.so.1"),
+                "schema": lambda manifest: manifest.update(schema_version=2),
+                # The recorded major is part of the identity: an 18.6 archive
+                # whose manifest calls itself 17 is not the bundle it is named for.
+                "major": lambda manifest: manifest["postgresql"].update(major="17"),
+                "major_missing": lambda manifest: manifest["postgresql"].pop("major"),
+                # Publication accepts the mask only; the poison-file fallback
+                # proves strictly less and is a local convenience, not evidence.
+                "verification_strategy": lambda manifest: manifest.update(verification_strategy="poison-file"),
+                "verification_strategy_missing": lambda manifest: manifest.pop("verification_strategy"),
+            }
+            for defect, corrupt in defects.items():
+                with self.subTest(defect=defect), tempfile.TemporaryDirectory() as inner:
+                    manifest = postgres_metadata()
+                    corrupt(manifest)
+                    with self.assertRaises(ValueError):
+                        self.module.validate_assets(packaged_postgres(Path(inner), manifest, defect))
+            # The required commands are the bin/ launchers; the raw ELFs live in libexec/bin.
+            for defect, executables in (("libexec_only", tuple("libexec/bin/" + name.split("/")[1] for name in POSTGRES_EXECUTABLES)),
+                                        ("missing_launcher", POSTGRES_EXECUTABLES[1:])):
+                with self.subTest(defect=defect), tempfile.TemporaryDirectory() as inner:
+                    bundle = Path(inner) / "bundle"
+                    for executable in executables:
+                        path = bundle / executable
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_text("#!/bin/sh\nexit 0\n")
+                        path.chmod(0o755)
+                    loader = bundle / LOADER
+                    loader.parent.mkdir(parents=True, exist_ok=True)
+                    loader.write_bytes(b"loader fixture")
+                    loader.chmod(0o755)
+                    (bundle / "manifest.json").write_text(json.dumps(postgres_metadata()))
+                    postgres_module("bundle").package(bundle, Path(inner) / "assets")
+                    with self.assertRaises(ValueError):
+                        self.module.validate_assets(Path(inner) / "assets")
+
+    def test_assets_reject_a_postgresql_bundle_without_the_loader(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assets = packaged_postgres(root)
+            self.assertEqual(len(self.module.validate_assets(assets)), 3)
+            for defect in ("missing", "empty", "not_executable"):
+                with self.subTest(defect=defect), tempfile.TemporaryDirectory() as inner:
+                    bundle = postgres_bundle(Path(inner))
+                    loader = bundle / LOADER
+                    if defect == "missing":
+                        loader.unlink()
+                    elif defect == "empty":
+                        loader.write_bytes(b"")
+                    else:
+                        loader.chmod(0o644)
+                    postgres_module("bundle").package(bundle, Path(inner) / "assets")
+                    with self.assertRaisesRegex(ValueError, "loader"):
+                        self.module.validate_assets(Path(inner) / "assets")
+
+    def test_assets_accept_only_relative_postgresql_shared_object_aliases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle = postgres_bundle(root)
+            library = bundle / "lib/libpq.so.5.18"
+            library.parent.mkdir(parents=True, exist_ok=True)
+            library.write_bytes(b"library fixture")
+            (bundle / "lib/libpq.so.5").symlink_to("libpq.so.5.18")
+            postgres_module("bundle").package(bundle, root / "assets")
+            self.assertEqual(len(self.module.validate_assets(root / "assets")), 3)
+            for defect, linkname in (("dangling", "libpq.so.6.0"), ("escaping", "../../outside"),
+                                     ("not_a_file", ".")):
+                with self.subTest(defect=defect), tempfile.TemporaryDirectory() as inner:
+                    bundle = postgres_bundle(Path(inner))
+                    (bundle / "lib").mkdir(parents=True, exist_ok=True)
+                    (bundle / "lib/libpq.so.5").symlink_to(linkname)
+                    postgres_module("bundle").package(bundle, Path(inner) / "assets")
+                    with self.assertRaises(ValueError):
+                        self.module.validate_assets(Path(inner) / "assets")
+
+    def test_plan_accepts_three_runtime_matrices_and_requires_exact_coverage(self):
+        policy = plan()
+        policy["redis_matrix"] = {"include": [{"redis_version": "8.10.3", "target": "musl", "architecture": "x86_64", "previous_version": None}]}
+        postgres_rows = [{"postgresql_version": "18.6", "target": "musl-dynamic", "architecture": "x86_64", "previous_version": None},
+                         {"postgresql_version": "17.11", "target": "musl-dynamic", "architecture": "x86_64", "previous_version": "17.11"}]
+        policy["postgres_matrix"] = {"include": copy.deepcopy(postgres_rows)}
+        bundles = [metadata(), redis_metadata(), postgres_metadata("18.6"), postgres_metadata("17.11")]
+        self.module.validate_plan(policy, bundles, TAG, REPOSITORY, COMMIT)
+        # A plan whose only rows are PostgreSQL must not be read as an empty matrix.
+        policy["matrix"] = {"include": []}
+        policy["redis_matrix"] = {"include": []}
+        self.module.validate_plan(policy, bundles[2:], TAG, REPOSITORY, COMMIT)
+        # The emptiness guard still exists: all three matrices empty is no release.
+        empty = copy.deepcopy(policy)
+        empty["postgres_matrix"] = {"include": []}
+        with self.assertRaisesRegex(ValueError, "Empty/invalid publication matrix"):
+            self.module.validate_plan(empty, [], TAG, REPOSITORY, COMMIT)
+        postgres_bundles = copy.deepcopy(bundles[2:])
+
+        def bundle_defect(data):
+            return lambda: (copy.deepcopy(postgres_rows), data)
+
+        cases = {
+            "missing_bundle": bundle_defect(postgres_bundles[:1]),
+            "extra_bundle": bundle_defect(postgres_bundles + [postgres_metadata("17.11", "other")]),
+            "manifest_profile": lambda: (
+                copy.deepcopy(postgres_rows),
+                [dict(copy.deepcopy(postgres_bundles[0]), profile="minimal"), copy.deepcopy(postgres_bundles[1])]),
+            "manifest_linkage": lambda: (
+                copy.deepcopy(postgres_rows),
+                [dict(copy.deepcopy(postgres_bundles[0]), linkage="static"), copy.deepcopy(postgres_bundles[1])]),
+            "manifest_builder": lambda: (
+                copy.deepcopy(postgres_rows),
+                [dict(copy.deepcopy(postgres_bundles[0]), builder={"commit": "b" * 40}), copy.deepcopy(postgres_bundles[1])]),
+            "manifest_version": lambda: (
+                copy.deepcopy(postgres_rows),
+                [postgres_metadata("18.5"), copy.deepcopy(postgres_bundles[1])]),
+        }
+        for field, value in (("postgresql_version", "18.7"), ("postgresql_version", "18"),
+                             ("target", "musl"), ("architecture", "aarch64"), ("profile", "minimal")):
+            def row_defect(field=field, value=value):
+                rows = copy.deepcopy(postgres_rows)
+                rows[0][field] = value
+                return rows, copy.deepcopy(postgres_bundles)
+            cases[f"row_{field}_{value}"] = row_defect
+
+        def previous_mismatch():
+            rows = copy.deepcopy(postgres_rows)
+            rows[1]["previous_version"] = "17.10"
+            return rows, copy.deepcopy(postgres_bundles)
+
+        def duplicate_row():
+            rows = copy.deepcopy(postgres_rows)
+            rows.append(copy.deepcopy(rows[0]))
+            return rows, copy.deepcopy(postgres_bundles)
+        cases["previous_mismatch"] = previous_mismatch
+        cases["duplicate_row"] = duplicate_row
+
+        def wrong_recorded_major():
+            # The version says 18.6 and the manifest's own major says 17: the
+            # bundle is not the one the plan selected, whatever its name.
+            data = copy.deepcopy(postgres_bundles)
+            data[0]["postgresql"]["major"] = "17"
+            return copy.deepcopy(postgres_rows), data
+
+        def poison_verified():
+            # A bundle verified without the mask is not the same evidence.
+            data = copy.deepcopy(postgres_bundles)
+            data[0]["verification_strategy"] = "poison-file"
+            return copy.deepcopy(postgres_rows), data
+        cases["manifest_major"] = wrong_recorded_major
+        cases["manifest_verification_strategy"] = poison_verified
+        for defect, build in cases.items():
+            with self.subTest(defect=defect):
+                broken = copy.deepcopy(policy)
+                rows, data = build()
+                broken["postgres_matrix"]["include"] = rows
+                with self.assertRaises(ValueError):
+                    self.module.validate_plan(broken, data, TAG, REPOSITORY, COMMIT)
+
+    def test_notes_describe_the_locale_contract_and_every_built_module(self):
+        eighteen = postgres_metadata("18.6")
+        seventeen = postgres_metadata("17.11")
+        notes = self.module.release_notes([eighteen, seventeen], REPOSITORY, COMMIT)
+        for expected in ("PostgreSQL", "18.6", "17.11", "musl-dynamic", "x86_64", "pgfixture",
+                         "builtin", "C.UTF-8", "PG_UNICODE_FAST", "code-point",
+                         "`cli`", "`preload`", "`shared`", "`sql`", "oid2name", "auto_explain", "pgoutput", "hstore",
+                         "plperl", "Perl embedding is not part of this bundle."):
+            self.assertIn(expected, notes, expected)
+        self.assertNotIn('COLLATE "C.UTF-8"', notes)
+        self.assertIn("strcoll", notes)
+        self.assertIn("code-point order", notes)
+        # A 17-only release must not claim the alternate collation 17 does not carry.
+        seventeen_only = self.module.release_notes([seventeen], REPOSITORY, COMMIT)
+        self.assertIn("C.UTF-8", seventeen_only)
+        self.assertNotIn("PG_UNICODE_FAST", seventeen_only)
+        # The inventory is read from the manifest, never hardcoded for 18.
+        trimmed = copy.deepcopy(eighteen)
+        trimmed["modules"] = {"included": [{"name": "only_this", "kind": "sql"}],
+                              "skipped": [{"name": "excluded_one", "reason": "Not part of this bundle."}]}
+        trimmed_notes = self.module.release_notes([trimmed], REPOSITORY, COMMIT)
+        self.assertIn("only_this", trimmed_notes)
+        self.assertIn("excluded_one", trimmed_notes)
+        self.assertNotIn("pgoutput", trimmed_notes)
+        # A mixed release still describes PHP and Redis exactly as before.
+        mixed = self.module.release_notes([metadata(), redis_metadata(), eighteen], REPOSITORY, COMMIT, plan())
+        for expected in ("PHP", "Redis", "PostgreSQL", "No profiles", "fully static musl", "C.UTF-8"):
+            self.assertIn(expected, mixed, expected)
 
     def test_mixed_notes_describe_fully_static_redis(self):
         redis = {"runtime": "redis", "redis": {"version": "8.10.3", "tls": False}, "target": "musl", "architecture": "x86_64", "build_id": "redisfixture", "libc": {"family": "musl", "minimum_version": None, "static": True}}

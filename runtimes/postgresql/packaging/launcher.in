@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+# Resolve from the executable, never from the caller's current directory.
+ROOT=$(CDPATH='' cd -P -- "$(dirname -- "$0")/.." && pwd)
+. "$ROOT/libexec/launch.sh"
+exec "$ROOT/lib/musl/ld-musl-x86_64.so.1" --library-path "$ROOT/lib:$ROOT/lib/musl" \
+  --argv0 "$ROOT/bin/@COMMAND@" "$ROOT/libexec/bin/@COMMAND@" "$@"

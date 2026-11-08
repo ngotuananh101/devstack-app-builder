@@ -1,0 +1,38 @@
+{
+  "zig": {
+    "version": "0.17.1",
+    "musl_version": "1.2.5"
+  },
+  "configure": {
+    "shared": [
+      "--disable-rpath",
+      "--with-ssl=openssl",
+      "--with-zlib",
+      "--with-uuid=e2fs",
+      "--with-libxml",
+      "--with-icu",
+      "--without-readline",
+      "--without-llvm",
+      "--without-perl",
+      "--without-python",
+      "--without-tcl",
+      "--without-lz4",
+      "--without-zstd",
+      "--without-pam",
+      "--without-systemd",
+      "--without-bonjour",
+      "--without-selinux",
+      "--without-gssapi",
+      "--without-ldap",
+      "--without-libcurl"
+    ],
+    "cppflags": "-D_GNU_SOURCE -idirafter /usr/include",
+    "make_target": "world-bin",
+    "install_target": "install-world-bin"
+  },
+  "locale": {
+    "provider": "builtin",
+    "default": "C.UTF-8",
+    "alternate_18": "PG_UNICODE_FAST"
+  }
+}
