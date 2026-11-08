@@ -24,6 +24,7 @@ import re
 import shutil
 import struct
 import subprocess
+import sys
 import tarfile
 import tempfile
 
@@ -819,21 +820,37 @@ def _mask_arguments(workspace):
     return arguments
 
 
-def _bwrap_usable():
-    """Whether bwrap can create the namespaces the masking needs, right now."""
+def _bwrap_diagnosis():
+    """Whether bwrap can mask right now, and why not when it cannot.
+
+    The reason is not decoration. Which isolation strategy ran decides whether a
+    bundle may be published at all, so a runner that silently falls back leaves
+    nobody able to tell a deliberate fallback from a broken mask. GitHub's
+    hosted runners install bubblewrap and still refuse the user namespace the
+    mask needs, and only bwrap knows which restriction did it; reporting what it
+    said is what tells an operator to publish from a host that can create one.
+    """
     executable = shutil.which("bwrap")
     if executable is None:
-        return False
+        return False, "bwrap is not installed"
     workspace = _workspace()
     try:
         result = subprocess.run(
             [executable, *_mask_arguments(workspace), "--", "/bin/sh", "-c", "exit 0"],
             text=True, capture_output=True, timeout=60)
-    except (OSError, subprocess.TimeoutExpired):
-        return False
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"bwrap could not start: {exc}"
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
-    return result.returncode == 0
+    if result.returncode == 0:
+        return True, "bwrap created the mask"
+    detail = (result.stderr.strip() or result.stdout.strip()).splitlines()
+    return False, f"bwrap exit {result.returncode}: {detail[-1] if detail else 'no output'}"
+
+
+def _bwrap_usable():
+    """Whether bwrap can create the namespaces the masking needs, right now."""
+    return _bwrap_diagnosis()[0]
 
 
 def _masked_host_loaders_probe():
@@ -932,15 +949,23 @@ def assert_no_host_loaders(bundle=None):
     own --library-path instead. Raises when neither can run: reporting PASSED
     with no isolation is the false pass this task exists to prevent, so
     "nothing was available" is a failure, never a quieter PASSED.
+
+    A fallback is logged with its cause. Which strategy ran decides whether the
+    bundle may be published, so the reason has to be in the build log where an
+    operator choosing a publication host will read it.
     """
-    if _bwrap_usable():
+    usable, reason = _bwrap_diagnosis()
+    if usable:
         return _masked_host_loaders_probe()
     if bundle is not None and _poison_probe(bundle):
+        print(f"bwrap unavailable ({reason}); proving the loader with the poison-file "
+              "fallback instead. A bundle verified this way is not published.",
+              file=sys.stderr, flush=True)
         return "poison-file"
     raise ValueError(
-        "Cannot prove host loader independence: bwrap cannot create namespaces and "
-        "the poison-file probe did not run. A PASSED without one of them could be "
-        "a pass produced by the host's own loader.")
+        "Cannot prove host loader independence: bwrap cannot mask here "
+        f"({reason}) and the poison-file probe did not run. A PASSED without one "
+        "of them could be a pass produced by the host's own loader.")
 
 
 def _isolation(workspace, strategy):

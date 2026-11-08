@@ -174,6 +174,10 @@ The `verify` subcommand is the sole writer of the `verification` field in `manif
 
 Real check counts recorded in `manifest.json`: **124 checks** for 17.11 and **130 checks** for 18.6.
 
+**Only a `bwrap` verification is publishable.** `publish.py` rejects a PostgreSQL bundle whose `verification_strategy` is `"poison-file"`, because that probe proves strictly less: it shows the bundle's commands resolve every vendored library through the launcher's `--library-path`, but it never enters a sandbox where the host's own loader is unusable. The fallback is a build-host convenience, not publication evidence.
+
+**A GitHub-hosted `ubuntu-24.04` runner does not produce a publishable PostgreSQL bundle.** It installs bubblewrap, but `bwrap` there does not create the user namespace the mask needs, so `verify` takes the poison fallback and prints the reason it read from `bwrap`. The CI build therefore proves the bundle builds, stages and runs a real cluster; publication has to run on a host where `bwrap` works (a self-hosted runner or a workstation), where the same `./build.sh postgresql <version>` records `verification_strategy: "bwrap"`.
+
 ### Assets and the never-overwrite rule
 
 Verified bundles generate three immutable release assets:

@@ -1,4 +1,5 @@
 """PostgreSQL source authenticity and CLI contracts."""
+import contextlib
 import hashlib
 import importlib.util
 import io
@@ -2443,6 +2444,31 @@ class PostgreSQLVerifyTests(unittest.TestCase):
         if not self.bundle._bwrap_usable():
             self.skipTest("bwrap cannot create namespaces on this host")
         self.assertEqual(self.bundle._masked_host_loaders_probe(), "bwrap")
+
+    def test_the_bwrap_diagnosis_names_why_the_mask_is_unavailable(self):
+        # The reason decides whether a bundle may be published, so a silent
+        # fallback is not acceptable: an operator has to be able to read the log
+        # and know whether to publish from another host.
+        usable, reason = self.bundle._bwrap_diagnosis()
+        self.assertIs(usable, self.bundle._bwrap_usable())
+        self.assertTrue(reason, "a diagnosis always carries a reason")
+        with mock.patch.object(self.bundle.shutil, "which", return_value=None):
+            self.assertEqual(self.bundle._bwrap_diagnosis(),
+                             (False, "bwrap is not installed"))
+
+    def test_a_poison_fallback_states_its_reason_and_that_it_publishes_nothing(self):
+        # The fallback must be visible where the conclusion is printed. Silence
+        # here is how a runner with a broken mask reads as a clean verification.
+        with tempfile.TemporaryDirectory() as temp:
+            bundle = self.staged(Path(temp))
+            with mock.patch.object(self.bundle, "_bwrap_diagnosis",
+                                   return_value=(False, "apparmor refused the user namespace")), \
+                    mock.patch.object(self.bundle, "_poison_probe", return_value=True), \
+                    contextlib.redirect_stderr(io.StringIO()) as errors:
+                strategy = self.bundle.assert_no_host_loaders(bundle)
+        self.assertEqual(strategy, "poison-file")
+        self.assertIn("apparmor refused the user namespace", errors.getvalue())
+        self.assertIn("not published", errors.getvalue())
 
     # -- lifecycle and relocation -----------------------------------------
 
