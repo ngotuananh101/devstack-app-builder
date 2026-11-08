@@ -144,6 +144,12 @@ def load_expected(major: str) -> dict:
         names = expected[kind]
         if not isinstance(names, list):
             raise ValueError(f"Kind {kind!r} in expected modules for {major} must be a list")
+        # An empty kind makes every guard for that kind a no-op while reading as
+        # a considered statement: `shared: []` once sat here against a tree with
+        # 36 shared libraries. Every kind has modules in every supported major,
+        # so an empty list is a broken config, not a legitimate zero.
+        if not names:
+            raise ValueError(f"Kind {kind!r} in expected modules for {major} must not be empty")
         if names != sorted(names):
             raise ValueError(f"Kind {kind!r} in expected modules for {major} must be sorted")
         for name in names:
@@ -175,9 +181,11 @@ def generate(install_root: Path, major: str) -> dict:
     paste-in step, and the exclusions this file carries are per-runtime.
 
     A path that is not a directory, or a tree with nothing recognisable in it,
-    is refused rather than returned as an empty object: an empty block is
-    trivially sorted, `load_expected` accepts it, and every module guard would
-    then pass while checking nothing.
+    is refused rather than returned as an empty object: an empty block used to
+    be trivially sorted and accepted by `load_expected`, which turned every
+    module guard into a no-op. `load_expected` now refuses an empty kind, so an
+    empty subtree here would only move that failure to the paste-in step; it is
+    refused here too, where the message can name the tree and the kind.
     """
     if not isinstance(major, str) or major not in MAJORS:
         raise ValueError(f"Unsupported major {major!r}; supported majors are {MAJORS}")
@@ -187,8 +195,9 @@ def generate(install_root: Path, major: str) -> dict:
     generated: dict[str, list[str]] = {kind: [] for kind in KINDS}
     for row in inventory(install_root):
         generated[row["kind"]].append(row["name"])
-    if not any(generated.values()):
-        raise ValueError(f"Install tree {str(install_root)!r} has no modules; "
+    empty = [kind for kind in KINDS if not generated[kind]]
+    if empty:
+        raise ValueError(f"Install tree {str(install_root)!r} has no {', '.join(empty)} modules; "
                          "refusing to generate an empty expected-module list")
     # Sorted because load_expected rejects an unsorted list; KINDS order because
     # that is the order the config file carries the blocks in.

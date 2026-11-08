@@ -55,7 +55,12 @@ COPY_TOP_LEVEL = ("bin", "lib", "share", "include")
 # these instead of its own would pass on the build host and fail everywhere
 # else, so verification makes each of them unusable before it starts a server.
 HOST_LOADERS = ("/lib/ld-musl-x86_64.so.1", "/lib64/ld-musl-x86_64.so.1",
-                "/usr/lib/ld-musl-x86_64.so.1", "/usr/lib64/ld-musl-x86_64.so.1")
+                "/usr/lib/ld-musl-x86_64.so.1", "/usr/lib64/ld-musl-x86_64.so.1",
+                # `make install` for musl defaults to --prefix=/usr/local, so a
+                # source install leaves the loader here, where neither the
+                # distro paths above nor the musl-dev tree below would find it.
+                "/usr/local/lib/ld-musl-x86_64.so.1",
+                "/usr/local/lib64/ld-musl-x86_64.so.1")
 # A musl-dev tree ships the loader again, and `cc -print-file-name=` style
 # probes find it there. Masking the directory hides every copy at once.
 HOST_LOADER_TREES = ("/usr/x86_64-linux-musl/lib64",)
@@ -548,11 +553,15 @@ def stage(install_root, output, request, provenance, repo_root):
 
     inventory = modules.inventory(output)
     expected = modules.load_expected(major)
+    # Every difference is fatal, not just a missing module. The config is
+    # generated from the staged trees themselves, so a module the tree has and
+    # the config does not means the build installed something nobody reviewed —
+    # and an `unexpected` line dropped on the floor is how `shared: []` once
+    # read as a verified empty set. `stage()` reports it; it does not skip it.
     differences = modules.compare(inventory, expected)
-    missing = [line for line in differences if line.startswith("missing ")]
-    if missing:
-        raise ValueError("The build did not install every expected module: "
-                         + "; ".join(missing))
+    if differences:
+        raise ValueError("The build did not install exactly the expected modules: "
+                         + "; ".join(differences))
 
     manifest = {
         "schema_version": SCHEMA_VERSION,
@@ -764,48 +773,62 @@ def _masked_host_loaders_probe():
 
 
 def _poison_probe(bundle):
-    """Fallback: prove a staged command resolves its libraries only from the bundle.
+    """Fallback: prove every staged command resolves its libraries only from the bundle.
 
-    Used only when bwrap genuinely cannot run. Every staged command resolves
-    its NEEDED libraries through the launcher's `--library-path`, never from a
-    default host directory. The probe proves that by prepending a directory
-    holding a zero-byte file named after a library the command NEEDS: the
-    loader must then fail with "Exec format error" rather than quietly falling
-    back to a host copy. A command that still succeeds resolved that library
-    from somewhere the launcher does not control, and a command that fails
-    without the poison is not resolvable at all.
+    Used only when bwrap genuinely cannot run, and it proves strictly less than
+    the mask, so it must prove as much as it can: every launcher, not one
+    hand-picked command. Each staged command resolves its NEEDED libraries
+    through the launcher's `--library-path`, never from a default host
+    directory. For each command the probe prepends a directory holding a
+    zero-byte file named after a library that command NEEDS and that the bundle
+    carries: the loader must then fail with "Exec format error" rather than
+    quietly falling back to a host copy. A command that still succeeds resolved
+    that library from somewhere the launcher does not control, and a command
+    that fails without the poison is not resolvable at all.
+
+    A command with no bundle-resident NEEDED library (pg_config links only
+    libc, which is the loader itself) has nothing to prove here and is skipped;
+    the mask, which is the strategy that actually gets published, still covers
+    it. The probe returns False unless at least one command proved the point,
+    so "no command had anything to prove" can never read as success.
     """
     bundle = Path(bundle)
-    command = next((name for name in ("psql", "postgres", "pg_dump")
-                    if (bundle / "bin" / name).is_file()), None)
-    if command is None:
+    library_dir = bundle / "lib"
+    if not library_dir.is_dir():
         return False
-    launcher = bundle / "bin" / command
-    try:
-        _run([launcher, "--version"], env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
-    except (ValueError, OSError):
-        return False
-    needed = [name for name in _needed(bundle / "libexec/bin" / command)
-              if name not in LOADER_LIBRARIES and (bundle / "lib" / name).exists()]
-    if not needed:
-        return False
-    workspace = _workspace()
-    try:
-        poison = workspace / "poison"
-        poison.mkdir()
-        for name in needed:
-            (poison / name).touch()
-        library_path = f"{poison}:{bundle / 'lib'}:{bundle / 'lib/musl'}"
-        result = subprocess.run(
-            [str(bundle / launchers.LOADER), "--library-path", library_path,
-             "--argv0", str(launcher), str(bundle / "libexec/bin" / command), "--version"],
-            text=True, capture_output=True, timeout=300,
-            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    finally:
-        shutil.rmtree(workspace, ignore_errors=True)
-    return result.returncode != 0
+    proved = 0
+    for raw in sorted((bundle / "libexec/bin").iterdir()):
+        launcher = bundle / "bin" / raw.name
+        if not launcher.is_file() or not raw.is_file():
+            continue
+        needed = [name for name in _needed(raw)
+                  if name not in LOADER_LIBRARIES and (library_dir / name).exists()]
+        if not needed:
+            continue
+        try:
+            _run([launcher, "--version"], env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+        except (ValueError, OSError):
+            return False
+        workspace = _workspace()
+        try:
+            poison = workspace / "poison"
+            poison.mkdir()
+            for name in needed:
+                (poison / name).touch()
+            library_path = f"{poison}:{bundle / 'lib'}:{bundle / 'lib/musl'}"
+            result = subprocess.run(
+                [str(bundle / launchers.LOADER), "--library-path", library_path,
+                 "--argv0", str(launcher), str(raw), "--version"],
+                text=True, capture_output=True, timeout=300,
+                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
+        if result.returncode == 0:
+            return False
+        proved += 1
+    return proved > 0
 
 
 def assert_no_host_loaders(bundle=None):
@@ -1278,23 +1301,56 @@ def pg_config_paths(root, strategy="bwrap"):
 
 
 def _check_launchers(bundle):
-    """Every bin/<command> is a regular, executable launcher; none is a symlink."""
-    for path in sorted((Path(bundle) / "bin").iterdir()):
+    """bin/ is exactly one shell launcher per raw binary, and never a raw ELF.
+
+    Being a regular executable file is not enough: a stray 0755 ELF dropped in
+    bin/ passes that test and then runs against the host interpreter, which is
+    the one failure this layout exists to prevent. So no entry may be an ELF,
+    every entry must be a script, and the two directories must name the same set
+    — a launcher with no binary behind it, or a binary nothing launches, both
+    mean the bundle is not the shape the launcher contract describes.
+    """
+    bundle = Path(bundle)
+    bin_dir, libexec_bin = bundle / "bin", bundle / "libexec/bin"
+    if not bin_dir.is_dir():
+        raise ValueError("The bundle has no bin/ directory")
+    if not libexec_bin.is_dir():
+        raise ValueError("The bundle has no libexec/bin/ directory")
+    raw = {path.name for path in libexec_bin.iterdir() if not path.name.endswith(".sh")}
+    launched = set()
+    for path in sorted(bin_dir.iterdir()):
         if path.is_symlink():
             raise ValueError(f"bin/{path.name} is a symlink; launchers resolve their own root")
         if not path.is_file():
             raise ValueError(f"bin/{path.name} is not a regular file")
         if not os.access(path, os.X_OK):
             raise ValueError(f"bin/{path.name} is not executable")
+        head = path.read_bytes()[:4]
+        if head == b"\x7fELF":
+            raise ValueError(f"bin/{path.name} is a raw ELF; bin/ holds launchers only")
+        if not path.read_bytes().startswith(b"#!"):
+            raise ValueError(f"bin/{path.name} is not a shell launcher")
+        if path.name not in raw:
+            raise ValueError(f"bin/{path.name} has no raw binary in libexec/bin")
+        launched.add(path.name)
+    missing = sorted(raw - launched)
+    if missing:
+        raise ValueError(f"Raw binaries with no launcher: {', '.join(missing)}")
 
 
 def _check_module_inventory(bundle, manifest):
-    """Compared against the pinned list; a missing module is fatal, an extra is not."""
+    """Compared against the pinned list; any difference is fatal, in either direction.
+
+    An extra module used to be dropped here on purpose, which made the check
+    one-directional: a bundle could gain a module nothing reviewed and still
+    verify. The config is generated from the staged trees, so a difference in
+    either direction means the bundle is not the one that was reviewed.
+    """
     major = manifest["postgresql"]["major"]
     differences = modules.compare(modules.inventory(bundle), modules.load_expected(major))
-    missing = [line for line in differences if line.startswith("missing")]
-    if missing:
-        raise ValueError(f"The bundle is missing expected modules: {'; '.join(missing)}")
+    if differences:
+        raise ValueError(f"The bundle's module inventory does not match the pinned set: "
+                         f"{'; '.join(differences)}")
     return differences
 
 
@@ -1307,6 +1363,10 @@ def _verify_binaries(bundle, manifest):
         path = Path(bundle) / relative
         if path.is_symlink():
             raise ValueError(f"Staged binary is a symlink: {row['path']}")
+        # A missing file is a changed bundle, and must read as one rather than
+        # as a FileNotFoundError from the digester.
+        if not path.is_file():
+            raise ValueError(f"Staged binary is missing: {row['path']}")
         if digest(path) != row["sha256"]:
             raise ValueError(f"Staged binary changed after staging: {row['path']}")
         actual = elf(path)

@@ -480,6 +480,25 @@ class PostgreSQLModulesTests(unittest.TestCase):
     def test_kinds_constant_order(self):
         self.assertEqual(self.modules.KINDS, ("sql", "preload", "cli", "shared"))
 
+    def test_load_expected_refuses_an_empty_kind(self):
+        # `shared: []` against a tree with 36 shared libraries is the defect the
+        # generated config exists to fix. Accepting an empty list lets any guard
+        # for that kind pass while checking nothing, so it is refused outright.
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "modules.json"
+            old_config = self.modules.CONFIG
+            try:
+                for kind in self.modules.KINDS:
+                    with self.subTest(kind=kind):
+                        block = {name: [f"{name}_module"] for name in self.modules.KINDS}
+                        block[kind] = []
+                        config.write_text(json.dumps({"18": block}))
+                        self.modules.CONFIG = config
+                        with self.assertRaisesRegex(ValueError, kind):
+                            self.modules.load_expected("18")
+            finally:
+                self.modules.CONFIG = old_config
+
     def test_inventory_supports_extension_directory_fallback(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -1773,6 +1792,21 @@ class PostgreSQLConfigReconciliationTests(unittest.TestCase):
             self.assertIn("ValueError", run.stderr)
             self.assertEqual(run.stdout, "")
 
+    def test_generate_refuses_a_tree_missing_one_kind(self):
+        # A partial tree is the same trap one kind at a time: emitting
+        # `cli: []` from a tree that has no bin/ would be pasted into the config
+        # and accepted, making the cli guard a no-op. `load_expected` now
+        # refuses an empty kind, so generate must refuse first and say which.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "share/extension").mkdir(parents=True)
+            (root / "lib").mkdir()
+            (root / "bin").mkdir()
+            (root / "share/extension/hstore.control").write_text("")
+            (root / "lib/auto_explain.so").write_text("")
+            with self.assertRaisesRegex(ValueError, "cli"):
+                self.modules.generate(root, "18")
+
     def test_the_committed_shared_lists_are_generated_not_empty(self):
         # The exact defect this reconciliation exists to fix: `shared: []`
         # against a tree with 36 shared libraries.
@@ -2105,6 +2139,55 @@ class PostgreSQLVerifyTests(unittest.TestCase):
                     self.bundle.verify(bundle)
             self.assertEqual(json.loads((bundle / "manifest.json").read_text())["verification"],
                              "NOT_RUN")
+
+    def test_verify_refuses_a_module_the_pinned_set_does_not_name(self):
+        # An extra module used to be dropped on the floor, which made the check
+        # one-directional: a bundle could gain a module nothing reviewed and
+        # still verify. The config is generated from the staged trees, so a
+        # difference in either direction means the bundle is not the reviewed one.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = self.staged(root)
+            self.write(bundle, self.manifest())
+            inventory = (self.modules.inventory(bundle)
+                         + [{"name": "stowaway", "kind": "shared"}])
+            with mock.patch.object(self.bundle, "lifecycle"), \
+                    mock.patch.object(self.bundle, "assert_no_host_loaders", return_value="bwrap"), \
+                    mock.patch.object(self.bundle.modules, "inventory", return_value=inventory):
+                with self.assertRaisesRegex(ValueError, "unexpected shared: stowaway"):
+                    self.bundle.verify(bundle)
+            self.assertEqual(json.loads((bundle / "manifest.json").read_text())["verification"],
+                             "NOT_RUN")
+
+    def test_verify_refuses_a_raw_elf_left_in_bin(self):
+        # A stray 0755 ELF passes the regular-executable test and then runs
+        # against the host interpreter — the one failure this layout prevents.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = self.staged(root)
+            self.write(bundle, self.manifest())
+            stray = bundle / "bin/postgres-real"
+            stray.write_bytes(b"\x7fELFstray")
+            stray.chmod(0o755)
+            with self.assertRaisesRegex(ValueError, "postgres-real"):
+                self.bundle._check_launchers(bundle)
+
+    def test_verify_refuses_a_launcher_with_no_raw_binary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = self.staged(root)
+            (bundle / "bin/orphan").write_text("#!/bin/sh\nexit 0\n")
+            (bundle / "bin/orphan").chmod(0o755)
+            with self.assertRaisesRegex(ValueError, "orphan"):
+                self.bundle._check_launchers(bundle)
+
+    def test_verify_refuses_a_raw_binary_with_no_launcher(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = self.staged(root)
+            (bundle / "bin/psql").unlink()
+            with self.assertRaisesRegex(ValueError, "psql"):
+                self.bundle._check_launchers(bundle)
 
     # -- host loader masking ----------------------------------------------
 

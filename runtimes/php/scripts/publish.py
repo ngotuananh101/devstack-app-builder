@@ -16,6 +16,27 @@ POSTGRES_SOURCES = Path(__file__).resolve().parents[2] / "postgresql/config/sour
 POSTGRES_EXECUTABLES = ("bin/postgres", "bin/initdb", "bin/pg_ctl", "bin/psql", "bin/pg_dump", "bin/pg_config")
 
 
+def _pinned_postgres_versions() -> list:
+    """The pinned PostgreSQL versions a plan is allowed to name.
+
+    The pin file is repository input the planner already validated, but this
+    script reads it independently, so a missing or malformed file must fail as
+    a ValueError naming the path rather than as a traceback out of the JSON
+    parser in the middle of plan validation.
+    """
+    try:
+        versions = json.loads(POSTGRES_SOURCES.read_text())["versions"]
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise ValueError(f"Cannot read the PostgreSQL source pins from {POSTGRES_SOURCES}") from error
+    # sources.json keys `versions` by version string; a plain list is accepted
+    # too so this does not pin the shape of a file another module owns.
+    if isinstance(versions, dict):
+        versions = list(versions)
+    if not isinstance(versions, list) or not versions:
+        raise ValueError(f"No pinned PostgreSQL versions in {POSTGRES_SOURCES}")
+    return versions
+
+
 def validate_assets(directory):
     archives = sorted(directory.glob("*.tar.gz"))
     if not archives:
@@ -93,6 +114,16 @@ def validate_assets(directory):
                     valid = (re.fullmatch(r"1[78]\.[0-9]+(?:\.[0-9]+)?", parts[0]) and parts[1] == "musl-dynamic"
                              and parts[2] == "x86_64"
                              and manifest.get("linkage") == "dynamic" and "profile" not in manifest
+                             # The recorded major is part of the identity: a
+                             # bundle that calls itself 18 while carrying a 17
+                             # tree would be published under a name the build
+                             # plan never selected.
+                             and manifest["postgresql"].get("major") == parts[0].split(".")[0]
+                             # A poison-file fallback proves far less than the
+                             # bwrap mask, and a bundle verified that way is not
+                             # the same evidence as one that was not. Publication
+                             # accepts only the mask.
+                             and manifest.get("verification_strategy") == "bwrap"
                              and isinstance(manifest.get("loader"), dict)
                              and manifest["loader"].get("path") == "lib/musl/ld-musl-x86_64.so.1")
                     # A musl-dynamic server without its bundled loader cannot boot
@@ -165,7 +196,9 @@ def validate_plan(plan, manifests, tag, repository, commit):
         if identity in expected:
             raise ValueError("Duplicate publication matrix row")
         expected.add(identity)
-    pinned = set(json.loads(POSTGRES_SOURCES.read_text())["versions"])
+    # Read through a guarded helper so a missing or malformed pin file is a
+    # ValueError naming it, not a traceback from deep inside plan validation.
+    pinned = set(_pinned_postgres_versions())
     for row in postgres_matrix["include"]:
         version = row.get("postgresql_version") if isinstance(row, dict) else None
         if (not isinstance(version, str) or not re.fullmatch(r"1[78]\.[0-9]+(?:\.[0-9]+)?", version)
@@ -190,6 +223,13 @@ def validate_plan(plan, manifests, tag, repository, commit):
             elif runtime == "redis" and "profile" not in manifest:
                 identity = (runtime, manifest["redis"]["version"], manifest["target"], manifest["architecture"])
             elif runtime == "postgresql" and "profile" not in manifest and manifest.get("linkage") == "dynamic":
+                # Same identity rule as validate_assets: the recorded major must
+                # be this version's own, so a plan cannot be satisfied by a
+                # bundle that is not the one it selected.
+                if manifest["postgresql"].get("major") != manifest["postgresql"]["version"].split(".")[0]:
+                    raise ValueError("PostgreSQL manifest major disagrees with its version")
+                if manifest.get("verification_strategy") != "bwrap":
+                    raise ValueError("PostgreSQL bundles verified without the bwrap mask are not published")
                 identity = (runtime, manifest["postgresql"]["version"], manifest["target"], manifest["architecture"])
             else:
                 raise ValueError("Invalid planned runtime")

@@ -161,6 +161,14 @@ class PublishContracts(unittest.TestCase):
                 "profile": lambda manifest: manifest.update(profile="minimal"),
                 "loader_path": lambda manifest: manifest["loader"].update(path="lib/ld-musl-x86_64.so.1"),
                 "schema": lambda manifest: manifest.update(schema_version=2),
+                # The recorded major is part of the identity: an 18.6 archive
+                # whose manifest calls itself 17 is not the bundle it is named for.
+                "major": lambda manifest: manifest["postgresql"].update(major="17"),
+                "major_missing": lambda manifest: manifest["postgresql"].pop("major"),
+                # Publication accepts the mask only; the poison-file fallback
+                # proves strictly less and is a local convenience, not evidence.
+                "verification_strategy": lambda manifest: manifest.update(verification_strategy="poison-file"),
+                "verification_strategy_missing": lambda manifest: manifest.pop("verification_strategy"),
             }
             for defect, corrupt in defects.items():
                 with self.subTest(defect=defect), tempfile.TemporaryDirectory() as inner:
@@ -283,6 +291,21 @@ class PublishContracts(unittest.TestCase):
             return rows, copy.deepcopy(postgres_bundles)
         cases["previous_mismatch"] = previous_mismatch
         cases["duplicate_row"] = duplicate_row
+
+        def wrong_recorded_major():
+            # The version says 18.6 and the manifest's own major says 17: the
+            # bundle is not the one the plan selected, whatever its name.
+            data = copy.deepcopy(postgres_bundles)
+            data[0]["postgresql"]["major"] = "17"
+            return copy.deepcopy(postgres_rows), data
+
+        def poison_verified():
+            # A bundle verified without the mask is not the same evidence.
+            data = copy.deepcopy(postgres_bundles)
+            data[0]["verification_strategy"] = "poison-file"
+            return copy.deepcopy(postgres_rows), data
+        cases["manifest_major"] = wrong_recorded_major
+        cases["manifest_verification_strategy"] = poison_verified
         for defect, build in cases.items():
             with self.subTest(defect=defect):
                 broken = copy.deepcopy(policy)
