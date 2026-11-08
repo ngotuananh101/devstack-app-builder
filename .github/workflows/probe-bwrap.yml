@@ -15,39 +15,24 @@ jobs:
   probe:
     runs-on: ubuntu-24.04
     steps:
-      - name: Baseline
+      - name: Baseline with the secure default
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends bubblewrap
           echo "bwrap: $(bwrap --version 2>&1)"
           echo "kernel: $(uname -r)"
-          echo "--- apparmor restrict:"; sysctl kernel.apparmor_restrict_unprivileged_userns 2>&1 || echo "(no such sysctl)"
-          echo "--- apparmor_restrict_unprivileged_unconfined:"; sysctl kernel.apparmor_restrict_unprivileged_unconfined 2>&1 || echo "(no such sysctl)"
-          echo "--- baseline bwrap:"
-          bwrap --dev-bind / / -- /bin/true 2>&1 | tail -3; echo "exit=$?"
-          echo "--- baseline unshare:"
-          unshare -Ur -- /bin/true 2>&1 | tail -3; echo "exit=$?"
+          echo "restrict_userns: $(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo n/a)"
+          echo "shipped profiles mentioning bwrap:"
+          ls -l /etc/apparmor.d/ 2>/dev/null | grep -i bwrap || echo "  (none)"
+          echo "loaded profiles mentioning bwrap:"
+          sudo aa-status 2>/dev/null | grep -i bwrap || echo "  (none)"
+          echo "--- bwrap exit code:"
+          set +e
+          bwrap --dev-bind / / -- /bin/true
+          echo "exit=$?"
+          set -e
 
-      - name: After disabling the sysctl
-        run: |
-          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          elif sysctl kernel.apparmor_restrict_unprivileged_unconfined >/dev/null 2>&1; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_unconfined=0
-          else
-            echo "(no apparmor userns sysctl present)"
-          fi
-          echo "--- bwrap after sysctl:"
-          bwrap --dev-bind / / -- /bin/true 2>&1 | tail -3; echo "exit=$?"
-          echo "--- unshare after sysctl:"
-          unshare -Ur -- /bin/true 2>&1 | tail -3; echo "exit=$?"
-          echo "--- with a filesystem mask, the shape verification uses:"
-          w=$(mktemp -d)
-          : > "$w/poison"
-          bwrap --dev-bind / / --ro-bind "$w/poison" /lib/ld-musl-x86_64.so.1 -- /bin/sh -c 'exit 0' 2>&1 | tail -3; echo "exit=$?"
-          rm -rf "$w"
-
-      - name: AppArmor profile for bwrap
+      - name: The real mask shape, with a path that exists
         run: |
           sudo tee /etc/apparmor.d/bwrap-userns-restrict >/dev/null <<'PROFILE'
           abi <abi/4.0>,
@@ -57,15 +42,23 @@ jobs:
             include if exists <local/bwrap-userns-restrict>
           }
           PROFILE
-          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict 2>&1 || echo "apparmor_parser failed"
-          echo "--- bwrap with a profile (sysctl still off):"
-          bwrap --dev-bind / / -- /bin/true 2>&1 | tail -3; echo "exit=$?"
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+          echo "restrict_userns is still: $(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo n/a)"
+          w=$(mktemp -d); : > "$w/empty"; mkdir -p "$w/tree"
+          set +e
+          echo "--- plain bind:"
+          bwrap --dev-bind / / -- /bin/sh -c 'exit 0'; echo "exit=$?"
+          echo "--- with a zero-byte file over an EXISTING host file (libc):"
+          bwrap --dev-bind / / --ro-bind "$w/empty" /lib/x86_64-linux-gnu/libc.so.6 -- /bin/sh -c 'exit 0'; echo "exit=$?"
+          echo "--- with a directory over an EXISTING host tree:"
+          bwrap --dev-bind / / --ro-bind "$w/tree" /usr/lib/x86_64-linux-gnu -- /bin/sh -c 'exit 0'; echo "exit=$?"
+          echo "--- masked program must now be unusable:"
+          bwrap --dev-bind / / --ro-bind "$w/empty" /lib/x86_64-linux-gnu/libc.so.6 -- /bin/true; echo "exit=$? (expected nonzero)"
+          rm -rf "$w"
+          set -e
 
-      - name: After restoring the sysctl, with the profile loaded
+      - name: Nested user namespace, as bwrap needs it
         run: |
-          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1
-          fi
-          echo "--- sysctl restored to: $(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo n/a)"
-          echo "--- bwrap with the profile loaded:"
-          bwrap --dev-bind / / -- /bin/true 2>&1 | tail -3; echo "exit=$?"
+          set +e
+          unshare -Ur -- /bin/sh -c 'cat /proc/self/uid_map; exit 0'; echo "unshare exit=$?"
+          set -e
