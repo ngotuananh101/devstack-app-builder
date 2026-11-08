@@ -38,15 +38,23 @@ toolchain() { python3 -I "$RUNTIME_DIR/scripts/toolchain.py" "$@"; }
 toolchain require make bison flex perl curl readelf strip tar bzip2
 zig_dir="$(toolchain prepare-zig --work "$work")"
 source_dir="$(python3 -I "$RUNTIME_DIR/scripts/source.py" --download "$work" "$version")"
-deps="$(toolchain build-dependencies --work "$work" --zig-dir "$zig_dir")"
-toolchain build-loader --work "$work" --zig-dir "$zig_dir"
+# The loader comes first because the compiler has to be told to name it. Every
+# program `zig cc` links asks the kernel for /lib/ld-musl-x86_64.so.1, which a
+# CI runner that never installed musl does not have: configure then aborts with
+# "cannot run C compiled programs" on the first dependency it probes. Pointing
+# the toolchain at its own loader makes those build-time programs runnable here.
+# The name is a workspace path, so stage() rewrites it back to the portable one.
+loader_record="$(toolchain build-loader --work "$work" --zig-dir "$zig_dir")"
+printf '%s\n' "$loader_record"
+loader="$(toolchain loader-path --work "$work")"
+deps="$(toolchain build-dependencies --work "$work" --zig-dir "$zig_dir" --loader "$loader")"
 toolchain write-provenance --work "$work" --output "$work/toolchain.json"
 # Command substitution first: a failing subcommand inside `< <(...)` never
 # reaches `set -e`, and the arrays would silently stay empty — configure would
 # then run with the caller's PATH, no CC, and no --disable-rpath.
 flag_list="$(toolchain configure-flags)"
 mapfile -t flags <<< "$flag_list"
-environment_list="$(toolchain env --zig-dir "$zig_dir" --deps "$deps")"
+environment_list="$(toolchain env --zig-dir "$zig_dir" --deps "$deps" --loader "$loader")"
 mapfile -t environment <<< "$environment_list"
 # The compiled prefix is irrelevant: relocation comes from --argv0 in the launchers,
 # and the default keeps bindir ending in /bin, which launchers.install expects.

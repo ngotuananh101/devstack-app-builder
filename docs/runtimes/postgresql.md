@@ -18,7 +18,7 @@ Arguments accept at most one pinned exact version. Unknown options, profiles, du
 ## Build dependencies
 
 - Host requirements: `make`, `bison`, `flex`, `perl`, `curl`, `readelf`, `strip`, `tar`, `bzip2` and Python 3 (run with `-I`).
-- CI runner (`ubuntu-24.04`) installs only `bison flex perl build-essential binutils curl` — deliberately **no** `musl-tools`.
+- CI runner (`ubuntu-24.04`) installs only `bison flex perl build-essential binutils curl bubblewrap` — deliberately **no** `musl-tools`. Nothing in the build needs `/lib/ld-musl-x86_64.so.1` to exist: build-time programs are linked against the toolchain's own loader (below). `bubblewrap` is not a build dependency; it is how verification hides every host musl loader before starting a server, and publication accepts only a bundle verified that way.
 - Dependencies fetched, verified and vendored (nothing is linked from `/usr/lib`, and no host package is ever installed):
   - **Zig** `0.17.1` (MIT): pinned in `config/sources.json` to provide `zig cc` and `zig c++` targeting `x86_64-linux-musl`, bundling musl `1.2.5`. Zig is a build tool and has no staged notice in `share/licenses/`.
   - **OpenSSL** `3.6.5` (Apache-2.0, shared): builds `libssl.so.3` and `libcrypto.so.3` staged into `lib/`.
@@ -28,6 +28,27 @@ Arguments accept at most one pinned exact version. Unknown options, profiles, du
   - **util-linux** `2.42.4` (LGPL-2.1-or-later, static `libuuid`): `-fPIC` static archive.
 
 All pinned source archives are fetched over HTTPS (PostgreSQL source URL shape `https://ftp.postgresql.org/pub/source/v<version>/postgresql-<version>.tar.bz2`, with checksum sidecar `.sha256` at the same location). Every dependency archive is SHA-256 verified against `config/sources.json` before extraction into a fresh directory, and built into a fresh staging prefix. `BUILD_JOBS` selects build parallelism (default 2).
+
+### The toolchain names its own loader while the build runs
+
+`configure` compiles a test program and executes it immediately, so the interpreter in
+its `PT_INTERP` has to exist on the host — and a runner with no musl installed has no
+`/lib/ld-musl-x86_64.so.1`. Every program `zig cc` links therefore carries
+`-Wl,--dynamic-linker=<workspace>/loader/libc.so`, the loader `toolchain build-loader`
+built a moment earlier, which is why `build.sh` builds the loader **before** the
+dependency stack. `toolchain build-dependencies` proves the mechanism works with a
+one-line probe program before it starts any dependency, so a broken link line names
+itself in seconds instead of surfacing as `configure: error: cannot run C compiled
+programs` inside libxml2.
+
+The workspace path must not reach a user's archive, so `bundle.py` rewrites every
+staged command's `PT_INTERP` back to the portable `/lib/ld-musl-x86_64.so.1` (in
+`bin/`, before `launchers.install` and before the manifest records the interpreter).
+The rewrite is length-preserving — it reuses the existing `PT_INTERP` slot, NUL-padded
+— and refuses a name that cannot fit rather than shipping a truncated interpreter path.
+Nothing at run time reads the name back: the launchers exec the bundled loader with
+`--library-path`, so the staged loader is the interpreter and never a program that asks
+for one.
 
 ### Shared versus static linkage rationale
 

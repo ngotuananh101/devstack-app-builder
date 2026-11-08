@@ -49,13 +49,14 @@ def sha256_file(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def build_elf(root, destination, needed=("libpq.so.5",), search=None, message=None):
+def build_elf(root, destination, needed=("libpq.so.5",), search=None, message=None,
+              interpreter="/lib/ld-musl-x86_64.so.1"):
     """Compile a musl-interp executable that needs no libc to run."""
     source = Path(root) / "fixture.c"
     if not source.exists():
         source.write_text(FIXTURE_SOURCE)
     command = ["cc", "-nostdlib", "-fno-stack-protector",
-               "-Wl,--dynamic-linker=/lib/ld-musl-x86_64.so.1", "-Wl,-e,_start",
+               f"-Wl,--dynamic-linker={interpreter}", "-Wl,-e,_start",
                "-Wl,--no-as-needed"]
     if message is not None:
         command.append(f'-DMSG="{message}"')
@@ -616,6 +617,65 @@ class PostgreSQLToolchainTests(unittest.TestCase):
         self.assertNotIn("-lc++", env["LDFLAGS"].split())
         self.assertIn("-fPIC", env["CFLAGS"])
 
+    def test_build_environment_names_the_pinned_loader_when_there_is_one(self):
+        # Without this every program `zig cc` links asks for the host path
+        # /lib/ld-musl-x86_64.so.1 and `configure` aborts with "cannot run C
+        # compiled programs" on a runner that never installed musl.
+        env = self.toolchain.build_env(Path("/zig"), Path("/deps"), Path("/work/loader/libc.so"))
+        self.assertIn("-Wl,--dynamic-linker=/work/loader/libc.so", env["CC"].split())
+        self.assertIn("-Wl,--dynamic-linker=/work/loader/libc.so", env["CXX"].split())
+        # Still not an LDFLAGS value: that string is replayed by a user's linker.
+        self.assertNotIn("dynamic-linker", env["LDFLAGS"])
+
+    def test_build_environment_leaves_the_loader_out_when_none_is_named(self):
+        env = self.toolchain.build_env(Path("/zig"), Path("/deps"))
+        self.assertNotIn("--dynamic-linker", " ".join(env["CC"].split()))
+        self.assertNotIn("--dynamic-linker", " ".join(env["CXX"].split()))
+
+    def test_build_programs_that_do_not_run_are_reported_as_such(self):
+        # The probe exists so the failure names its cause in seconds instead of
+        # surfacing inside a dependency's configure as "cannot run C compiled
+        # programs". A compiler that produces a program which dies stands in for
+        # the missing-loader case the probe was added for.
+        with tempfile.TemporaryDirectory() as temp:
+            work = Path(temp)
+            script = work / "broken-cc"
+            script.write_text(
+                "import pathlib, sys\n"
+                "target = pathlib.Path(sys.argv[sys.argv.index('-o') + 1])\n"
+                "target.write_text('#!/bin/sh\\nexit 3\\n')\n"
+                "target.chmod(0o755)\n")
+            script.chmod(0o755)
+            env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C",
+                   "CC": f"python3 -I {script}", "LDFLAGS": ""}
+            with self.assertRaisesRegex(ValueError, "cannot run C compiled programs"):
+                self.toolchain.check_build_programs_run(work / "probe", env)
+
+    def test_a_probe_whose_loader_does_not_exist_names_the_configure_symptom(self):
+        # This is the CI failure the probe was added for: the ELF is fine, but
+        # the interpreter it asks for is not on the host, so the kernel refuses
+        # the exec. The message must name the downstream symptom, not a bare
+        # permission error nobody can act on.
+        if not shutil.which("cc"):
+            self.skipTest("C compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            work = Path(temp)
+            env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LDFLAGS": "",
+                   "CC": "cc -Wl,--dynamic-linker=/nonexistent/ld-musl-x86_64.so.1"}
+            with self.assertRaisesRegex(ValueError, "cannot run C compiled programs"):
+                self.toolchain.check_build_programs_run(work / "probe", env)
+
+    def test_loader_path_reads_back_what_build_loader_recorded(self):
+        # Guessing the path from the layout is what this avoids: the loader
+        # module owns where libc.so goes.
+        with tempfile.TemporaryDirectory() as temp:
+            work = Path(temp)
+            (work / "loader.json").write_text(json.dumps(
+                {"source": "/work/loader/libc.so", "loader": {"sha256": "a" * 64}}))
+            self.assertEqual(self.toolchain.loader_path(work), "/work/loader/libc.so")
+            (work / "loader.json").write_text(json.dumps({"source": "/elsewhere/libc.so"}))
+            self.assertEqual(self.toolchain.loader_path(work), "/elsewhere/libc.so")
+
     def test_zig_pin_is_checked_before_any_configure(self):
         # A mismatched declared version must raise, not warn.
         with tempfile.TemporaryDirectory() as temp:
@@ -951,6 +1011,69 @@ class PostgreSQLBundleTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.bundle.elf(Path(temp) / "missing")
 
+    # -- staged interpreter -------------------------------------------------
+
+    def test_staged_program_is_repointed_at_the_portable_loader(self):
+        # The build links every program against the workspace's own loader so
+        # `configure` can run what it compiles. A shipped ELF must not carry
+        # that path, so staging rewrites PT_INTERP to the portable name.
+        if not shutil.which("cc") or not shutil.which("readelf"):
+            self.skipTest("ELF fixture compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace_loader = root / "work/loader/libc.so"
+            workspace_loader.parent.mkdir(parents=True)
+            build_library(workspace_loader, "libc.so")
+            library = build_library(root / "libpq.so.5", "libpq.so.5")
+            binary = build_elf(root, root / "postgres", search=library.parent,
+                               interpreter=str(workspace_loader))
+            self.assertEqual(self.bundle.program_interpreter(binary), str(workspace_loader))
+            self.assertTrue(self.bundle.portable_interpreter(binary))
+            self.assertEqual(self.bundle.program_interpreter(binary),
+                             self.bundle.INTERPRETER)
+            # The rewrite is in place: the file is still a valid ELF to readelf
+            # and nothing else in it moved.
+            self.assertEqual(self.bundle.elf(binary)["needed"], ["libpq.so.5"])
+            # Rewriting an already-portable program changes nothing.
+            self.assertFalse(self.bundle.portable_interpreter(binary))
+
+    def test_staged_interpreter_rewrite_refuses_a_name_that_does_not_fit(self):
+        # Length-preserving by construction: a longer name means the segment
+        # layout would have to change, which is a toolchain problem rather than
+        # something to paper over by truncating the path.
+        if not shutil.which("cc") or not shutil.which("readelf"):
+            self.skipTest("ELF fixture compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            library = build_library(root / "libpq.so.5", "libpq.so.5")
+            binary = build_elf(root, root / "postgres", search=library.parent)
+            with self.assertRaisesRegex(ValueError, "cannot fit"):
+                self.bundle.set_interpreter(binary, "/" + "x" * 200)
+            self.assertEqual(self.bundle.program_interpreter(binary), self.bundle.INTERPRETER)
+
+    def test_a_staged_program_with_no_interpreter_is_refused(self):
+        # A static program would silently ship a bundle that cannot be launched,
+        # so it is named rather than skipped.
+        if not shutil.which("cc"):
+            self.skipTest("ELF fixture compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "static.c"
+            source.write_text(
+                "void _start(void)\n"
+                "{\n"
+                "\t__asm__ volatile (\"syscall\" : : \"a\" (60), \"D\" (0)\n"
+                "\t                  : \"rcx\", \"r11\", \"memory\");\n"
+                "\t__builtin_unreachable();\n"
+                "}\n")
+            static = root / "static"
+            subprocess.run(["cc", "-nostdlib", "-static", "-Wl,-e,_start",
+                            "-o", str(static), str(source)],
+                           check=True, capture_output=True)
+            self.assertIsNone(self.bundle.program_interpreter(static))
+            with self.assertRaisesRegex(ValueError, "requests no interpreter"):
+                self.bundle.portable_interpreter(static)
+
     # -- version through the loader ----------------------------------------
 
     def test_binary_version_runs_through_the_loader(self):
@@ -994,12 +1117,16 @@ class PostgreSQLBundleTests(unittest.TestCase):
 
     # -- stage -------------------------------------------------------------
 
-    def fixture(self, root):
+    def fixture(self, root, interpreter="/lib/ld-musl-x86_64.so.1"):
         """A synthetic install tree shaped like `install-world-bin` produced it.
 
         The binaries NEEDED `libcrypto.so.3`, the one shared dependency, because
         that is what the real build links and what the loader can resolve from
         the dependency prefix at staging time.
+
+        `interpreter` is what the build's compiler named. It defaults to the
+        portable path; a build that links against the workspace's own loader
+        passes that path here instead.
         """
         install = root / "inst"
         for directory in ("bin", "lib", "share/extension", "share/timezone",
@@ -1011,7 +1138,7 @@ class PostgreSQLBundleTests(unittest.TestCase):
         for command in ("postgres", "initdb", "pg_ctl", "psql", "pg_config",
                         "pg_dump", "oid2name", "vacuumlo"):
             build_elf(root, install / "bin" / command, needed=("libcrypto.so.3",),
-                      search=root / "shared")
+                      search=root / "shared", interpreter=interpreter)
             (install / "bin" / command).chmod(0o755)
         expected = self.modules.load_expected("18")
         for name in expected["sql"]:
@@ -1227,6 +1354,36 @@ class PostgreSQLBundleTests(unittest.TestCase):
                           [{key: row[key] for key in ("path",)}
                            for row in manifest["binaries"]])
 
+    def test_stage_rewrites_a_workspace_interpreter_to_the_portable_one(self):
+        # The build links against the workspace's own loader so configure can
+        # run what it compiles on a host with no musl. Staging must not let that
+        # path into the archive, and the manifest must record what is on disk.
+        if not shutil.which("cc") or not shutil.which("readelf"):
+            self.skipTest("ELF fixture compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            install = self.fixture(root)
+            record = self.provenance(root, install)
+            workspace_loader = record["loader"]["path"]
+            for command in ("postgres", "initdb", "pg_ctl", "psql", "pg_config",
+                            "pg_dump", "oid2name", "vacuumlo"):
+                build_elf(root, install / "bin" / command, needed=("libcrypto.so.3",),
+                          search=root / "shared", interpreter=workspace_loader)
+                (install / "bin" / command).chmod(0o755)
+            output = root / "bundle"
+            manifest = self.bundle.stage(install, output, self.request(root), record, ROOT)
+            for row in manifest["binaries"]:
+                self.assertEqual(row["interpreter"], self.bundle.INTERPRETER, row["path"])
+                self.assertEqual(
+                    self.bundle.program_interpreter(output / row["path"]),
+                    self.bundle.INTERPRETER, row["path"])
+            # The rewrite is in place, so the recorded digest is the on-disk one.
+            for row in manifest["binaries"]:
+                self.assertEqual(row["sha256"], sha256_file(output / row["path"]), row["path"])
+            # The loader itself is an interpreter, never a program rewritten.
+            self.assertIsNone(
+                self.bundle.program_interpreter(output / "lib/musl/ld-musl-x86_64.so.1"))
+
     def test_stage_refuses_a_binary_the_install_tree_cannot_resolve(self):
         # The counterpart of the test above: a NEEDED library present in no
         # searched directory must abort staging rather than be skipped, so the
@@ -1441,6 +1598,22 @@ class PostgreSQLBundleTests(unittest.TestCase):
             again = subprocess.run(command, text=True, capture_output=True, env=environment)
             self.assertNotEqual(again.returncode, 0)
             self.assertIn("Refusing", again.stderr)
+
+    def test_build_script_builds_the_loader_before_the_dependencies(self):
+        # The compiler has to be told which loader to name, so the loader must
+        # exist first: without it `configure` compiles programs it cannot run
+        # and the first dependency aborts with "cannot run C compiled programs".
+        text = (SCRIPTS / "build.sh").read_text()
+        loader = text.index("build-loader")
+        dependencies = text.index("build-dependencies")
+        self.assertLess(loader, dependencies)
+        between = text[loader:dependencies]
+        self.assertIn("loader-path", between)
+        # The pinned loader reaches the dependency build...
+        self.assertIn('--loader "$loader"', text[dependencies:dependencies + 200])
+        # ...and the environment configure and make run in.
+        environment = text.index("toolchain env ")
+        self.assertIn('--loader "$loader"', text[environment:environment + 200])
 
     def test_build_script_stages_after_install_and_checks_provenance(self):
         text = (SCRIPTS / "build.sh").read_text()

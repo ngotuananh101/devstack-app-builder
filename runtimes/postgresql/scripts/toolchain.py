@@ -175,11 +175,28 @@ def configure_flags(options):
     return list(options["configure"]["shared"])
 
 
-def build_env(zig_dir, deps_prefix):
-    """A complete build environment: pinned compiler, isolated pkg-config, no host libs."""
+def build_env(zig_dir, deps_prefix, loader=None):
+    """A complete build environment: pinned compiler, isolated pkg-config, no host libs.
+
+    ``loader`` is the musl loader the build was just given permission to name as
+    PT_INTERP. Without it every program `zig cc` links asks the kernel for
+    ``/lib/ld-musl-x86_64.so.1``, which a CI runner that never installed musl does
+    not have, and `configure` dies on "cannot run C compiled programs" the moment
+    it compiles its first test program. Naming the pinned loader instead makes the
+    build's own programs runnable on exactly the hosts this bundle targets.
+
+    It is not a bundle decision: the shipped ELFs are rewritten to the portable
+    ``/lib/`` name when they are staged, so nothing inside a user's archive ever
+    carries the workspace path this puts in a build-time program.
+    """
     zig_dir = Path(zig_dir)
     deps_prefix = Path(deps_prefix)
     pkgconfig = deps_prefix / "lib/pkgconfig"
+    interpreter = ""
+    if loader is not None:
+        # -Wl,-rpath,$ORIGIN-sibling would be simpler, but a runpath in a build
+        # program is exactly what parse_elf refuses to see in a staged one.
+        interpreter = f" -Wl,--dynamic-linker={Path(loader).resolve()}"
     # Everything Zig-specific rides on the compiler, never on LDFLAGS: LDFLAGS is
     # recorded in Makefile.global, returned by `pg_config --ldflags` and copied
     # into libpq.pc's Libs.private, so it must stay a value any linker accepts
@@ -190,8 +207,8 @@ def build_env(zig_dir, deps_prefix):
         "PATH": HOST_PATH,
         "LC_ALL": "C",
         "SOURCE_DATE_EPOCH": "0",
-        "CC": f"{zig_dir}/zig cc -target {TARGET} -dynamic -lc++ -lc++abi",
-        "CXX": f"{zig_dir}/zig c++ -target {TARGET} -dynamic -lc++ -lc++abi",
+        "CC": f"{zig_dir}/zig cc -target {TARGET} -dynamic -lc++ -lc++abi{interpreter}",
+        "CXX": f"{zig_dir}/zig c++ -target {TARGET} -dynamic -lc++ -lc++abi{interpreter}",
         "CPPFLAGS": load_options()["configure"]["cppflags"],
         "CFLAGS": "-O2 -fPIC",
         "LDFLAGS": f"-L{deps_prefix}/lib",
@@ -419,6 +436,56 @@ def icu_link_flags(deps_prefix):
     return [f"-L{deps_prefix}/lib", "-licui18n", "-licuuc", "-licudata", "-lpthread", "-lm"]
 
 
+RUNTIME_PROBE = """\
+#include <stdio.h>
+
+int main(void) {
+    puts("build-program-ran");
+    return 0;
+}
+"""
+
+
+def check_build_programs_run(work, env):
+    """Prove a program this toolchain links actually runs before the stack is built.
+
+    `configure` compiles a test program and executes it immediately. Every program
+    `zig cc` links without an explicit ``--dynamic-linker`` names
+    ``/lib/ld-musl-x86_64.so.1``; on a CI runner that never installed musl the
+    kernel cannot resolve that path and `configure` aborts with "cannot run C
+    compiled programs" a few seconds into the first dependency. That failure names
+    no cause further down, so it is checked here instead, before the tens of
+    minutes the dependency build costs.
+
+    The probe is deliberately the same shape as configure's: link with ``CC`` out
+    of the scrubbed environment, then run the result with no loader indirection.
+    """
+    work = Path(work)
+    work.mkdir(parents=True, exist_ok=True)
+    source = work / "runtime_probe.c"
+    binary = work / "runtime_probe"
+    source.write_text(RUNTIME_PROBE)
+    binary.unlink(missing_ok=True)
+    command = env["CC"].split() + ["-O2", str(source), *env["LDFLAGS"].split(),
+                                   "-o", str(binary)]
+    _call(command, work, env, "toolchain runtime probe")
+    try:
+        result = subprocess.run([str(binary)], text=True, capture_output=True, env=env)
+    except OSError as exc:
+        # The kernel refuses the exec outright when the interpreter the ELF
+        # names does not exist: ENOENT for a missing loader, EACCES when a
+        # sandbox masks the path. Either way the cause is the same one.
+        result = None
+        reason = str(exc)
+    else:
+        reason = f"rc={result.returncode} out={result.stdout.strip()!r} err={result.stderr.strip()!r}"
+    if result is None or result.returncode != 0 or result.stdout.strip() != "build-program-ran":
+        raise ValueError(
+            "A program this toolchain links does not run; every dependency "
+            "configure would abort with 'cannot run C compiled programs'. "
+            f"{reason}")
+
+
 def check_icu_links(work, env, deps_prefix):
     """Prove the ICU archives link as PostgreSQL will link them, and run.
 
@@ -444,14 +511,21 @@ def check_icu_links(work, env, deps_prefix):
             f"not usable: rc={run.returncode} out={run.stdout.strip()!r} err={run.stderr.strip()!r}")
 
 
-def build_dependencies(work, pins, zig_dir):
-    """Build the pinned stack into ``<work>/deps`` and return that prefix."""
+def build_dependencies(work, pins, zig_dir, loader=None):
+    """Build the pinned stack into ``<work>/deps`` and return that prefix.
+
+    ``loader`` is passed through to :func:`build_env`: without it the build's own
+    programs name a host path the runner may not have, and `configure` cannot run
+    what it compiles. The probe below catches that in seconds rather than at the
+    first dependency.
+    """
     work = Path(work).resolve()
     zig_dir = Path(zig_dir).resolve()
     plan = dependency_plan(load_options(), work)
     deps = work / "deps"
     deps.mkdir(parents=True, exist_ok=False)
-    env = build_env(zig_dir, deps)
+    env = build_env(zig_dir, deps, loader)
+    check_build_programs_run(work / "runtime-probe", env)
     licenses = {}
     for step in plan:
         name = step["name"]
@@ -493,6 +567,16 @@ def build_loader(work, zig_dir):
         "musl_version": record["version"],
         "license": metadata["license"],
     }
+
+
+def loader_path(work):
+    """The loader :func:`build_loader` wrote for this workspace.
+
+    Read back from the metadata rather than guessed from the layout: the loader
+    module owns where it puts libc.so, and build.sh needs the exact path to hand
+    the compiler as its ``--dynamic-linker``.
+    """
+    return json.loads((Path(work) / "loader.json").read_text())["source"]
 
 
 def provenance(options, pins, deps_prefix, loader, licenses, icu=None):
@@ -545,10 +629,19 @@ def _main():
     environment = sub.add_parser("env", help="Print the build environment as VARIABLE=value lines")
     environment.add_argument("--zig-dir", type=Path, required=True)
     environment.add_argument("--deps", type=Path, required=True)
+    # The loader is optional so the environment can still be printed for a
+    # workspace that has not built one yet; every program linked without it asks
+    # for a host path this build refuses to depend on.
+    environment.add_argument("--loader", type=Path)
     for name in ("prepare-zig", "build-dependencies", "build-loader"):
         command = sub.add_parser(name)
         command.add_argument("--work", type=Path, required=True)
         command.add_argument("--zig-dir", type=Path)
+    dependencies = sub.choices["build-dependencies"]
+    dependencies.add_argument("--loader", type=Path)
+    resolve_loader = sub.add_parser(
+        "loader-path", help="Print the loader build-loader recorded for this workspace")
+    resolve_loader.add_argument("--work", type=Path, required=True)
     record = sub.add_parser("write-provenance")
     record.add_argument("--work", type=Path, required=True)
     record.add_argument("--output", type=Path, required=True)
@@ -562,7 +655,7 @@ def _main():
     elif args.command == "configure-flags":
         print("\n".join(configure_flags(options)))
     elif args.command == "env":
-        for key, value in build_env(args.zig_dir, args.deps).items():
+        for key, value in build_env(args.zig_dir, args.deps, args.loader).items():
             print(f"{key}={value}")
     elif args.command == "prepare-zig":
         require(["curl", "tar"])
@@ -571,10 +664,12 @@ def _main():
         require(["make", "curl", "tar", "strip", "readelf"])
         zig_dir = args.zig_dir
         zig(zig_dir, options)
-        print(build_dependencies(args.work, pins, zig_dir))
+        print(build_dependencies(args.work, pins, zig_dir, args.loader))
     elif args.command == "build-loader":
         require(["make", "curl", "tar", "readelf", "cc"])
         print(json.dumps(build_loader(args.work, args.zig_dir)))
+    elif args.command == "loader-path":
+        print(loader_path(args.work))
     else:
         metadata = json.loads((args.work / "loader.json").read_text())
         licenses = json.loads((args.work / "licenses.json").read_text())

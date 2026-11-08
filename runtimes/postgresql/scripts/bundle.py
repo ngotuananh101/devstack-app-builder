@@ -22,6 +22,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import struct
 import subprocess
 import tarfile
 import tempfile
@@ -318,6 +319,92 @@ def _needed(path):
     return re.findall(r"\(NEEDED\).*?\[([^\]]+)\]", result.stdout)
 
 
+# The layout of the two headers that locate PT_INTERP, and the segment type
+# that carries it. Read directly rather than through readelf so staging can
+# rewrite the string without a build-host tool and without round-tripping text.
+EHDR = struct.Struct("<16sHHIQQQIHHHHHH")
+PHDR = struct.Struct("<IIQQQQQQ")
+PT_INTERP = 3
+
+
+def program_interpreter(path):
+    """The program interpreter an ELF asks for, or None when it asks for none."""
+    blob = Path(path).read_bytes()
+    if blob[:4] != b"\x7fELF":
+        return None
+    header = EHDR.unpack_from(blob)
+    phoff, phentsize, phnum = header[5], header[9], header[10]
+    for index in range(phnum):
+        start = phoff + index * phentsize
+        kind, _, offset, _, _, filesize, _, _ = PHDR.unpack_from(blob, start)
+        if kind == PT_INTERP:
+            return blob[offset:offset + filesize].rstrip(b"\x00").decode("utf-8", "replace")
+    return None
+
+
+def set_interpreter(path, wanted):
+    """Rewrite PT_INTERP in place; returns True when the file changed.
+
+    Length-preserving on purpose: the new name goes into the bytes the linker
+    already reserved, NUL-padded, so no segment moves and no offset shifts. A
+    name that does not fit is refused rather than truncated, because a truncated
+    interpreter path leaves a bundle that fails on every machine.
+    """
+    path = Path(path)
+    blob = bytearray(path.read_bytes())
+    if blob[:4] != b"\x7fELF":
+        return False
+    header = EHDR.unpack_from(blob)
+    phoff, phentsize, phnum = header[5], header[9], header[10]
+    encoded = wanted.encode() + b"\x00"
+    for index in range(phnum):
+        start = phoff + index * phentsize
+        kind, _, offset, _, _, filesize, _, _ = PHDR.unpack_from(blob, start)
+        if kind != PT_INTERP:
+            continue
+        if len(encoded) > filesize:
+            raise ValueError(f"{path.name} cannot fit {wanted} in its PT_INTERP slot")
+        replacement = encoded.ljust(filesize, b"\x00")
+        if blob[offset:offset + filesize] == replacement:
+            return False
+        blob[offset:offset + filesize] = replacement
+        path.write_bytes(bytes(blob))
+        path.chmod(path.stat().st_mode)
+        return True
+    raise ValueError(f"{path.name} has no PT_INTERP to rewrite")
+
+
+def portable_interpreter(path):
+    """Point one staged program at the loader name the bundle ships.
+
+    The build's compiler is told ``-Wl,--dynamic-linker=<workspace loader>`` so
+    that `configure` can run the programs it compiles on a host with no musl
+    installed. That name is a build-workspace path, and a shipped ELF carrying
+    it would work on the machine that built the bundle and nowhere else. Nothing
+    reads the name back in a bundle run — the launchers exec the bundled loader
+    with ``--library-path`` — so rewriting it to the portable one costs nothing
+    and removes the workspace from the archive.
+    """
+    current = program_interpreter(path)
+    if current is None:
+        raise ValueError(f"Staged program requests no interpreter: {Path(path).name}")
+    if current == INTERPRETER:
+        return False
+    return set_interpreter(path, INTERPRETER)
+
+
+def portable_interpreters(output):
+    """Rewrite every staged command's interpreter; returns the count changed.
+
+    Only ``bin/`` is touched. The ``lib/*.so`` modules are shared objects with
+    no PT_INTERP, and the staged loader is the interpreter rather than a program
+    that asks for one.
+    """
+    output = Path(output)
+    return sum(bool(portable_interpreter(output / "bin" / command))
+               for command in launchers.commands(output))
+
+
 def binary_version(binary, loader, library_path):
     """Ask a raw bundle binary for its version through the shipped loader.
 
@@ -523,6 +610,11 @@ def stage(install_root, output, request, provenance, repo_root):
 
     output.mkdir(parents=True, exist_ok=False)
     _copy_tree(install_root, output, provenance)
+    # The build named a loader inside its own workspace so `configure` could run
+    # what it compiled. Every staged command is repointed here, before the
+    # manifest records the interpreter, so no workspace path survives into the
+    # archive.
+    portable_interpreters(output)
 
     (output / "lib/musl").mkdir()
     staged_loader = output / launchers.LOADER

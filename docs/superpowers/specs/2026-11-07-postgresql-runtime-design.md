@@ -58,6 +58,18 @@ loader with `--library-path "$ROOT/lib:$ROOT/lib/musl"` and the real binary unde
 holds an absolute library path — this matches the repository's existing rule that
 no bundle may ship absolute `RUNPATH`.
 
+**The build links against its own loader, and staging rewrites the name.** `configure`
+compiles a program and runs it immediately, so that program's `PT_INTERP` has to exist
+on the build host. `zig cc` defaults it to `/lib/ld-musl-x86_64.so.1`, which a runner
+with no musl installed does not have: the dependency build then dies at libxml2 with
+`configure: error: cannot run C compiled programs`. So the compiler is given
+`-Wl,--dynamic-linker=<workspace>/loader/libc.so`, the loader the pipeline built just
+before the dependencies, and `bundle.py` rewrites every staged `bin/` command's
+`PT_INTERP` back to `/lib/ld-musl-x86_64.so.1` before `launchers.install` and before the
+manifest records it. The rewrite is length-preserving and refuses a name that cannot
+fit; nothing reads the value back in a bundle run, because the launchers exec the
+bundled loader explicitly. This is the same fix Apache shipped in `7008128`.
+
 **Both directories are required on `--library-path`** (spike-verified, see the
 research note). Every musl-linked ELF carries `NEEDED: ld-musl-x86_64.so.1`, but the
 loader registers itself as `ldso.name = "libc.so"`, so that name matches neither the
