@@ -64,9 +64,12 @@ on the build host. `zig cc` defaults it to `/lib/ld-musl-x86_64.so.1`, which a r
 with no musl installed does not have: the dependency build then dies at libxml2 with
 `configure: error: cannot run C compiled programs`. So the compiler is given
 `-Wl,--dynamic-linker=<workspace>/loader/libc.so`, the loader the pipeline built just
-before the dependencies, and `bundle.py` rewrites every staged `bin/` command's
+before the dependencies, and `bundle.py` rewrites every staged program's
 `PT_INTERP` back to `/lib/ld-musl-x86_64.so.1` before `launchers.install` and before the
-manifest records it. The rewrite is length-preserving and refuses a name that cannot
+manifest records it. The walk covers the whole tree rather than `bin/`, because
+`install-world-bin` also puts `pg_regress`, `pg_isolation_regress` and
+`isolationtester` under `lib/pgxs`, where they run without a launcher.
+The rewrite is length-preserving and refuses a name that cannot
 fit; nothing reads the value back in a bundle run, because the launchers exec the
 bundled loader explicitly. This is the same fix Apache shipped in `7008128`.
 
