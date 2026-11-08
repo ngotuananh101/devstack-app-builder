@@ -124,6 +124,56 @@ class PublishContracts(unittest.TestCase):
         policy["matrix"] = {"include": []}
         self.module.validate_plan(policy, [redis], TAG, REPOSITORY, COMMIT)
 
+    def test_apache_rows_are_validated_against_the_exact_plan(self):
+        apache = {"schema_version": 1, "runtime": "apache", "apache": {"version": "2.4.70"},
+                  "target": "musl-dynamic", "architecture": "x86_64", "linkage": "dynamic",
+                  "build_id": "apachefixture", "verification": "PASSED",
+                  "builder": {"commit": COMMIT},
+                  "modules": {"dso": ["ssl", "http2", "md", "brotli", "lua", "dav",
+                                      "proxy_fcgi", "rewrite"]},
+                  "mpm": {"default": "event", "shared": ["event", "worker", "prefork"]}}
+        policy = plan()
+        policy["matrix"] = {"include": []}
+        policy["redis_matrix"] = {"include": []}
+        policy["apache_matrix"] = {"include": [{"apache_version": "2.4.70", "target": "musl-dynamic",
+                                                "architecture": "x86_64", "previous_version": None}]}
+        self.module.validate_plan(policy, [apache], TAG, REPOSITORY, COMMIT)
+        for defect in ("missing_row", "missing_bundle", "wrong_patch", "patch_target",
+                       "static", "profile", "commit"):
+            broken_plan = copy.deepcopy(policy)
+            bundle = copy.deepcopy(apache)
+            if defect == "missing_row": broken_plan["apache_matrix"] = {"include": []}
+            if defect == "missing_bundle": bundle = copy.deepcopy(metadata())
+            if defect == "wrong_patch": broken_plan["apache_matrix"]["include"][0]["apache_version"] = "2.4.71"
+            if defect == "patch_target": bundle["target"] = "musl"
+            if defect == "static": bundle["linkage"] = "static"
+            if defect == "profile": bundle["profile"] = "full"
+            if defect == "commit": bundle["builder"]["commit"] = "b" * 40
+            with self.subTest(defect=defect), self.assertRaises(ValueError):
+                self.module.validate_plan(broken_plan, [bundle], TAG, REPOSITORY, COMMIT)
+
+    def test_apache_notes_claim_only_the_recorded_bundle(self):
+        apache = {"schema_version": 1, "runtime": "apache", "apache": {"version": "2.4.70"},
+                  "target": "musl-dynamic", "architecture": "x86_64", "linkage": "dynamic",
+                  "build_id": "apachefixture", "verification": "PASSED",
+                  "builder": {"commit": COMMIT},
+                  "modules": {"dso": ["ssl", "http2", "md", "brotli", "lua", "dav",
+                                      "proxy_fcgi", "rewrite"]},
+                  "mpm": {"default": "event", "shared": ["event", "worker", "prefork"]}}
+        notes = self.module.release_notes([apache], REPOSITORY, COMMIT, plan())
+        for expected in ("Apache", "2.4.70", "musl-dynamic", "x86_64", "| event |", "| 8 |",
+                         "apachefixture", "setcap cap_net_bind_service", "bin/apachectl",
+                         "-d"):
+            self.assertIn(expected, notes)
+        self.assertNotIn("PHP", notes.split("Apache httpd bundles", 1)[1])
+        for defect in ("static", "modules", "mpm"):
+            broken = copy.deepcopy(apache)
+            if defect == "static": broken["linkage"] = "static"
+            if defect == "modules": broken.pop("modules")
+            if defect == "mpm": broken["mpm"]["default"] = "threadpool"
+            with self.subTest(defect=defect), self.assertRaises(ValueError):
+                self.module.release_notes([broken], REPOSITORY, COMMIT, plan())
+
     def test_mixed_assets_accept_only_safe_redis_aliases(self):
         from test_redis import module as redis_module
         with tempfile.TemporaryDirectory() as temp:

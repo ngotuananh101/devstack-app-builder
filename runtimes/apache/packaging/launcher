@@ -1,0 +1,13 @@
+#!/bin/sh
+# Generated launcher: one per program in libexec/bin.
+set -eu
+# Resolve from the executable, never from the caller's current directory: the same
+# launcher has to work from any working directory and after the tree is moved.
+ROOT=$(CDPATH='' cd -P -- "$(dirname -- "$0")/.." && pwd)
+. "$ROOT/libexec/launch.sh"
+# The trailing placeholder expands to the program's own fixed leading arguments,
+# if it needs any; most programs get nothing.
+exec "$ROOT/lib/musl/ld-musl-x86_64.so.1" \
+     --library-path "$LD_LIBRARY_PATH" \
+     --argv0 "$ROOT/bin/@NAME@" \
+     "$ROOT/libexec/bin/@NAME@" @EXTRA@ "$@"

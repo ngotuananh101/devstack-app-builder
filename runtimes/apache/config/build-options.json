@@ -1,0 +1,67 @@
+{
+  "comment": "Configure contract for httpd. ${PREFIX} is the vendored dependency prefix, ${INSTALL} is where httpd itself is installed (the bundle tree). Every option here is load-bearing: a module that quietly drops out because a --with-* path was not honoured fails the build at the census in scripts/httpd.py, not at first request.",
+  "arguments": [
+    "--enable-layout=Apache",
+    "--prefix=${INSTALL}",
+    "--with-apr=${PREFIX}",
+    "--with-apr-util=${PREFIX}",
+    "--with-pcre=${PREFIX}",
+    "--with-z=${PREFIX}",
+    "--with-ssl=${PREFIX}",
+    "--enable-ssl",
+    "--with-nghttp2=${PREFIX}",
+    "--enable-http2",
+    "--enable-proxy-http2",
+    "--with-jansson=${PREFIX}",
+    "--with-curl=${PREFIX}",
+    "--enable-md",
+    "--with-brotli=${PREFIX}",
+    "--enable-brotli",
+    "--with-lua=${PREFIX}",
+    "--enable-lua",
+    "--with-libxml2=${PREFIX}",
+    "--enable-proxy-html",
+    "--enable-xml2enc",
+    "--enable-ldap",
+    "--enable-authnz-ldap",
+    "--enable-dav",
+    "--enable-dav-fs",
+    "--enable-dav-lock",
+    "--enable-authn-dbd",
+    "--enable-authz-dbd",
+    "--enable-dbd",
+    "--enable-session-dbd",
+    "--enable-cgid",
+    "--enable-suexec",
+    "--enable-proxy-fdpass",
+    "--with-suexec-bin=${INSTALL}/bin/suexec",
+    "--enable-mods-shared=reallyall",
+    "--enable-mods-static=",
+    "--enable-mpms-shared=event worker prefork",
+    "--with-mpm=event",
+    "--with-port=80",
+    "--disable-systemd",
+    "--disable-socache-dc",
+    "--disable-privileges",
+    "--disable-isapi"
+  ],
+  "excluded": [
+    {
+      "name": "isapi",
+      "reason": "Windows-only; modules/arch/win32/config.m4 has no Linux counterpart."
+    },
+    {
+      "name": "socache_dc",
+      "reason": "distcache has been unmaintained since 2005 and is not part of Lounge."
+    },
+    {
+      "name": "systemd",
+      "reason": "Requires libsystemd and a systemd-managed host; a portable bundle must not link it."
+    },
+    {
+      "name": "privileges",
+      "reason": "Solaris-style privilege model needing matching kernel interfaces; not portable."
+    }
+  ],
+  "rpath_strip": " -rpath $(libexecdir)"
+}

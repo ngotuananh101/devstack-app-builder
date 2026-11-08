@@ -9,7 +9,6 @@ import subprocess
 import tarfile
 from urllib.parse import quote
 
-
 # The pinned PostgreSQL sources are authoritative: a plan may only name a
 # version the repository has already authenticated an archive digest for.
 POSTGRES_SOURCES = Path(__file__).resolve().parents[2] / "postgresql/config/sources.json"
@@ -36,6 +35,50 @@ def _pinned_postgres_versions() -> list:
         raise ValueError(f"No pinned PostgreSQL versions in {POSTGRES_SOURCES}")
     return versions
 
+# What an Apache archive must carry to be the bundle this builder promises: every
+# launcher startable, and the modules that make the documented feature set real.
+APACHE_PROGRAMS = ("bin/httpd", "bin/apachectl", "bin/openssl", "libexec/bin/httpd")
+APACHE_REQUIRED = (
+    "conf/httpd.conf",
+    "conf/original/httpd.conf",
+    "ssl/openssl.cnf",
+    "modules/mod_ssl.so",
+    "modules/mod_http2.so",
+    "modules/mod_md.so",
+    "modules/mod_brotli.so",
+    "modules/mod_lua.so",
+    "modules/mod_dav.so",
+    "modules/mod_proxy_fcgi.so",
+    "modules/mod_rewrite.so",
+    "lib/apr-util-1/apr_dbd_sqlite3-1.so",
+)
+
+
+def resolve_link(members, canonical):
+    """Follow an archived symlink to the regular file it names.
+
+    Apache ships soname aliases (lib/libz.so.1 -> libz.so.1.3.2) and chains two
+    of them (libbrotlicommon.so -> libbrotlicommon.so.1 -> ...so.1.2.1), so the
+    first hop is rarely the answer. A link is safe only when every hop is
+    relative and lands on a regular file this archive carries: an absolute,
+    escaping, dangling or looping link would write outside the extraction root
+    or make the extracted tree depend on the machine doing the extraction.
+    """
+    seen = set()
+    current = canonical
+    while current not in seen:
+        member = members.get(current)
+        if member is None:
+            return None
+        seen.add(current)
+        if not member.issym():
+            return current if member.isfile() else None
+        linkname = Path(member.linkname)
+        if linkname.is_absolute() or ".." in linkname.parts or not linkname.parts:
+            return None
+        current = str(Path(current).parent / linkname)
+    return None  # A loop names no file.
+
 
 def validate_assets(directory):
     archives = sorted(directory.glob("*.tar.gz"))
@@ -58,36 +101,22 @@ def validate_assets(directory):
         root = archive.name[:-7]
         with tarfile.open(archive) as tar:
             members = {}
-            links = []
             for member in tar.getmembers():
                 path = Path(member.name)
                 canonical = str(path)
-                redis_alias = (manifest.get("runtime") == "redis" and canonical in {
-                    root + "/bin/redis-sentinel", root + "/bin/redis-check-rdb", root + "/bin/redis-check-aof"}
-                    and member.issym() and member.linkname == "redis-server")
-                # PostgreSQL ships versioned shared objects with the usual
-                # `libpq.so -> libpq.so.5.18` aliases. Accept only relative
-                # links whose target is a real file inside this same archive.
-                postgres_alias = (manifest.get("runtime") == "postgresql" and member.issym()
-                                  and not member.linkname.startswith("/")
-                                  and ".." not in Path(member.linkname).parts)
                 if (path.is_absolute() or ".." in path.parts or not path.parts
                         or path.parts[0] != root or member.name.rstrip("/") != canonical
-                        or not (member.isfile() or member.isdir() or redis_alias or postgres_alias)
-                        or canonical in members):
+                        or not (member.isfile() or member.isdir() or member.issym()) or canonical in members):
                     raise ValueError("Unsafe archive layout")
                 members[canonical] = member
-                if postgres_alias:
-                    links.append(canonical)
+            # A link is only tolerated when it resolves inside this archive, so the
+            # layout check above cannot be turned into a write outside it.
+            for canonical, member in members.items():
+                if member.issym() and not resolve_link(members, canonical):
+                    raise ValueError("Unsafe archive layout")
             packaged = members.get(root + "/manifest.json")
             if not packaged or not packaged.isfile() or json.load(tar.extractfile(packaged)) != manifest:
                 raise ValueError("Sidecar and packaged manifest differ")
-            for link in links:
-                member = members[link]
-                target = str(Path(link).parent / member.linkname)
-                destination = members.get(target)
-                if not target.startswith(root + "/") or not destination or not destination.isfile():
-                    raise ValueError(f"Archive link does not resolve inside the bundle: {link}")
             runtime = manifest.get("runtime")
             try:
                 if runtime == "php":
@@ -108,6 +137,25 @@ def validate_assets(directory):
                         candidate = members.get(root + "/bin/" + name)
                         if not candidate or not candidate.issym() or candidate.linkname != "redis-server":
                             raise ValueError("Missing/unsafe Redis alias")
+                elif runtime == "apache":
+                    parts = [manifest["apache"]["version"], manifest["target"], manifest["architecture"], manifest["build_id"]]
+                    valid = (re.fullmatch(r"2\.4\.[0-9]+", parts[0]) and parts[2] == "x86_64"
+                             and manifest.get("linkage") == "dynamic" and "profile" not in manifest
+                             and isinstance(manifest.get("loader"), dict)
+                             and manifest["loader"].get("path") == "lib/musl/ld-musl-x86_64.so.1")
+                    loader = members.get(root + "/lib/musl/ld-musl-x86_64.so.1")
+                    if not loader or not loader.isfile() or loader.size == 0 or loader.mode & 0o111 != 0o111:
+                        raise ValueError("Archive lost the bundled musl loader")
+                    # The launchers are the only entry points a user should run:
+                    # libexec/ holds the ELFs and is started through bin/.
+                    executables = ("bin/httpd", "bin/apachectl", "libexec/bin/httpd")
+                    for relative in APACHE_PROGRAMS:
+                        candidate = members.get(root + "/" + relative)
+                        if not candidate or not candidate.isfile() or candidate.mode & 0o111 != 0o111:
+                            raise ValueError(f"Archive lost Apache program permissions: {relative}")
+                    for relative in APACHE_REQUIRED:
+                        if not members.get(root + "/" + relative):
+                            raise ValueError(f"Archive is missing a required Apache file: {relative}")
                 elif runtime == "postgresql":
                     parts = [manifest["postgresql"]["version"], manifest["target"], manifest["architecture"], manifest["build_id"]]
                     executables = POSTGRES_EXECUTABLES
@@ -160,12 +208,16 @@ def validate_plan(plan, manifests, tag, repository, commit):
     redis_matrix = plan.get("redis_matrix", {"include": []})
     if not isinstance(redis_matrix, dict) or not isinstance(redis_matrix.get("include"), list):
         raise ValueError("Empty/invalid publication matrix")
+    apache_matrix = plan.get("apache_matrix", {"include": []})
+    if not isinstance(apache_matrix, dict) or not isinstance(apache_matrix.get("include"), list):
+        raise ValueError("Empty/invalid publication matrix")
     postgres_matrix = plan.get("postgres_matrix", {"include": []})
     if not isinstance(postgres_matrix, dict) or not isinstance(postgres_matrix.get("include"), list):
         raise ValueError("Empty/invalid publication matrix")
     # Any one runtime with rows is a real release: a PostgreSQL-only plan is not
-    # an empty matrix, so this guard is a three-way or rather than a pair.
-    if not (matrix["include"] or redis_matrix["include"] or postgres_matrix["include"]):
+    # an empty matrix, so this guard is a four-way or rather than a pair.
+    if not (matrix["include"] or redis_matrix["include"] or apache_matrix["include"]
+            or postgres_matrix["include"]):
         raise ValueError("Empty/invalid publication matrix")
     expected = set()
     for row in matrix["include"]:
@@ -196,6 +248,18 @@ def validate_plan(plan, manifests, tag, repository, commit):
         if identity in expected:
             raise ValueError("Duplicate publication matrix row")
         expected.add(identity)
+    for row in apache_matrix["include"]:
+        if (not isinstance(row, dict) or not isinstance(row.get("apache_version"), str)
+                or not re.fullmatch(r"2\.4\.[0-9]+", row["apache_version"])
+                or row.get("target") != "musl-dynamic" or row.get("architecture") != "x86_64" or "profile" in row):
+            raise ValueError("Invalid Apache publication matrix")
+        previous = row.get("previous_version")
+        if previous is not None and previous != row["apache_version"]:
+            raise ValueError("Invalid previous Apache version")
+        identity = ("apache", row["apache_version"], row["target"], row["architecture"])
+        if identity in expected:
+            raise ValueError("Duplicate publication matrix row")
+        expected.add(identity)
     # Read through a guarded helper so a missing or malformed pin file is a
     # ValueError naming it, not a traceback from deep inside plan validation.
     pinned = set(_pinned_postgres_versions())
@@ -222,6 +286,10 @@ def validate_plan(plan, manifests, tag, repository, commit):
                 identity = (runtime, manifest["php"]["version"], manifest["target"], manifest["architecture"])
             elif runtime == "redis" and "profile" not in manifest:
                 identity = (runtime, manifest["redis"]["version"], manifest["target"], manifest["architecture"])
+            elif runtime == "apache" and "profile" not in manifest:
+                if manifest.get("linkage") != "dynamic":
+                    raise ValueError("Invalid planned runtime")
+                identity = (runtime, manifest["apache"]["version"], manifest["target"], manifest["architecture"])
             elif runtime == "postgresql" and "profile" not in manifest and manifest.get("linkage") == "dynamic":
                 # Same identity rule as validate_assets: the recorded major must
                 # be this version's own, so a plan cannot be satisfied by a
@@ -388,6 +456,40 @@ def _postgres_section(manifests):
     return lines
 
 
+def _apache_section(manifests):
+    lines = ["## Apache httpd bundles", "",
+             "Full Apache Lounge-equivalent module set, built against vendored dependencies; "
+             "the only libc needed on the host is the one in the bundle.", "",
+             "| Apache | Target | Architecture | MPM | Modules (shared) | Build ID |",
+             "| --- | --- | --- | --- | --- | --- |"]
+    for manifest in sorted(manifests,
+                           key=lambda m: (tuple(map(int, m["apache"]["version"].split("."))), m["target"])):
+        if manifest.get("linkage") != "dynamic":
+            raise ValueError("Apache bundles must be dynamic musl bundles")
+        modules = manifest.get("modules", {}).get("dso")
+        if not isinstance(modules, list):
+            raise ValueError("Apache bundles must record their module inventory")
+        mpm = manifest.get("mpm", {}).get("default")
+        if not isinstance(mpm, str) or mpm not in {"event", "worker", "prefork"}:
+            raise ValueError("Apache bundles must record their MPM")
+        lines.append("| " + " | ".join((manifest["apache"]["version"], manifest["target"],
+                                        manifest["architecture"], mpm, str(len(modules)),
+                                        manifest["build_id"])) + " |")
+    lines += ["",
+              "- Launch through `bin/`, never through `bin/httpd`'s `libexec/` target: the launchers "
+              "start the bundled musl loader with the bundle's own library path.",
+              "- `bin/httpd` always passes the bundle's own `ServerRoot`; `bin/apachectl` wraps it.",
+              "- `bin/apachectl` is a config/control wrapper, not a service manager; run it as the "
+              "user that owns the bundle.",
+              "- Listening on a privileged port needs `setcap cap_net_bind_service+ep` on "
+              "`lib/musl/ld-musl-x86_64.so.1`; port 8080 and above need nothing.",
+              "- Configuration and documents live under `conf/` and `htdocs/`; certificates are yours "
+              "to supply (`ssl/openssl.cnf` is only the OpenSSL CLI's default configuration).",
+              "- The bundle is relocatable: copy it anywhere and the launchers follow.",
+              "- This release does not configure or run a DevStack site."]
+    return lines
+
+
 def release_notes(manifests, repository, commit, plan=None):
     """Describe exactly the bundles in this release, one section per runtime.
 
@@ -397,17 +499,22 @@ def release_notes(manifests, repository, commit, plan=None):
     """
     php_manifests = [manifest for manifest in manifests if manifest.get("runtime") == "php"]
     redis_manifests = [manifest for manifest in manifests if manifest.get("runtime") == "redis"]
+    apache_manifests = [manifest for manifest in manifests if manifest.get("runtime") == "apache"]
     postgres_manifests = [manifest for manifest in manifests if manifest.get("runtime") == "postgresql"]
     sections = []
     if php_manifests:
         sections.append(_php_section(php_manifests, plan))
     if redis_manifests:
         sections.append(_redis_section(redis_manifests))
+    if apache_manifests:
+        sections.append(_apache_section(apache_manifests))
     if postgres_manifests:
         sections.append(_postgres_section(postgres_manifests))
     if not sections:
         raise ValueError("No recognized runtime bundles to describe")
-    runtimes = [name for name, present in (("PHP", php_manifests), ("Redis", redis_manifests), ("PostgreSQL", postgres_manifests)) if present]
+    runtimes = [label for label, present in (("PHP", php_manifests), ("Redis", redis_manifests),
+                                             ("Apache", apache_manifests), ("PostgreSQL", postgres_manifests))
+                if present]
     lines = ["# DevStack runtime bundles", "",
              "Verified " + "/".join(runtimes) + " archives from the exact build plan.", ""]
     for index, section in enumerate(sections):

@@ -21,6 +21,7 @@ from test_build import load
 
 
 WORKFLOW = REPO / ".github/workflows/build.yml"
+BUILD_JOBS = ("build-php", "build-redis", "build-postgresql", "build-apache")
 
 
 def job_block(text, name):
@@ -48,8 +49,9 @@ class WorkflowContracts(unittest.TestCase):
         self.assertNotIn("PROFILE_INPUT", planner)
         self.assertIn("scripts/updates.py", planner)
         self.assertIn("redis_matrix:", planner)
+        self.assertIn("postgres_matrix:", planner)
+        self.assertIn("apache_matrix:", planner)
         self.assertIn("BYPASS: ${{ inputs.bypass || false }}", planner)
-        self.assertIn("  build-redis:\n", workflow, "Missing native Redis build job")
         php = job_block(workflow, "build-php")
         self.assertIn('./build.sh php "$BUILD_VERSION"', php)
         self.assertNotIn("BUILD_TARGET", php)
@@ -59,11 +61,63 @@ class WorkflowContracts(unittest.TestCase):
         self.assertNotIn("BUILD_TARGET", redis)
         self.assertNotIn("BUILD_PROFILE", redis)
         self.assertNotIn("docker", redis.lower())
+        postgres = job_block(workflow, "build-postgresql")
+        self.assertIn('./build.sh postgresql "$BUILD_VERSION"', postgres)
+        self.assertNotIn("BUILD_TARGET", postgres)
+        self.assertNotIn("BUILD_PROFILE", postgres)
+        self.assertNotIn("docker", postgres.lower())
+        apache = job_block(workflow, "build-apache")
+        self.assertIn('./build.sh apache "$BUILD_VERSION"', apache)
+        self.assertNotIn("BUILD_TARGET", apache)
+        self.assertNotIn("BUILD_PROFILE", apache)
+        self.assertNotIn("docker", apache.lower(), "Apache builds must not use Docker")
         publish = workflow.split("  publish:\n", 1)[1]
-        self.assertIn("needs: [plan, build-php, build-redis, build-postgresql]", publish)
+        self.assertIn(
+            "needs: [plan, build-php, build-redis, build-postgresql, build-apache]", publish)
         self.assertIn("always()", publish)
-        self.assertIn("needs.build-redis.result", publish)
+        for runtime in ("php", "redis", "postgresql", "apache"):
+            self.assertIn(f"needs.build-{runtime}.result", publish, runtime)
         self.assertIn("pattern: runtime-*", publish)
+
+    def test_apache_ci_never_installs_a_host_musl(self):
+        # The Apache job failed this way once: Ubuntu 24.04's musl-tools is 1.2.4
+        # while the pin is 1.2.5, and the build used to refuse the mismatch. The
+        # pinned musl is now compiled by loader.py, so a host musl must not be
+        # installed at all — installing it would only hide a regression in that.
+        workflow = (REPO / ".github/workflows/build.yml").read_text()
+        apache = workflow.split("  build-apache:\n", 1)[1].split("  publish:\n", 1)[0]
+        installation = apache.split("      - name: Install CI-only native build dependencies\n", 1)[1]
+        command = textwrap.dedent(installation.split("        run:", 1)[1].split("      - name:", 1)[0])
+        import shlex
+        packages = []
+        for line in command.splitlines():
+            if line.lstrip().startswith("#") or not line.strip():
+                continue
+            argv = shlex.split(line)
+            if argv[:3] == ["sudo", "apt-get", "install"]:
+                packages += argv[4:]
+        self.assertTrue(packages, "The Apache job must install its build tools")
+        for forbidden in ("musl", "musl-tools", "musl-dev"):
+            self.assertNotIn(forbidden, packages)
+        # A C compiler is still the one thing the host must provide.
+        self.assertIn("build-essential", packages)
+
+    def test_postgresql_ci_installs_the_mask_its_verification_needs(self):
+        # Publication accepts only a bundle verified under the bwrap mask, so a
+        # runner without bubblewrap fails the build rather than publishing a
+        # weaker bundle. The job must therefore install it explicitly.
+        job = job_block(WORKFLOW.read_text(), "build-postgresql")
+        installation = job.split("      - name: Install CI-only native build dependencies\n", 1)[1]
+        command = textwrap.dedent(installation.split("        run:", 1)[1].split("      - name:", 1)[0])
+        import shlex
+        packages = []
+        for line in command.splitlines():
+            if line.lstrip().startswith("#") or not line.strip():
+                continue
+            argv = shlex.split(line)
+            if argv[:3] == ["sudo", "apt-get", "install"]:
+                packages += argv[4:]
+        self.assertIn("bubblewrap", packages)
 
     def test_bypass_input_is_manual_only_and_defaults_to_version_checks(self):
         workflow = (REPO / ".github/workflows/build.yml").read_text()
@@ -75,13 +129,13 @@ class WorkflowContracts(unittest.TestCase):
         schedule = workflow.split("  schedule:\n", 1)[1].split("  workflow_dispatch:", 1)[0]
         self.assertNotIn("bypass", schedule)
         # Bypass only changes planning; build jobs must keep building the planned version.
-        for job, following in (("  build-php:\n", "  build-redis:\n"), ("  build-redis:\n", "  publish:\n")):
-            section = workflow.split(job, 1)[1].split(following, 1)[0]
-            self.assertNotIn("bypass", section.lower())
+        for job in BUILD_JOBS:
+            with self.subTest(job=job):
+                self.assertNotIn("bypass", job_block(workflow, job).lower())
 
     def test_php_ci_installs_host_musl_before_spc_preflight(self):
         workflow = (REPO / ".github/workflows/build.yml").read_text()
-        php = workflow.split("  build-php:\n", 1)[1].split("  build-redis:\n", 1)[0]
+        php = job_block(workflow, "build-php")
         preparation = php.split("      - name: Install CI-only build dependencies\n", 1)[1].split("      - name:", 1)[0]
         command = textwrap.dedent(preparation.split("        run:", 1)[1]).strip()
         command = command.removeprefix("|").strip()
@@ -203,24 +257,30 @@ class WorkflowContracts(unittest.TestCase):
         planner = load_planner()
         upstream = {"8.5": "8.5.1", "8.4": "8.4.10", "8.3": "8.3.2", "8.2": "8.2.3"}
         from test_updates import REPOSITORY
+        apache_pins = sorted(json.loads((REPO / "runtimes/apache/config/sources.json").read_text())["versions"])
+        postgres_pins = json.loads((REPO / "runtimes/postgresql/config/sources.json").read_text())["versions"]
+        redis_pins = ("8.10.3", "7.4.12", "7.2.17")
         # Scheduled and default manual runs check public versions; only bypass rebuilds
         # the whole matrix regardless of what is already published.
-        scenarios = (("schedule", False, False, False, False, 4, 3, 2),
-                     ("schedule", True, False, False, False, 0, 3, 2),
-                     ("schedule", False, True, False, False, 4, 0, 2),
-                     ("schedule", True, True, False, False, 0, 0, 2),
-                     ("schedule", True, True, True, False, 0, 0, 0),
-                     ("workflow_dispatch", True, True, True, False, 0, 0, 0),
-                     ("workflow_dispatch", False, True, True, False, 4, 0, 0),
-                     ("workflow_dispatch", True, True, True, True, 4, 3, 2),
-                     ("workflow_dispatch", False, False, False, True, 4, 3, 2))
-        for event, php_current, redis_current, postgres_current, bypass, php_count, redis_count, postgres_count in scenarios:
-            with self.subTest(event=event, php_current=php_current, redis_current=redis_current, postgres_current=postgres_current, bypass=bypass), tempfile.TemporaryDirectory() as tmp:
+        scenarios = (("schedule", False, False, False, False, False),
+                     ("schedule", True, False, False, True, False),
+                     ("schedule", False, True, True, False, False),
+                     ("schedule", False, False, True, True, False),
+                     ("schedule", True, True, True, True, False),
+                     ("workflow_dispatch", True, True, True, True, False),
+                     ("workflow_dispatch", False, True, True, True, False),
+                     ("workflow_dispatch", True, True, True, True, True),
+                     ("workflow_dispatch", False, False, False, False, True))
+        for event, php_current, redis_current, postgres_current, apache_current, bypass in scenarios:
+            with self.subTest(event=event, php_current=php_current, redis_current=redis_current,
+                              postgres_current=postgres_current, apache_current=apache_current, bypass=bypass), \
+                    tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 output = root / "output"
                 history = {(series, "musl-dynamic", "x86_64"): version for series, version in upstream.items()} if php_current else {}
-                redis_history = {(version, "musl", "x86_64"): version for version in ("8.10.3", "7.4.12", "7.2.17")} if redis_current else {}
-                postgres_history = {(version, "musl-dynamic", "x86_64"): version for version in ("18.6", "17.11")} if postgres_current else {}
+                redis_history = {(version, "musl", "x86_64"): version for version in redis_pins} if redis_current else {}
+                postgres_history = {(version, "musl-dynamic", "x86_64"): version for version in postgres_pins} if postgres_current else {}
+                apache_history = {(version, "musl-dynamic", "x86_64"): version for version in apache_pins} if apache_current else {}
                 env = {**os.environ, "PUBLISH": "false", "RELEASE_TAG": "", "BYPASS": str(bypass).lower(),
                        "GITHUB_OUTPUT": str(output), "GITHUB_EVENT_NAME": event, "GITHUB_REPOSITORY": REPOSITORY,
                        "GITHUB_SHA": "a" * 40, "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}
@@ -234,37 +294,44 @@ class WorkflowContracts(unittest.TestCase):
                      patch.object(planner.php, "latest_php", side_effect=upstream.__getitem__), \
                      patch.object(planner.php, "published_versions", return_value=history), \
                      patch.object(planner, "published_redis", return_value=redis_history), \
-                     patch.object(planner, "published_postgresql", return_value=postgres_history):
+                     patch.object(planner, "published_postgresql", return_value=postgres_history), \
+                     patch.object(planner, "published_apache", return_value=apache_history):
                     planner.main()
                 policy = json.loads((root / "runtime-update-plan.json").read_text())
                 outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
+                counts = {"matrix": 0 if (php_current and not bypass) else 4,
+                          "redis_matrix": 0 if (redis_current and not bypass) else len(redis_pins),
+                          "postgres_matrix": 0 if (postgres_current and not bypass) else len(postgres_pins),
+                          "apache_matrix": 0 if (apache_current and not bypass) else len(apache_pins)}
+                selected = any(counts.values())
+                self.assertEqual(outputs["has_updates"], "true" if selected else "false")
+                self.assertEqual(outputs["has_php_updates"], "true" if counts["matrix"] else "false")
+                self.assertEqual(outputs["has_redis_updates"], "true" if counts["redis_matrix"] else "false")
+                self.assertEqual(outputs["has_postgres_updates"], "true" if counts["postgres_matrix"] else "false")
+                self.assertEqual(outputs["has_apache_updates"], "true" if counts["apache_matrix"] else "false")
+                self.assertEqual(outputs["publish"], "true" if event == "schedule" and selected else "false")
+                for name, count in counts.items():
+                    self.assertEqual(json.loads(outputs[name]), policy[name], name)
+                    self.assertEqual(len(policy[name]["include"]), count, name)
                 rows = policy["matrix"]["include"]
-                self.assertEqual(outputs["has_updates"], "true" if php_count or redis_count or postgres_count else "false")
-                self.assertEqual(outputs["has_php_updates"], "true" if php_count else "false")
-                self.assertEqual(outputs["has_redis_updates"], "true" if redis_count else "false")
-                self.assertEqual(outputs["has_postgres_updates"], "true" if postgres_count else "false")
-                self.assertEqual(outputs["publish"], "true" if event == "schedule" and (php_count or redis_count or postgres_count) else "false")
-                self.assertEqual(json.loads(outputs["matrix"]), policy["matrix"])
-                self.assertEqual(json.loads(outputs["redis_matrix"]), policy["redis_matrix"])
-                self.assertEqual(json.loads(outputs["postgres_matrix"]), policy["postgres_matrix"])
-                self.assertEqual(len(rows), php_count)
-                self.assertEqual(len(policy["redis_matrix"]["include"]), redis_count)
-                self.assertEqual(len(policy["postgres_matrix"]["include"]), postgres_count)
                 if rows:
                     self.assertEqual({row["php_version"] for row in rows}, {"8.5.1", "8.4.10", "8.3.2", "8.2.3"})
                     self.assertEqual({row["target"] for row in rows}, {"musl-dynamic"})
                     self.assertTrue(all("profile" not in row for row in rows))
-                if redis_count:
+                if counts["redis_matrix"]:
                     self.assertEqual({row["target"] for row in policy["redis_matrix"]["include"]}, {"musl"})
-                if postgres_count:
+                if counts["postgres_matrix"]:
                     self.assertEqual({row["target"] for row in policy["postgres_matrix"]["include"]}, {"musl-dynamic"})
+                if counts["apache_matrix"]:
+                    self.assertEqual({row["target"] for row in policy["apache_matrix"]["include"]}, {"musl-dynamic"})
 
     def test_noop_matrix_and_publication_are_gated_by_persisted_plan(self):
         workflow = (REPO / ".github/workflows/build.yml").read_text()
-        php = workflow.split("  build-php:\n", 1)[1].split("  build-redis:\n", 1)[0]
+        php = job_block(workflow, "build-php")
         publish = workflow.split("  publish:\n", 1)[1]
         self.assertIn("if: needs.plan.outputs.has_php_updates == 'true'", php)
-        self.assertIn("needs: [plan, build-php, build-redis, build-postgresql]", publish)
+        self.assertIn(
+            "needs: [plan, build-php, build-redis, build-postgresql, build-apache]", publish)
         self.assertIn("name: publication-plan", publish)
         self.assertIn("--plan dist/plans/runtime-update-plan.json", publish)
         self.assertIn("group: runtime-build-publication", workflow)
@@ -280,18 +347,24 @@ class WorkflowContracts(unittest.TestCase):
         expression = expression.removeprefix("${{").removesuffix("}}").strip()
         # Evaluate our emitted boolean expression over the entire small state space.
         states = ("success", "failure", "cancelled", "skipped")
-        for cancelled, plan_result, publish_enabled, php_selected, redis_selected, postgres_selected, php_result, redis_result, postgres_result in itertools.product(
-                (False, True), states, (False, True), (False, True), (False, True), (False, True), states, states, states):
+        flag = (False, True)
+        for (cancelled, plan_result, publish_enabled, php_selected, redis_selected,
+             postgres_selected, apache_selected, php_result, redis_result,
+             postgres_result, apache_result) in itertools.product(
+                flag, states, flag, flag, flag, flag, flag, states, states, states, states):
             expected = (not cancelled and plan_result == "success" and publish_enabled
                         and php_result == ("success" if php_selected else "skipped")
                         and redis_result == ("success" if redis_selected else "skipped")
-                        and postgres_result == ("success" if postgres_selected else "skipped"))
+                        and postgres_result == ("success" if postgres_selected else "skipped")
+                        and apache_result == ("success" if apache_selected else "skipped"))
             values = {"needs.plan.result": plan_result, "needs.plan.outputs.publish": str(publish_enabled).lower(),
                       "needs.plan.outputs.has_php_updates": str(php_selected).lower(),
                       "needs.plan.outputs.has_redis_updates": str(redis_selected).lower(),
                       "needs.plan.outputs.has_postgres_updates": str(postgres_selected).lower(),
+                      "needs.plan.outputs.has_apache_updates": str(apache_selected).lower(),
                       "needs.build-php.result": php_result, "needs.build-redis.result": redis_result,
-                      "needs.build-postgresql.result": postgres_result}
+                      "needs.build-postgresql.result": postgres_result,
+                      "needs.build-apache.result": apache_result}
             candidate = expression.replace("always()", "True").replace("!cancelled()", repr(not cancelled))
             for name, value in values.items():
                 candidate = candidate.replace(name, repr(value))
@@ -320,12 +393,33 @@ class WorkflowContracts(unittest.TestCase):
         pattern = re.search(r"^          pattern: (.+)$", job_block(text, "publish"), re.MULTILINE)[1]
         self.assertTrue(fnmatch.fnmatchcase(artifact.replace("${{ matrix.postgresql_version }}", "18.6"), pattern))
 
+    def test_workflow_builds_apache_with_explicit_ci_dependencies(self):
+        text = WORKFLOW.read_text()
+        job = job_block(text, "build-apache")
+        self.assertIn("if: needs.plan.outputs.has_apache_updates == 'true'", job)
+        self.assertIn("needs: [plan, contracts]", job)
+        self.assertIn("matrix: ${{ fromJson(needs.plan.outputs.apache_matrix) }}", job)
+        self.assertIn('./build.sh apache "$BUILD_VERSION"', job)
+        self.assertIn("if-no-files-found: error", job)
+        plan_job = job_block(text, "plan")
+        self.assertIn("apache_matrix: ${{ steps.set.outputs.apache_matrix }}", plan_job)
+        self.assertIn("has_apache_updates: ${{ steps.set.outputs.has_apache_updates }}", plan_job)
+        artifact = re.search(r"^          name: (runtime-apache-.+)$", job, re.MULTILINE)[1]
+        pattern = re.search(r"^          pattern: (.+)$", job_block(text, "publish"), re.MULTILINE)[1]
+        self.assertTrue(fnmatch.fnmatchcase(artifact.replace("${{ matrix.apache_version }}", "2.4.70"), pattern))
+
     def test_publish_gate_requires_every_selected_runtime_to_succeed(self):
         gate = job_block(WORKFLOW.read_text(), "publish")
         # Names match what scripts/updates.py writes to $GITHUB_OUTPUT.
-        for runtime in ("php", "redis", "postgres"):
+        for runtime in ("php", "redis", "postgres", "apache"):
             self.assertIn(f"has_{runtime}_updates", gate, runtime)
-        self.assertIn("build-postgresql", gate, "publish must depend on the postgresql build")
+        for runtime in BUILD_JOBS:
+            self.assertIn(runtime, gate, f"publish must depend on {runtime}")
+
+    def test_contracts_job_checks_every_runtime_script(self):
+        contracts = job_block(WORKFLOW.read_text(), "contracts")
+        for runtime in ("php", "redis", "postgresql", "apache"):
+            self.assertIn(f"runtimes/{runtime}/scripts/", contracts, runtime)
 
     def test_asset_download_pattern_excludes_the_publication_plan(self):
         workflow = (REPO / ".github/workflows/build.yml").read_text()
@@ -333,8 +427,9 @@ class WorkflowContracts(unittest.TestCase):
         publish = workflow.split("  publish:\n", 1)[1]
         pattern = re.search(r"^          pattern: (.+)$", publish, re.MULTILINE)[1]
         plan_name = re.search(r"^          name: (.+)$", plan_job, re.MULTILINE)[1]
-        for artifact in ("runtime-php-8.4.10-musl-dynamic-x86_64", "runtime-redis-8.10.3-musl-x86_64"):
-            self.assertTrue(fnmatch.fnmatchcase(artifact, pattern))
+        for artifact in ("runtime-php-8.4.10-musl-dynamic-x86_64", "runtime-redis-8.10.3-musl-x86_64",
+                         "runtime-postgresql-18.6-musl-dynamic-x86_64", "runtime-apache-2.4.70-musl-dynamic-x86_64"):
+            self.assertTrue(fnmatch.fnmatchcase(artifact, pattern), artifact)
         self.assertFalse(fnmatch.fnmatchcase(plan_name, pattern), "Plan JSON must not be merged into bundle assets")
 
     def test_ci_uploads_verified_archives_without_profile_inputs(self):

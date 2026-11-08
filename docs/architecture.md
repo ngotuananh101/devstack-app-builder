@@ -18,6 +18,8 @@ devstack-runtime-builder/
 │   │   ├── config/           # Extension lists, pins and runtime configuration
 │   │   ├── scripts/          # Build and management scripts
 │   │   └── README.md
+│   ├── redis/                # Redis runtime builder
+│   ├── apache/               # Apache httpd runtime builder
 │   ├── postgresql/           # PostgreSQL runtime builder
 │   │   ├── config/           # Build options, modules and source pins
 │   │   ├── packaging/        # Launcher templates and runtime scripts
@@ -30,6 +32,8 @@ devstack-runtime-builder/
 │   │       └── musl-dynamic/
 │   ├── redis/
 │   │   └── <version>/musl/
+│   ├── apache/
+│   │   └── <version>/musl-dynamic/
 │   ├── postgresql/
 │   │   └── <version>/
 │   │       └── musl-dynamic/
@@ -38,8 +42,9 @@ devstack-runtime-builder/
 │   ├── architecture.md
 │   └── runtimes/
 │       ├── php.md
-│       ├── postgresql.md
-│       └── redis.md
+│       ├── redis.md
+│       ├── apache.md
+│       └── postgresql.md
 └── .github/
     └── workflows/
         └── build.yml         # Matrix build CI workflow
@@ -62,6 +67,7 @@ Every runtime directory under `runtimes/<name>` adheres to the following contrac
 ## Supported Runtimes
 
 - [Redis](runtimes/redis.md): Native Linux x86_64 source builds, fully static musl only; no profiles, Docker or service configuration.
+- [Apache httpd (2.4.x)](runtimes/apache.md): `musl-dynamic` bundle shaped like the Windows Apache Lounge build — 126 shared modules, all three MPMs, every dependency (OpenSSL, PCRE2, brotli, nghttp2, jansson, curl, expat, libxml2, Lua, OpenLDAP, sqlite3, unixODBC, APR, APR-util) built from a pinned source, and a bundled musl loader. One pinned exact version; no profiles.
 - [PHP (8.5, 8.4, 8.3, 8.2)](runtimes/php.md): Single `musl-dynamic` target — musl-linked binaries with a fixed static baseline, 20 shared `.so` extensions (19 on PHP 8.5, which compiles OPcache into the binary), and a bundled musl loader — with independent CLI and FPM SAPI support. Custom PHP versions can be specified at build time.
 - [PostgreSQL (18.6, 17.11)](runtimes/postgresql.md): Relocatable `musl-dynamic` server bundles for PostgreSQL 18.x and 17.x with bundled musl loader, OpenSSL shared, static zlib/libxml2/ICU/libuuid, 85 extension modules, and `builtin`/`C.UTF-8` locale collation.
 

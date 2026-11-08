@@ -1,0 +1,461 @@
+# Apache httpd Runtime — Design
+
+Date: 2026-11-08
+Status: approved for implementation
+
+## Intent
+
+Add Apache httpd as the third runtime in this repository, alongside PHP
+(`musl-dynamic`) and Redis (fully static musl). The deliverable is one
+self-contained archive that a user unpacks and runs: full Apache, every module,
+every dependency vendored, no host Apache, no host libc, no Docker.
+
+"Full" is the requirement, so it is made measurable: every module the Apache Lounge
+2.4.70 Windows build ships must exist in this bundle under the same name and be
+proven loadable and working, and every library those modules need must be built from
+a pinned source in this repository's build, not taken from the build host.
+
+## Goals
+
+- **Full module parity with Lounge.** Every `mod_*.so` Lounge ships for 2.4.70 exists
+  here as a DSO under the same name, plus the Linux-only modules (`cgid`,
+  `proxy_fdpass`, `suexec`, `unixd`). 126 DSOs ship and all 126 are proven loadable;
+  `isapi` is the single exception and cannot exist on Linux.
+- **Everything vendored.** httpd, APR, APR-util, musl loader, PCRE2, OpenSSL, zlib,
+  brotli, nghttp2, jansson, curl, expat, libxml2, Lua, OpenLDAP, sqlite3, unixODBC —
+  each pinned to an exact version with a reviewed SHA-256 and built from source into
+  a staging prefix.
+- **Relocatable and host-independent.** Carries its own musl loader; runs on a host
+  with no musl and no Apache, from a path with spaces, after being moved.
+- **A Lounge-shaped tree.** Modules in `modules/`, binaries invoked through `bin/`
+  launchers, `conf/httpd.conf` written the way Lounge writes it (`Define SRVROOT`,
+  `${SRVROOT}/htdocs`, `#LoadModule x_module modules/mod_x.so`, `Listen 80`).
+- Repository conventions: one pinned exact version, no profile or libc selector, no
+  package installation on the build host, manifest + checksum-verified archives,
+  planner builds only missing combinations.
+
+## Non-goals
+
+- Not a distro replacement, not a systemd unit, not a service manager. Nothing is
+  installed outside the bundle directory.
+- Not a PHP integration. `mod_proxy_fcgi` ships and is verified, but wiring it up is
+  the consumer's job.
+- Not Oracle DBD, FreeTDS, Berkeley DB, GDBM, `mod_systemd`, `mod_socache_dc`,
+  `mod_privileges` — each with a recorded reason in `config/modules.json`.
+- Not Windows, not aarch64, not glibc. x86_64 Linux musl-dynamic only.
+- Not upstream version discovery. Only pinned exact versions are built.
+
+## Decisions taken (and why)
+
+### musl-dynamic with a bundled loader, not static
+
+Apache `dlopen`s every module, and a fully static musl binary cannot do that, so the
+bundle is musl-dynamic with its own loader — the same construct as the PHP runtime.
+
+Real ELFs live in `libexec/bin/` and are never executed by the kernel (their
+`PT_INTERP` names a loader the host may not have). Every public command in `bin/` is
+a generated `sh` launcher:
+
+```sh
+#!/bin/sh
+set -eu
+ROOT=$(CDPATH='' cd -P -- "$(dirname -- "$0")/.." && pwd)
+. "$ROOT/libexec/launch.sh"
+exec "$ROOT/lib/musl/ld-musl-x86_64.so.1" \
+     --library-path "$ROOT/lib/musl:$ROOT/lib" \
+     --argv0 "$ROOT/bin/httpd" \
+     "$ROOT/libexec/bin/httpd" "$@"
+```
+
+`libexec/launch.sh`:
+
+```sh
+# Sourced by generated launchers (POSIX sh).
+unset LD_PRELOAD LD_AUDIT
+export LD_LIBRARY_PATH="$ROOT/lib/musl:$ROOT/lib"
+export APACHE_SERVER_ROOT="$ROOT"
+```
+
+- `--library-path` covers the executable's own `NEEDED` entries and each module's.
+  Both directories are required, exactly as in the PHP bundle.
+- `LD_LIBRARY_PATH` is exported deliberately (the PHP launcher clears it) because
+  musl `dlopen` and APR-util's DSO lookup consult it. APR-util derives `APR_DSOPATH`
+  from its build-time `shlibpath_var`, which is `LD_LIBRARY_PATH`;
+  `apu_dso_load()` walks that path before `APU_DSO_LIBDIR`. Without it, `mod_dbd`
+  cannot find its drivers even though the server itself started.
+- `LD_PRELOAD`/`LD_AUDIT` are cleared so a host injection cannot reach a musl
+  process.
+- `APACHE_SERVER_ROOT` feeds `Define SRVROOT "${APACHE_SERVER_ROOT}"`. httpd has no
+  `${NAME:default}`: `ap_resolve_env()` substitutes `${NAME}` from `Define`d
+  variables then `getenv()`, and a `:` in the name only suppresses the warning while
+  the literal text survives. The launcher guarantees the variable is always set.
+- `--argv0` names the command the user typed in log lines. httpd does not derive
+  `ServerRoot` from `argv[0]`, so this is presentation only.
+- `-d "$ROOT"` is passed to `httpd` alone. `HTTPD_ROOT` is baked at configure time, so
+  without it the bundle reads the build host's `conf/httpd.conf` and its own is never
+  consulted; `httpd -V` on the bundle is the proof. Other programs get no extra argument.
+- The launcher does not inspect or rewrite `-f`. Arguments belong to the caller.
+
+### No RPATH/RUNPATH at all
+
+The repository forbids absolute `RUNPATH`, and httpd's module link lines carry
+`-rpath $(libexecdir)` generated by `APACHE_MODPATH_ADD` — which would bake the
+staging prefix into all 130+ DSOs, with no configure switch to stop it.
+
+Decision: the link keeps the rpath libtool insists on, and `httpd.py` edits it out of
+every installed ELF after `make install` (`strip_runpath`). Dropping the rpath argument
+instead is not an option: libtool then treats the module as a convenience library and
+installs a `.a` rather than a `.so`. `stage.py` asserts no vendored library carried an
+rpath, and `verify.py` rejects any absolute `RPATH`/`RUNPATH` in the bundle. Resolution
+is the launcher's job alone.
+
+### Module policy: everything shared
+
+`--enable-mods-shared=reallyall` with an empty `--enable-mods-static` makes every
+`APACHE_MODULE` a DSO. Three cannot be DSOs:
+
+- `mod_so` — static only by construction (`modules/core/config.m4`), and it is what
+  performs the loading.
+- `mod_http` — forced static; the MPM needs its hooks before any DSO exists.
+- `mod_core` — `core.c` is the server itself.
+
+`mod_unixd` **is** a DSO here (126 shared modules), unlike a static build where
+`os/unix/unixd.c` is linked into the binary; `config/modules.json` lists it in `dso`.
+
+This is not tidiness. `LoadModule` of a statically linked module is a hard startup
+error ("module X is built-in and can't be loaded", `modules/core/mod_so.c`), so a
+`LoadModule` line must never name a static module.
+
+Census (verified from the 2.4.70 build, not assumed):
+
+- **126 DSOs** built and verified: the Lounge module set plus the Linux-only `cgid`,
+  `proxy_fdpass`, `suexec` and `unixd`, and minus `isapi`, which has no Linux build.
+- **3 static** — `core`, `http`, `so` (`httpd -l` prints exactly
+  `core.c http_core.c mod_so.c`, and no MPM).
+- **`isapi`** is Windows-only (`modules/arch/win32/config.m4`) and does not exist on
+  Linux. `systemd`, `socache_dc` and `privileges` are refused with recorded reasons.
+
+### MPM policy: event by default, all three shared
+
+`--enable-mpms-shared="event worker prefork" --with-mpm=event`. Linux supports shared
+MPMs (`APACHE_MPM_MODULE` emits `mod_mpm_<name>.la` into `MPM_MODULES`), and the
+default MPM must be in the shared list.
+
+`-DFOREGROUND` is honoured independently of MPM linkage — it is
+`ap_exists_config_define("FOREGROUND")` inside `event.c`, `worker.c` and
+`prefork.c` — so a caller can keep the process in the foreground with any MPM.
+
+The shipped config enables `mpm_event_module` and leaves `worker`/`prefork` as
+commented `LoadModule` lines, as Lounge does.
+
+### Config contract: Lounge shape
+
+The shipped `conf/httpd.conf` is Lounge's file, not upstream's
+`docs/conf/httpd.conf.in`:
+
+- `Define SRVROOT "${APACHE_SERVER_ROOT}"` near the top, one uncommented occurrence.
+- `ServerRoot "${SRVROOT}"`.
+- `Listen 80`.
+- The commented `LoadModule` wall in Lounge's exact spelling —
+  `#LoadModule proxy_module modules/mod_proxy.so`, with the `modules/` prefix.
+- `DocumentRoot "${SRVROOT}/htdocs"` and the matching `<Directory
+  "${SRVROOT}/htdocs">` block with `AllowOverride All`.
+- `TypesConfig conf/mime.types`, `Include conf/extra/*.conf`, `logs/` for
+  `ErrorLog`/`CustomLog`/`PidFile`.
+- `<IfModule unixd_module> User daemon / Group daemon </IfModule>`.
+
+Two details are load-bearing rather than cosmetic:
+
+1. The quoted `DocumentRoot`/`<Directory>` paths start with `${SRVROOT}`, not `/`.
+2. `LoadModule` lines keep the `modules/` prefix so they resolve against `ServerRoot`.
+
+`User daemon` on a non-root run is inert:
+`ap_unixd_setup_child()` only calls `setgid`/`initgroups`/`setuid` when
+`geteuid() == 0`, and `User root` is rejected unless `BIG_SECURITY_HOLE` is compiled
+in. Nothing needs stripping.
+
+`conf/extra/`, `conf/original/`, `conf/magic`, `conf/charset.conv`, `conf/mime.types`
+and `htdocs/index.html` ship as Lounge ships them.
+
+### Vendored dependency set
+
+Every library is downloaded over HTTPS, digest-verified **before** extraction, built
+with the musl toolchain compiled from the pinned musl source into one staging prefix,
+and installed into `<root>/lib`. Exact versions live in `config/sources.json` with
+reviewed SHA-256. The host supplies the C compiler and the kernel UAPI headers musl
+does not ship; nothing else.
+
+| Dependency | Needed by | Notes |
+|---|---|---|
+| musl | loader + toolchain | same pin as `runtimes/php/config/musl.json`; compiled into the build's own `musl-gcc` |
+| APR 1.7.6 | core | |
+| APR-util 1.6.6 | core | `--with-expat --with-openssl --with-ldap --with-sqlite3 --with-odbc --enable-util-dso` |
+| httpd 2.4.70 | — | no rpath |
+| PCRE2 10.x | core | httpd wants `pcre2-config` reporting `10.*` |
+| OpenSSL 3.0 LTS | `ssl`, `md`, `http2`, `session_crypto`, ldap TLS | |
+| zlib 1.3.x | `deflate`, curl, libxml2 | |
+| brotli 1.1.x | `mod_brotli` | `libbrotlienc` + `libbrotlicommon` |
+| nghttp2 1.6x | `http2`, `proxy_http2` | ≥ 1.2.1; ≥ 1.50 adds RFC 9113 strictness |
+| jansson 2.14 | `mod_md` | header check is `<jansson_config.h>` |
+| curl 8.x | `mod_md` | built against staged OpenSSL/zlib/brotli/nghttp2 |
+| expat 2.6.x | APR-util XML → `mod_dav` | |
+| libxml2 2.13.x | `proxy_html`, `xml2enc` | |
+| Lua 5.4.x | `mod_lua` | |
+| OpenLDAP 2.6.x | `ldap`, `authnz_ldap`, `authz_dbd` | libraries only |
+| sqlite3 3.4x | `apr_dbd_sqlite3-1.so` | self-contained; CI can verify it |
+| unixODBC 2.3.x | `apr_dbd_odbc-1.so` | mirrors Lounge's single DBD driver |
+
+**DBD/DBM.** APR-util is built with `--enable-util-dso`, so drivers are `dlopen`ed
+from `LD_LIBRARY_PATH`. DBD ships `apr_dbd_sqlite3-1.so` and `apr_dbd_odbc-1.so`;
+`pgsql`, `mysql`, `oracle`, `freetds` are excluded — Lounge parity is `odbc` only.
+DBM is different and explicit: **only SDBM**, compiled into `libaprutil-1.so`
+(`dbm/apr_dbm_sdbm.c`, the default type in `build/dbm.m4`). No `apr_dbm_db`,
+`apr_dbm_gdbm` or `apr_dbm_ndbm`, and no Berkeley DB or GDBM vendored. `htdbm` and
+`mod_authn_dbm` verify against SDBM, which is the default `DBMType`.
+
+**No host libraries.** `pcre2-config`, `libcurl.pc`, `libjansson.pc` and
+`libnghttp2.pc` must resolve inside the staging prefix; `PATH` and `PKG_CONFIG_PATH`
+are set so a host copy cannot be picked. The verifier's `NEEDED` allow-list rejects
+any dependency that is not a bundle file.
+
+### Binding port 80 needs a capability on the loader
+
+A shell launcher cannot carry `cap_net_bind_service`: `execve` of a script re-execs
+the interpreter and takes capabilities from the interpreter's file. Putting the
+capability on `libexec/bin/httpd` does not work either — the kernel `execve`s the
+**loader**, which maps the program itself.
+
+The only file that is actually `execve`d is the loader, so that is where the
+capability must go, documented in `docs/runtimes/apache.md`:
+
+```bash
+sudo setcap cap_net_bind_service=+ep "$ROOT/lib/musl/ld-musl-x86_64.so.1"
+```
+
+Alternatives documented: run on ports ≥ 1024 (what the verifier does), or run as
+root and let children drop to `User daemon`. The bundle never assumes the capability
+is present.
+
+### Version policy
+
+One pinned exact httpd patch per release with reviewed upstream SHA-256 in
+`config/sources.json`, mirroring Redis. The planner compares only pinned versions and
+never discovers upstream releases. Bumping a version means adding the pin and its
+checksum first; every vendored dependency is re-verified in the same build.
+
+## Bundle layout
+
+```text
+apache-<version>-musl-dynamic-x86_64-<build-id>/
+  bin/httpd apachectl htpasswd htdigest htdbm ab logresolve httxt2dbm
+      checkgid rotatelogs htcacheclean fcgistarter openssl
+  libexec/launch.sh
+  libexec/bin/<real ELFs>            # httpd, suexec, openssl, ...
+  lib/musl/ld-musl-x86_64.so.1
+  lib/*.so*                         # openssl, curl, xml2, expat, pcre2, brotli,
+                                    #   nghttp2, jansson, lua, ldap, sqlite3, odbc,
+                                    #   apr, aprutil, apriconv
+  lib/apr-util-1/apr_dbd_sqlite3-1.so  lib/apr-util-1/apr_dbd_odbc-1.so
+                                    # DBM is SDBM, compiled into libaprutil-1.so
+  modules/mod_*.so                  # 126 DSOs + mod_mpm_{event,worker,prefork}.so
+  conf/httpd.conf conf/mime.types conf/magic conf/charset.conv
+  conf/extra/*.conf conf/original/*
+  htdocs/index.html cgi-bin/ error/ icons/ manual/
+  include/                          # httpd + APR headers for consumers
+  ssl/openssl.cnf                   # the OpenSSL CLI's default configuration
+  logs/                             # empty
+  share/licenses/                   # builder + httpd LICENSE/NOTICE + per dependency
+  share/sources/sources.json        # exact URL/sha256 of every source archive
+  manifest.json
+```
+
+`suexec` is staged in `libexec/bin/` with mode 0755 and **no launcher**: it only works
+as a root-owned setuid binary the kernel executes directly, which a shell launcher
+cannot carry and a user-owned tarball must not restore. `apachectl` is a wrapper
+(`packaging/apachectl`) rather than upstream's configure-generated script, which bakes
+the build host's paths and sources `bin/envvars`.
+
+`modules/` sits at the root, not `lib/modules`, because `ServerRoot` is the install
+root and Lounge's `LoadModule` lines say `modules/...`.
+
+## Constraints from this repository (non-negotiable)
+
+- Never install packages on the build host; a missing tool fails with an explicit
+  message.
+- Never overwrite an existing bundle or asset; delete or move explicitly.
+- Fresh `.cache/apache/build.*` dirs; downloads and extraction in separate new
+  directories; Python that reads them runs with `-I`; digests verified before
+  extraction.
+- No Docker. x86_64 Linux only. No absolute `RPATH`/`RUNPATH`.
+- `python3 -I -m unittest discover -s tests -v`, `bash -n` over every `build.sh`,
+  `sh -n` over packaging scripts stay green.
+
+## Builder-facing requirements
+
+### `runtimes/apache/`
+
+- `scripts/source.py` — validates one exact version against `config/sources.json`,
+  resolves the dependency graph, emits `--print-plan`, downloads, verifies and
+  extracts each archive into its own fresh directory.
+- `scripts/loader.py` — compiles the pinned musl into a private toolchain (its own
+  `musl-gcc` wrapper and specs, `--syslibdir=/lib`), proves it by compiling and
+  running a program with it — including a kernel UAPI header, because musl ships
+  none — and returns the loader to ship, the compiler path every later step uses,
+  and the kernel include roots it discovered.
+- `scripts/uapi.py` — reads the host compiler's include search list and returns
+  every directory supplying `linux/` or `asm/`, refusing a set that does not cover
+  both. Fedora keeps them together under `/usr/include`; Ubuntu splits `asm/` into
+  `/usr/include/x86_64-linux-gnu`, which is why a hardcoded root cannot work.
+- `scripts/deps.py` — builds the pinned set into a staging prefix in dependency
+  order: zlib → OpenSSL → PCRE2 → brotli → nghttp2 → jansson → expat → libxml2 →
+  Lua → OpenLDAP → sqlite3 → unixODBC → curl → APR → APR-util → httpd.
+- `scripts/build.sh` — Redis's shape: arg validation, `--print-plan`, host/tool
+  checks (`cc`, `make`, `perl`, `pkg-config`, `readelf`, `strip`, `curl`, `ar`,
+  `ranlib`), refuses to replace an existing bundle, then probe → download →
+  toolchain → deps → httpd → stage → verify → package. The host provides no musl:
+  `loader.py` builds the pinned release into a private toolchain, and `deps.py` and
+  `httpd.py` are handed its compiler path and the kernel include roots, both as
+  arguments rather than as constants.
+- `scripts/stage.py` — installs httpd into `libexec/bin`, generates launchers from
+  one template, moves DSOs to `modules/`, libraries to `lib/`, stages config, htdocs,
+  include, licenses, sources, writes `manifest.json`.
+- `scripts/verify.py` — below.
+- `scripts/package.py` — deterministic tar.gz + `.sha256` + manifest sidecar.
+- `config/sources.json` — the httpd pin. `config/dependencies.json` — the 16 vendored
+  pins. `config/build-options.json` — configure flags and excluded modules with
+  reasons. `config/modules.json` — expected DSO census, static set, MPMs. `config/httpd.conf` —
+  the shipped configuration template. `packaging/{launcher,launch.sh,apachectl}` — the
+  only files in `packaging/`, so the CI `sh -n` sweep over that directory stays valid.
+
+`./build.sh apache [exact-version] [--print-plan]`.
+
+Configure essentials (spelling is the builder's, intent is not):
+
+```text
+--with-apr/--with-apr-util=<staging> --with-pcre=<staging>
+--with-ssl=<staging> --enable-ssl
+--with-nghttp2=<staging> --enable-http2 --enable-proxy-http2
+--with-curl=<staging> --with-jansson=<staging> --enable-md
+--with-brotli=<staging> --enable-brotli --with-lua=<staging> --enable-lua
+--with-ldap --enable-ldap --enable-authnz-ldap
+--enable-dav --enable-dav-fs --enable-dav-lock
+--enable-mods-shared=reallyall --enable-mods-static=
+--enable-mpms-shared="event worker prefork" --with-mpm=event
+--enable-cgid --enable-suexec --enable-proxy-fdpass
+--disable-systemd --disable-socache-dc --disable-privileges
+```
+
+`mod_md` and `mod_http2` silently disable themselves when a dependency check fails,
+so the build asserts the module list **after** configure by reading the generated
+`modules.mk` and `httpd -M`, never by trusting the flags.
+
+### Verification (must be real)
+
+1. `httpd -V` reports 2.4.70 and the expected flags. `httpd -l` lists exactly the
+   static set — `core.c`, `http_core.c`, `mod_so.c` — and **no MPM**: `-l` prints
+   `ap_prelinked_modules`, and a shared MPM is not prelinked.
+2. Every expected DSO loads. `httpd -M` only reports what a given config loads, so the
+   verifier writes a throwaway config per conflict group (one MPM per run; `cgi` or
+   `cgid` but not both; `socache_shmcb` and `socache_dc` split), each loading every
+   remaining DSO, and requires `httpd -M` to succeed and name each module `shared`. A
+   module that silently fails to load fails the build. Expected inventory comes from
+   `config/modules.json`, generated from the build. On-disk `.so` names are not proof.
+3. ELF contract for every executable and DSO: no `GLIBC_*` symbols, every `NEEDED`
+   resolves inside the bundle, no `RPATH`/`RUNPATH` with an absolute path, loader
+   present and executable.
+4. Start on `127.0.0.1:<high port>` with `-DFOREGROUND`; assert over real HTTP:
+   static file, `autoindex`, `mod_rewrite` including `.htaccess` under
+   `AllowOverride All`, `mod_headers`, `mod_expires`, `mod_deflate` (gzip) and
+   `mod_brotli` (`Accept-Encoding: br`).
+5. `mod_ssl`: certificate generated with the bundle's own `openssl`; TLS 1.2 and 1.3
+   requests succeed; `mod_socache_shmcb` loads and is used by the session cache.
+6. `mod_http2`: `curl --http2` negotiates h2 over ALPN and returns the same body.
+7. `mod_proxy` + `mod_proxy_fcgi`: a throwaway FastCGI responder on a Unix socket
+   answers through `SetHandler "proxy:fcgi://..."`.
+8. `mod_dav`/`mod_dav_fs`: `PUT`/`GET`/`DELETE` round-trip in a scratch dir.
+   `mod_cgid`: a CGI script prints its environment.
+9. `mod_dbd` with `apr_dbd_sqlite3`: a `DBDParams` query returns a row;
+   `mod_authn_dbd` authenticates against an sqlite file. `odbc` is loaded with
+   `apr_dbd_get_driver("odbc")` and must fail on connection, not on load.
+10. `mod_lua`: a `LuaHookFixups` script sets a response header.
+11. `mod_ldap` loads and returns a clean connection error against no server.
+12. `htpasswd`/`htdigest`/`htdbm` create credentials the server accepts via
+    `mod_authn_file`/`mod_authn_dbm`.
+13. Stop cleanly; move the tree to a new path with spaces; repeat 4–12 there; then
+    repeat with `/lib/ld-musl-x86_64.so.1` masked (`bwrap --unshare-user --ro-bind
+    /dev/null /lib/ld-musl-x86_64.so.1`, skipped with a recorded reason when `bwrap`
+    is absent — the same posture as the PHP runtime's experiment script) to prove
+    host independence.
+14. Always stop the server on success and failure; never bind a privileged port.
+
+### Manifest
+
+`schema_version: 1`, `runtime: "apache"`, `apache: {version}`, `target:
+"musl-dynamic"`, `linkage: "dynamic"`, `architecture: "x86_64"`, `build-id`,
+`verification: "PASSED"`, `loader {path, digest}`, `mpm {default, shared}`,
+`modules {dso, static, excluded: [{name, reason}]}`, `dependencies [{name, version,
+sha256}]`, `dbd_drivers`, `dbm: "sdbm"`, `binaries` (hashes + `NEEDED`),
+`provenance` (URLs, checksums, configure flags, compiler), `licenses`.
+
+### Pipeline integration
+
+- `scripts/updates.py`: `apache_matrix`, `has_apache_updates`, folded into
+  `has_updates`/`publish`.
+- `.github/workflows/build.yml`: a `build-apache` job on Ubuntu 24.04 installing only
+  `build-essential binutils curl musl-tools perl cmake libpcre2-dev`; sources are
+  fetched and digest-verified by the build itself.
+- `publish.py`: accept `runtime == "apache"`; require `bin/httpd`, `bin/apachectl`,
+  `bin/openssl`, `libexec/bin/httpd`, `conf/httpd.conf`, `conf/original/httpd.conf`,
+  `ssl/openssl.cnf`, `modules/mod_{ssl,http2,md,brotli,lua,dav,proxy_fcgi,rewrite}.so`
+  and `lib/apr-util-1/apr_dbd_sqlite3-1.so`, plus the loader. Symlinks are accepted
+  when every hop is relative and lands on a regular file in the same archive (the
+  soname aliases `stage_libraries` keeps, including brotli's two-hop chain).
+- `docs/runtimes/apache.md`, `README.md`: contract, usage, the port-80 statement.
+- Tests: `tests/test_apache.py` plus updates to `test_updates.py`,
+  `test_publish.py`, `test_workflow.py`.
+
+## Sequencing
+
+1. `source.py` + `deps.py` for the full pinned set; build the dependency chain once
+   and stage it.
+2. httpd configure/build with the module policy; assert the census from build output
+   (where `mod_md`/`mod_http2`/`mod_lua` drop out silently if a pin is wrong).
+3. `stage.py` + launchers + the Lounge-shaped `conf/httpd.conf`.
+4. `verify.py`: ELF and module inventory, then HTTP behaviour, then relocation and
+   no-host-musl.
+5. Planner, workflow, publisher, docs, tests.
+6. A real CI run, then a published release.
+
+## Open items left to the builder
+
+None. Every decision above was settled during implementation; the resolved list below
+records what the build actually produced.
+
+## Resolved during the build (verified, not assumed)
+
+- How the rpath is removed: after `make install`, by rewriting the installed ELFs
+  (`httpd.py:strip_runpath`), not by editing the generated `modules.mk`.
+- `mod_unixd` is a DSO in this build; the static set is `core`, `http`, `so`.
+- Pins landed in `config/dependencies.json`: OpenSSL 3.0.22, PCRE2 10.49, brotli 1.2.1,
+  nghttp2 1.71.0, jansson 2.14, expat 2.10.0, libxml2 2.15.4, Lua 5.4.9, OpenLDAP
+  2.6.16, sqlite3 3.54.1, unixODBC 2.3.14, curl 8.23.0, APR 1.7.6, APR-util 1.6.6.
+- `include/` ships in the archive: it is HTTPD_ROOT/include, so consumers linking
+  against the bundle expect it there.
+- Extracted archives must keep their member mtimes. Regenerated autotools files look
+  stale otherwise and `make` invokes the packaged `missing` script, which fails.
+
+## Resolved already (verified, not assumed)
+
+- `Define SRVROOT "${APACHE_SERVER_ROOT}"` works with an exported variable; httpd has
+  no `${NAME:default}`.
+- `--enable-mpms-shared` + `--with-mpm=event` is valid on Linux; the default MPM must
+  appear in the shared list, and a shared MPM is absent from `httpd -l`.
+- `-DFOREGROUND` is independent of MPM linkage.
+- `LoadModule` of a static module is a hard startup error.
+- All 123 Lounge modules exist on Linux; `isapi` does not.
+- `mod_deflate` in 2.4.70 has no zstd support, so no zstd pin.
+- PCRE2 is required, detected via `pcre2-config` reporting `10.*`.
+- musl `dlopen` resolves a DSO's dependencies through `--library-path` and
+  `LD_LIBRARY_PATH`; APR-util's DSO lookup uses `APR_DSOPATH` = `LD_LIBRARY_PATH`.
+- `$ORIGIN`-relative `RUNPATH` survives relocation under musl (available, unused).
+- SDBM is the default `DBMType` and is compiled into `libaprutil-1.so`.

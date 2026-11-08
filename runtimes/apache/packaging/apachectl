@@ -1,0 +1,38 @@
+#!/bin/sh
+# Apache control script for a bundled httpd: resolves its own root, then hands
+# everything to bin/httpd. The paths upstream's script bakes at configure time
+# are exactly what relocation breaks, so this one derives them at run time.
+set -eu
+ROOT=$(CDPATH='' cd -P -- "$(dirname -- "$0")/.." && pwd)
+. "$ROOT/libexec/launch.sh"
+
+# Raise the soft descriptor limit the way upstream does; ignore hosts that refuse.
+ulimit -S -n "$(ulimit -H -n)" 2>/dev/null || true
+
+case "${1:-}" in
+    start|stop|restart|graceful|graceful-stop)
+        exec "$ROOT/bin/httpd" -k "$1"
+        ;;
+    configtest)
+        exec "$ROOT/bin/httpd" -t
+        ;;
+    startssl|sslstart|start-SSL)
+        printf '%s\n' 'The startssl option is no longer supported.' \
+            'Enable SSL by including conf/extra/httpd-ssl.conf in httpd.conf, then use "apachectl start".' >&2
+        exit 2
+        ;;
+    status|fullstatus)
+        printf '%s\n' 'apachectl status needs mod_status and a text browser; enable conf/extra/httpd-info.conf first.' >&2
+        exit 2
+        ;;
+    ""|-h|--help|help)
+        cat <<EOF
+Usage: apachectl <start|stop|restart|graceful|graceful-stop|configtest>
+       apachectl <httpd options>
+ServerRoot: $ROOT
+EOF
+        ;;
+    *)
+        exec "$ROOT/bin/httpd" "$@"
+        ;;
+esac
