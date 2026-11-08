@@ -114,19 +114,21 @@ class ExtractionContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             destination = Path(temporary) / "pcre2.tar.gz"
             attempts = []
+            good = b"\x1f\x8b\x08\x00real"
 
             def fake_run(command, **kwargs):
                 attempts.append(command)
                 if len(attempts) == 1:
                     return subprocess.CompletedProcess(command, 22, "",
                                                       "curl: (22) 504")
-                Path(command[command.index("--output") + 1]).write_bytes(b"archive")
+                Path(command[command.index("--output") + 1]).write_bytes(good)
                 return subprocess.CompletedProcess(command, 0, "", "")
 
             with mock.patch.object(self.fetch.subprocess, "run", side_effect=fake_run), \
                     mock.patch.object(self.fetch.time, "sleep"):
-                self.fetch.download("https://example.invalid/pcre2.tar.gz", destination)
-            self.assertEqual(destination.read_bytes(), b"archive")
+                self.fetch.download("https://example.invalid/pcre2.tar.gz", destination,
+                                    hashlib.sha256(good).hexdigest())
+            self.assertEqual(destination.read_bytes(), good)
             self.assertEqual(len(attempts), 2)
             for command in attempts:
                 self.assertIn("=https", command)
@@ -145,15 +147,100 @@ class ExtractionContracts(unittest.TestCase):
                 with self.assertRaisesRegex(
                         ValueError, "Cannot download.*after %d attempts"
                         % self.fetch.FETCH_ATTEMPTS):
-                    self.fetch.download("https://example.invalid/pcre2.tar.gz", destination)
+                    self.fetch.download("https://example.invalid/pcre2.tar.gz", destination,
+                                        "0" * 64)
             self.assertGreater(len(attempts), 1)
             self.assertFalse(destination.exists())
 
+    def test_an_error_page_served_as_200_is_retried(self):
+        # Measured on the CI runner (2026-11-08): zlib.net answered a pinned
+        # tarball with 12193 bytes of `text/html` and a normal 200, while the
+        # same URL served the pinned digest to a probe run minutes earlier on
+        # the same image. That is a flaky connection wearing a success status,
+        # so it must be retried — treating it as "the archive changed" is what
+        # made a whole Apache build die on the first response.
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "zlib.tar.gz"
+            attempts = []
+            good = b"\x1f\x8b\x08\x00" + b"real tarball"
+
+            def fake_run(command, **kwargs):
+                attempts.append(command)
+                target = Path(command[command.index("--output") + 1])
+                if len(attempts) == 1:
+                    target.write_bytes(b"<html>Service Unavailable</html>")
+                else:
+                    target.write_bytes(good)
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            expected = hashlib.sha256(good).hexdigest()
+            with mock.patch.object(self.fetch.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(self.fetch.time, "sleep"):
+                self.fetch.download("https://zlib.net/zlib.tar.gz", destination,
+                                    sha256=expected)
+            self.assertEqual(destination.read_bytes(), good)
+            self.assertEqual(len(attempts), 2)
+
+    def test_a_real_archive_that_changed_is_not_retried(self):
+        # The opposite case, and the reason the retry is gated on the body not
+        # being an archive at all: a gzip that decompresses is upstream's
+        # answer, and retrying it six times with backoff just delays the
+        # "re-pin this" message the operator needs.
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "zlib.tar.gz"
+            downloads = []
+            changed = b"\x1f\x8b\x08\x00" + b"a different build of the same version"
+
+            def fake_run(command, **kwargs):
+                # Only count the body fetches. The message paths issue a HEAD for
+                # the content type, which is not a retry and must not be judged
+                # as one.
+                if "--head" not in command:
+                    downloads.append(command)
+                Path(command[command.index("--output") + 1]).write_bytes(changed)
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with mock.patch.object(self.fetch.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(self.fetch.time, "sleep"):
+                with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+                    self.fetch.download("https://zlib.net/zlib.tar.gz", destination,
+                                        sha256="0" * 64)
+            self.assertEqual(len(downloads), 1)
+
     def test_a_digest_mismatch_says_what_arrived_instead(self):
         # A bare "expected X, got Y" is not diagnosable: it cannot distinguish a
-        # changed upstream archive from a proxy that answered 200 with an HTML
-        # error page, and that difference decides whether the pin or the route
-        # is at fault. The message must carry the size and the content type.
+        # changed upstream archive from a non-archive that answered, and that
+        # difference decides whether the pin or the route is at fault. The
+        # message must carry the size and the content type.
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            (work / "downloads").mkdir()
+            payload = b"\x1f\x8b\x08\x00" + b"a different build of the same version"
+
+            def fake_run(command, **kwargs):
+                Path(command[command.index("--output") + 1]).write_bytes(payload)
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            entry = {"name": "pcre2", "url": "https://example.invalid/pcre2-10.49.tar.gz",
+                     "sha256": "0" * 64}
+            with mock.patch.object(self.fetch.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(self.fetch.time, "sleep"), \
+                    mock.patch.object(self.fetch, "content_type",
+                                      return_value="application/x-gzip"):
+                with self.assertRaises(ValueError) as caught:
+                    self.fetch.fetch_one(entry, work)
+            message = str(caught.exception)
+            self.assertIn(hashlib.sha256(payload).hexdigest(), message)
+            self.assertIn(f"{len(payload)} bytes", message)
+            self.assertIn("application/x-gzip", message)
+            # Nothing was extracted from an archive that failed its pin.
+            self.assertFalse((work / "sources" / "pcre2").exists())
+
+    def test_an_error_page_from_the_fetcher_names_it_as_such(self):
+        # The 12193-byte `text/html` body the CI runner actually received. It is
+        # retried as an interception, so the failure that surfaces after the
+        # retries must say the body was never an archive rather than claim a
+        # digest mismatch the operator would try to re-pin against.
         with tempfile.TemporaryDirectory() as temporary:
             work = Path(temporary)
             (work / "downloads").mkdir()
@@ -166,15 +253,13 @@ class ExtractionContracts(unittest.TestCase):
             entry = {"name": "pcre2", "url": "https://example.invalid/pcre2-10.49.tar.gz",
                      "sha256": "0" * 64}
             with mock.patch.object(self.fetch.subprocess, "run", side_effect=fake_run), \
-                    mock.patch.object(self.fetch, "content_type",
-                                      return_value="text/html"):
+                    mock.patch.object(self.fetch.time, "sleep"):
                 with self.assertRaises(ValueError) as caught:
                     self.fetch.fetch_one(entry, work)
             message = str(caught.exception)
-            self.assertIn(hashlib.sha256(payload).hexdigest(), message)
+            self.assertIn("not an archive", message)
             self.assertIn(f"{len(payload)} bytes", message)
-            self.assertIn("text/html", message)
-            # Nothing was extracted from an archive that failed its pin.
+            self.assertNotIn("SHA-256 mismatch", message)
             self.assertFalse((work / "sources" / "pcre2").exists())
 
     def test_a_github_failure_falls_back_to_the_mirror(self):
@@ -191,13 +276,14 @@ class ExtractionContracts(unittest.TestCase):
                 attempts.append(command)
                 if len(attempts) <= self.fetch.FETCH_ATTEMPTS:
                     return subprocess.CompletedProcess(command, 22, "", "curl: (22) 504")
-                Path(command[command.index("--output") + 1]).write_bytes(b"archive")
+                Path(command[command.index("--output") + 1]).write_bytes(pinned)
                 return subprocess.CompletedProcess(command, 0, "", "")
 
+            pinned = b"\x1f\x8b\x08\x00archive"
             with mock.patch.object(self.fetch.subprocess, "run", side_effect=fake_run), \
                     mock.patch.object(self.fetch.time, "sleep"):
-                self.fetch.download(url, destination)
-            self.assertEqual(destination.read_bytes(), b"archive")
+                self.fetch.download(url, destination, hashlib.sha256(pinned).hexdigest())
+            self.assertEqual(destination.read_bytes(), pinned)
             direct = [c[-1] for c in attempts[:-1]]
             self.assertEqual(len(direct), self.fetch.FETCH_ATTEMPTS)
             for attempted in direct:
@@ -218,7 +304,8 @@ class ExtractionContracts(unittest.TestCase):
             with mock.patch.object(self.fetch.subprocess, "run", side_effect=fake_run), \
                     mock.patch.object(self.fetch.time, "sleep"):
                 with self.assertRaisesRegex(ValueError, "Cannot download"):
-                    self.fetch.download("https://zlib.net/zlib-1.4.tar.gz", destination)
+                    self.fetch.download("https://zlib.net/zlib-1.4.tar.gz", destination,
+                                        "0" * 64)
             self.assertEqual(len(attempts), self.fetch.FETCH_ATTEMPTS)
             for command in attempts:
                 self.assertNotIn("gh-proxy.org", command[-1])
@@ -238,13 +325,16 @@ class ExtractionContracts(unittest.TestCase):
                 attempts.append(command)
                 if len(attempts) <= self.fetch.FETCH_ATTEMPTS:
                     return subprocess.CompletedProcess(command, 22, "", "curl: (22) 504")
-                Path(command[command.index("--output") + 1]).write_bytes(b"<html>nope</html>")
+                # A real archive, but not the pinned one: the mirror answered.
+                Path(command[command.index("--output") + 1]).write_bytes(
+                    b"\x1f\x8b\x08\x00rewritten by the proxy")
                 return subprocess.CompletedProcess(command, 0, "", "")
 
             entry = {"name": "pcre2", "url": url, "sha256": "0" * 64}
             with mock.patch.object(self.fetch.subprocess, "run", side_effect=fake_run), \
                     mock.patch.object(self.fetch.time, "sleep"), \
-                    mock.patch.object(self.fetch, "content_type", return_value="text/html"):
+                    mock.patch.object(self.fetch, "content_type",
+                                      return_value="application/x-gzip"):
                 with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
                     self.fetch.fetch_one(entry, work)
             self.assertEqual(attempts[-1][-1], self.fetch.MIRROR + url)

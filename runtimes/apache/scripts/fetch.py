@@ -49,15 +49,39 @@ def mirror_for(url):
     return None
 
 
-def download(url, destination):
+# A gzip stream starts with 1f 8b, a bzip2 stream with "BZh", and an xz stream
+# with fd 37 7a 58 5a 00. A pinned source is always one of those; an HTML or
+# plain-text error page never is. This is the only reliable way to tell "the
+# transfer was intercepted" from "upstream replaced the archive": both arrive
+# as HTTP 200 with a body that does not match the pin.
+ARCHIVE_MAGIC = (b"\x1f\x8b", b"BZh", b"\xfd7zXZ\x00")
+
+
+def looks_like_archive(path):
+    """Whether the bytes on disk begin like one of the archive formats."""
+    with Path(path).open("rb") as stream:
+        head = stream.read(6)
+    return any(head.startswith(magic) for magic in ARCHIVE_MAGIC)
+
+
+def download(url, destination, sha256):
     """Download one pinned source, retrying a transient gateway failure.
 
     GitHub's release CDN answers 504 for a single asset while the rest of the
     same release serves normally, and the failing assets recover at different
     moments; a build needs every one of them at once. Curl's own ``--retry``
     covers transfer errors but a 504 arrives as an ordinary HTTP status, so the
-    attempts are made here. A digest that does not match its pin is never
-    retried: that is a changed archive, not a flaky connection.
+    attempts are made here.
+
+    A body that is not an archive at all is retried too. Measured on a CI
+    runner: zlib.net answered a pinned tarball with 12193 bytes of ``text/html``
+    and a normal ``200``, while the same URL served the pinned digest minutes
+    earlier on the same image. That is the interception failure, not a changed
+    archive, and giving up on it wastes a build that was otherwise fine.
+
+    An archive that *did* arrive but hashes differently is never retried: that
+    is upstream's answer, and six backoff attempts would only delay the
+    ``re-pin this`` message the operator needs.
     """
     if destination.exists():
         raise ValueError("Refusing to reuse an existing download: " + destination.name)
@@ -73,8 +97,25 @@ def download(url, destination):
             ],
             text=True, capture_output=True,
         )
-        if last.returncode == 0:
+        if last.returncode != 0:
+            continue
+        if not looks_like_archive(destination):
+            # Keep the last attempt's bytes for the message, but do not accept
+            # them: an error page is not a download that "mostly worked".
+            last = subprocess.CompletedProcess(
+                last.args, 0, last.stdout,
+                "body is not an archive (%d bytes)" % destination.stat().st_size)
+            continue
+        if digest(destination) == sha256:
             return
+        # A real archive with the wrong digest: upstream changed it. Fail now.
+        actual = digest(destination)
+        size = destination.stat().st_size
+        destination.unlink(missing_ok=True)
+        raise ValueError(
+            "SHA-256 mismatch for %s: expected %s, got %s (%d bytes, "
+            "content-type %s)"
+            % (url, sha256, actual, size, content_type(url) or "unknown"))
     # Only now, with every direct attempt spent, is a mirror worth trying.
     # Doing it earlier would send traffic through a third party on days when
     # GitHub is perfectly healthy.
@@ -101,6 +142,15 @@ def download(url, destination):
             % (url, FETCH_ATTEMPTS, MIRROR, (last.stderr or "").strip()[-400:],
                direct_error)
         )
+    actual = digest(destination)
+    if actual != sha256:
+        size = destination.stat().st_size
+        kind = content_type(url)
+        destination.unlink(missing_ok=True)
+        raise ValueError(
+            "SHA-256 mismatch for %s: expected %s, got %s (%d bytes, "
+            "content-type %s)"
+            % (url, sha256, actual, size, kind or "unknown"))
 
 
 def members(tar):
@@ -191,24 +241,10 @@ def content_type(url):
 def fetch_one(entry, work):
     name = entry["name"]
     archive = work / "downloads" / (name + ".tar.gz")
-    download(entry["url"], archive)
-    actual = digest(archive)
-    if actual != entry["sha256"]:
-        # Report what arrived, not just that it differed. Size and content type
-        # are what separate "upstream replaced the archive" (fix the pin) from
-        # "something in the path answered 200 with an error page" (fix the
-        # route); without them a CI failure is not readable.
-        size = archive.stat().st_size
-        kind = content_type(entry["url"])
-        # Leave nothing behind. `download` refuses to reuse an existing file, so
-        # a kept archive would make the next run fail on the leftover instead of
-        # re-fetching, and a bad archive is not worth the disk either.
-        archive.unlink()
-        raise ValueError(
-            "SHA-256 mismatch for %s: expected %s, got %s (%d bytes, "
-            "content-type %s)"
-            % (name, entry["sha256"], actual, size, kind or "unknown")
-        )
+    # download() owns the pin: it retries an intercepted transfer and raises a
+    # fully attributed message for a genuine mismatch, so re-checking here would
+    # only re-fetch the content type it has already reported.
+    download(entry["url"], archive, entry["sha256"])
     return extract(archive, work / "sources" / name)
 
 

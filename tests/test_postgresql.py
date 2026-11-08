@@ -827,7 +827,7 @@ class PostgreSQLToolchainTests(unittest.TestCase):
         # compiling, so the download is attempted more than once.
         with tempfile.TemporaryDirectory() as temp:
             downloads = Path(temp)
-            payload = b"archive bytes"
+            payload = b"\x1f\x8b\x08\x00archive bytes"
             pin = {"url": "https://example.invalid/zlib-1.4.tar.gz",
                    "sha256": hashlib.sha256(payload).hexdigest()}
             attempts = []
@@ -876,7 +876,7 @@ class PostgreSQLToolchainTests(unittest.TestCase):
     def test_fetch_reverifies_a_cached_archive_against_its_pin(self):
         with tempfile.TemporaryDirectory() as temp:
             downloads = Path(temp)
-            payload = b"archive bytes"
+            payload = b"\x1f\x8b\x08\x00archive bytes"
             existing = downloads / "zlib-1.4.tar.gz"
             existing.write_bytes(payload)
             digest = hashlib.sha256(payload).hexdigest()
@@ -894,10 +894,38 @@ class PostgreSQLToolchainTests(unittest.TestCase):
 
     def test_a_digest_mismatch_says_what_arrived_instead(self):
         # A bare "SHA-256 mismatch for <url>" is not diagnosable: it cannot
-        # distinguish a changed upstream archive from a proxy that answered
-        # HTTP 200 with an HTML error page, and that difference decides whether
-        # the pin or the network is at fault. The message must carry the digest
-        # that actually arrived, the size, and the content type.
+        # distinguish a changed upstream archive from a body that was never an
+        # archive, and that difference decides whether the pin or the route is
+        # at fault. The message must carry the digest, the size, and the type.
+        with tempfile.TemporaryDirectory() as temp:
+            downloads = Path(temp)
+            payload = b"\x1f\x8b\x08\x00" + b"a different build of the same version"
+
+            def fake_run(command, **kwargs):
+                Path(command[command.index("--output") + 1]).write_bytes(payload)
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            pin = {"url": "https://example.invalid/zlib-1.4.tar.gz", "sha256": "0" * 64}
+            with mock.patch.object(self.toolchain.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(self.toolchain.time, "sleep"), \
+                    mock.patch.object(self.toolchain, "_content_type",
+                                      return_value="application/x-gzip"):
+                with self.assertRaises(ValueError) as caught:
+                    self.toolchain._fetch(pin, downloads)
+            message = str(caught.exception)
+            self.assertIn("SHA-256", message)
+            self.assertIn(hashlib.sha256(payload).hexdigest(), message)
+            self.assertIn(f"{len(payload)} bytes", message)
+            self.assertIn("application/x-gzip", message)
+            # The mismatching download is not kept: it is not the pinned archive.
+            self.assertFalse((downloads / "zlib-1.4.tar.gz").exists())
+            self.assertEqual(list(downloads.glob("*.part")), [])
+
+    def test_an_error_page_that_persists_names_itself_as_not_an_archive(self):
+        # The body the CI runner actually received from zlib.net. It is retried
+        # as an interception, so what surfaces after the retries must say the
+        # body was never an archive — not claim a digest mismatch an operator
+        # would try to re-pin against.
         with tempfile.TemporaryDirectory() as temp:
             downloads = Path(temp)
             payload = b"<html>Service Unavailable</html>"
@@ -906,20 +934,66 @@ class PostgreSQLToolchainTests(unittest.TestCase):
                 Path(command[command.index("--output") + 1]).write_bytes(payload)
                 return subprocess.CompletedProcess(command, 0, "", "")
 
-            pin = {"url": "https://example.invalid/zlib-1.4.tar.gz", "sha256": "0" * 64}
+            pin = {"url": "https://zlib.net/zlib-1.4.tar.gz", "sha256": "0" * 64}
             with mock.patch.object(self.toolchain.subprocess, "run", side_effect=fake_run), \
-                    mock.patch.object(self.toolchain, "_content_type",
-                                      return_value="text/html"):
+                    mock.patch.object(self.toolchain.time, "sleep"):
                 with self.assertRaises(ValueError) as caught:
                     self.toolchain._fetch(pin, downloads)
             message = str(caught.exception)
-            self.assertIn("SHA-256", message)
-            self.assertIn(hashlib.sha256(payload).hexdigest(), message)
+            self.assertIn("not an archive", message)
             self.assertIn(f"{len(payload)} bytes", message)
-            self.assertIn("text/html", message)
-            # The mismatching download is not kept: it is not the pinned archive.
-            self.assertFalse((downloads / "zlib-1.4.tar.gz").exists())
+            self.assertNotIn("SHA-256 mismatch", message)
             self.assertEqual(list(downloads.glob("*.part")), [])
+
+    def test_an_error_page_served_as_200_is_retried(self):
+        # Measured on a CI runner (2026-11-08): zlib.net answered a pinned
+        # tarball with 12193 bytes of `text/html` under a normal 200, while the
+        # same URL served the pinned digest to a probe minutes earlier on the
+        # same image. That is an intercepted transfer wearing a success status,
+        # so it must be retried rather than re-pinned.
+        with tempfile.TemporaryDirectory() as temp:
+            downloads = Path(temp)
+            good = b"\x1f\x8b\x08\x00" + b"real tarball"
+            pin = {"url": "https://zlib.net/zlib-1.4.tar.gz",
+                   "sha256": hashlib.sha256(good).hexdigest()}
+            attempts = []
+
+            def fake_run(command, **kwargs):
+                attempts.append(command)
+                target = Path(command[command.index("--output") + 1])
+                target.write_bytes(b"<html>Service Unavailable</html>"
+                                   if len(attempts) == 1 else good)
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with mock.patch.object(self.toolchain.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(self.toolchain.time, "sleep"):
+                archive = self.toolchain._fetch(pin, downloads)
+            self.assertEqual(archive.read_bytes(), good)
+            self.assertEqual(len(attempts), 2)
+
+    def test_a_real_archive_that_changed_is_not_retried(self):
+        # A gzip that arrived intact but hashes differently is upstream's
+        # answer. Retrying it with backoff would only delay the "re-pin this"
+        # message, which is the one thing the operator can act on.
+        with tempfile.TemporaryDirectory() as temp:
+            downloads = Path(temp)
+            changed = b"\x1f\x8b\x08\x00" + b"a different build of the same version"
+            pin = {"url": "https://zlib.net/zlib-1.4.tar.gz", "sha256": "0" * 64}
+            downloads_made = []
+
+            def fake_run(command, **kwargs):
+                if "--head" not in command:
+                    downloads_made.append(command)
+                Path(command[command.index("--output") + 1]).write_bytes(changed)
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with mock.patch.object(self.toolchain.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(self.toolchain.time, "sleep"), \
+                    mock.patch.object(self.toolchain, "_content_type",
+                                      return_value="application/x-gzip"):
+                with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+                    self.toolchain._fetch(pin, downloads)
+            self.assertEqual(len(downloads_made), 1)
 
     def test_a_github_failure_falls_back_to_the_mirror(self):
         # GitHub's release CDN can answer 504 for hours while every other host
@@ -930,7 +1004,7 @@ class PostgreSQLToolchainTests(unittest.TestCase):
         # known.
         with tempfile.TemporaryDirectory() as temp:
             downloads = Path(temp)
-            payload = b"archive bytes"
+            payload = b"\x1f\x8b\x08\x00archive bytes"
             pin = {"url": "https://github.com/example/zlib/releases/download/v1/zlib-1.4.tar.gz",
                    "sha256": hashlib.sha256(payload).hexdigest()}
             attempts = []
@@ -979,7 +1053,8 @@ class PostgreSQLToolchainTests(unittest.TestCase):
 
             def fake_run(command, **kwargs):
                 if "gh-proxy.org" in command[-1]:
-                    Path(command[command.index("--output") + 1]).write_bytes(b"tampered")
+                    Path(command[command.index("--output") + 1]).write_bytes(
+                        b"\x1f\x8b\x08\x00tampered")
                     return subprocess.CompletedProcess(command, 0, "", "")
                 return subprocess.CompletedProcess(command, 22, "", "504")
 

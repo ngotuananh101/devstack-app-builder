@@ -160,6 +160,38 @@ def _content_type(url):
     return result.stdout.strip() or None
 
 
+# A gzip stream starts with 1f 8b, a bzip2 stream with "BZh", and an xz stream
+# with the XZ magic. A pinned source is always one of those; an HTML or
+# plain-text error page never is. This is the only reliable way to tell "the
+# transfer was intercepted" from "upstream replaced the archive", because both
+# arrive as HTTP 200 with a body that does not match the pin.
+ARCHIVE_MAGIC = (b"\x1f\x8b", b"BZh", b"\xfd7zXZ\x00")
+
+
+def looks_like_archive(path):
+    """Whether the bytes on disk begin like one of the archive formats."""
+    with Path(path).open("rb") as stream:
+        head = stream.read(6)
+    return any(head.startswith(magic) for magic in ARCHIVE_MAGIC)
+
+
+def _reject_mismatch(pin, temporary):
+    """Refuse a real archive whose digest is not the pin, and say what arrived.
+
+    The size and content type are what separate "upstream replaced the archive"
+    (fix the pin) from "something in the path answered 200 with an error page"
+    (fix the route); a message without them leaves a CI failure nobody can read.
+    """
+    actual = digest(temporary)
+    size = temporary.stat().st_size
+    kind = _content_type(pin["url"]) or "unknown"
+    temporary.unlink(missing_ok=True)
+    raise ValueError(
+        f"SHA-256 mismatch for {pin['url']}: "
+        f"expected {pin['sha256']}, got {actual} "
+        f"({size} bytes, content-type {kind})")
+
+
 def _fetch(pin, downloads):
     """Download one pinned archive, retrying a transient gateway failure.
 
@@ -178,6 +210,7 @@ def _fetch(pin, downloads):
         return archive
     temporary = archive.with_name(archive.name + ".part")
     result = None
+    rejected_mismatch = False
     for attempt in range(FETCH_ATTEMPTS):
         if attempt:
             time.sleep(FETCH_RETRY_DELAYS[attempt - 1])
@@ -187,8 +220,28 @@ def _fetch(pin, downloads):
              "--max-time", "600", "--output", str(temporary), pin["url"]],
             text=True, capture_output=True,
         )
-        if result.returncode == 0:
-            break
+        if result.returncode != 0:
+            continue
+        rejected_mismatch = False
+        if not looks_like_archive(temporary):
+            # An intercepted transfer. Measured on a CI runner (2026-11-08):
+            # zlib.net answered a pinned tarball with 12193 bytes of `text/html`
+            # under a normal 200, while the same URL served the pinned digest to
+            # a probe minutes earlier. Retrying this is right; re-pinning would
+            # be treating somebody's error page as upstream's release.
+            result = subprocess.CompletedProcess(
+                result.args, 0, result.stdout,
+                "body is not an archive (%d bytes)" % temporary.stat().st_size)
+            continue
+        if digest(temporary) == pin["sha256"]:
+            temporary.rename(archive)
+            return archive
+        # A real archive with a different digest: upstream replaced it. Fail now
+        # rather than spend the backoff delaying a message the operator needs.
+        rejected_mismatch = True
+        break
+    if rejected_mismatch:
+        _reject_mismatch(pin, temporary)
     if result.returncode != 0:
         # Only now, with every direct attempt spent, is a mirror worth trying.
         # Doing it earlier would send traffic through a third party on days when
@@ -212,19 +265,23 @@ def _fetch(pin, downloads):
                 f"Cannot download {pin['url']} after {FETCH_ATTEMPTS} attempts, "
                 f"nor from {MIRROR}: {result.stderr.strip()[-400:]} "
                 f"(direct: {direct_error})")
-    if digest(temporary) != pin["sha256"]:
-        # Report what arrived, not just that it differed. The size and content
-        # type are what separate "upstream replaced the archive" (fix the pin)
-        # from "something in the path answered 200 with an error page" (fix the
-        # route); a message without them leaves a CI failure nobody can read.
-        actual = digest(temporary)
-        size = temporary.stat().st_size
-        kind = _content_type(pin["url"]) or "unknown"
-        temporary.unlink()
+        if not looks_like_archive(temporary):
+            size = temporary.stat().st_size if temporary.exists() else 0
+            temporary.unlink(missing_ok=True)
+            raise ValueError(
+                f"Cannot download {pin['url']} after {FETCH_ATTEMPTS} attempts, "
+                f"nor from {MIRROR}: body is not an archive ({size} bytes)")
+    # `result` carries a synthetic success for a non-archive body, so this is
+    # the only place that can tell the two residual cases apart.
+    if not looks_like_archive(temporary):
+        size = temporary.stat().st_size if temporary.exists() else 0
+        temporary.unlink(missing_ok=True)
         raise ValueError(
-            f"SHA-256 mismatch for {pin['url']}: "
-            f"expected {pin['sha256']}, got {actual} "
-            f"({size} bytes, content-type {kind})")
+            f"Cannot download {pin['url']} after {FETCH_ATTEMPTS} attempts: "
+            f"body is not an archive ({size} bytes); "
+            f"{result.stderr.strip()[-400:]}")
+    if digest(temporary) != pin["sha256"]:
+        _reject_mismatch(pin, temporary)
     temporary.rename(archive)
     return archive
 
