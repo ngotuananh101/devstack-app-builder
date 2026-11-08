@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan all supported PHP bundles and pinned static-musl Redis bundles."""
+"""Plan all supported PHP bundles, pinned static-musl Redis bundles, and pinned dynamic-musl PostgreSQL bundles."""
 import argparse
 import importlib.util
 import json
@@ -10,6 +10,7 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 REDIS_TARGET = "musl"
+POSTGRES_TARGET = "musl-dynamic"
 
 
 def load(path, name):
@@ -21,6 +22,7 @@ def load(path, name):
 
 php = load(ROOT / "runtimes/php/scripts/updates.py", "php_updates")
 redis = load(ROOT / "runtimes/redis/scripts/source.py", "redis_source")
+postgresql = load(ROOT / "runtimes/postgresql/scripts/source.py", "postgresql_source")
 
 
 def published_redis(repository):
@@ -85,6 +87,69 @@ def published_redis(repository):
     return result
 
 
+def published_postgresql(repository):
+    php.validate_repository(repository)
+    result = {}
+    for release in php.pages(f"repos/{repository}/releases"):
+        if type(release.get("draft")) is not bool or type(release.get("prerelease")) is not bool:
+            raise ValueError("Invalid GitHub release state")
+        if release["draft"] or release["prerelease"]:
+            continue
+        tag = release.get("tag_name")
+        if not isinstance(tag, str):
+            raise ValueError("Invalid GitHub release tag")
+        if not tag.startswith("runtimes-"):
+            continue
+        release_id = php.positive_id(release.get("id"))
+        entries = {}
+        for asset in php.pages(f"repos/{repository}/releases/{release_id}/assets"):
+            name = asset.get("name")
+            if not isinstance(name, str) or name in entries:
+                raise ValueError("Invalid/duplicate GitHub asset name")
+            entries[name] = asset
+        roots = set()
+        for name in entries:
+            if name.startswith("postgresql-"):
+                for suffix in (".tar.gz.sha256", ".tar.gz", ".manifest.json"):
+                    if name.endswith(suffix):
+                        roots.add(name[:-len(suffix)])
+                        break
+        for root in sorted(roots):
+            match = re.fullmatch(r"postgresql-([0-9]+\.[0-9]+(?:\.[0-9]+)?)-musl-dynamic-x86_64-([A-Za-z0-9_.-]+)", root)
+            if not match:
+                raise ValueError("Invalid public PostgreSQL asset identity")
+            version, build_id = match.groups()
+            architecture = "x86_64"
+            names = [root + suffix for suffix in (".tar.gz", ".tar.gz.sha256", ".manifest.json")]
+            if any(name not in entries for name in names):
+                raise ValueError("Incomplete public PostgreSQL asset group")
+            for name in names:
+                asset = entries[name]
+                php.positive_id(asset.get("id"))
+                if asset.get("state") != "uploaded" or type(asset.get("size")) is not int or asset["size"] <= 0:
+                    raise ValueError("Invalid public PostgreSQL asset state")
+            metadata = entries[root + ".manifest.json"]
+            if metadata["size"] > php.MAX_MANIFEST_BYTES:
+                raise ValueError("Oversized PostgreSQL manifest")
+            manifest = php.gh_json(f"repos/{repository}/releases/assets/{metadata['id']}", asset=True)
+            if (not isinstance(manifest, dict) or type(manifest.get("schema_version")) is not int
+                    or manifest["schema_version"] != 1 or manifest.get("runtime") != "postgresql"
+                    or manifest.get("verification") != "PASSED"
+                    or manifest.get("linkage") != "dynamic"):
+                raise ValueError("Invalid/unverified public PostgreSQL manifest")
+            try:
+                parts = [manifest["postgresql"]["version"], manifest["target"], manifest["architecture"], manifest["build_id"]]
+                if parts != [version, POSTGRES_TARGET, architecture, build_id] or "profile" in manifest:
+                    raise ValueError("PostgreSQL manifest/asset identity mismatch")
+                major = manifest["postgresql"].get("major")
+                if major != version.split(".")[0]:
+                    raise ValueError("PostgreSQL manifest major disagrees with version")
+            except (KeyError, TypeError) as error:
+                raise ValueError("Missing PostgreSQL manifest identity") from error
+            result[(version, POSTGRES_TARGET, architecture)] = version
+    return result
+
+
 def make_plan(*, event, repository, commit, run_id, run_attempt, publish=False, release_tag="", bypass=False):
     policy = php.make_plan(event=event, repository=repository, commit=commit, run_id=run_id,
                            run_attempt=run_attempt, publish=publish, release_tag=release_tag, bypass=bypass)
@@ -99,17 +164,31 @@ def make_plan(*, event, repository, commit, run_id, run_attempt, publish=False, 
             if bypass or previous is None:
                 rows.append({"redis_version": version, "target": target, "architecture": "x86_64", "previous_version": previous})
     policy["redis_matrix"] = {"include": rows}
-    policy["has_updates"] = bool(policy["matrix"]["include"] or rows)
+
+    postgres_history = published_postgresql(repository)
+    postgres_config = json.loads(postgresql.CONFIG.read_text())
+    postgres_rows = []
+    for version in postgres_config["versions"]:
+        postgresql.load_source(version)  # Never plan unpinned/unvalidated sources.
+        for target in (POSTGRES_TARGET,):
+            previous = postgres_history.get((version, target, "x86_64"))
+            if bypass or previous is None:
+                postgres_rows.append({"postgresql_version": version, "target": target, "architecture": "x86_64", "previous_version": previous})
+    policy["postgres_matrix"] = {"include": postgres_rows}
+
+    policy["has_updates"] = bool(policy["matrix"]["include"] or rows or postgres_rows)
     policy["publish"] = policy["has_updates"] and (scheduled or publish)
     return policy
 
 
 def write_outputs(path, policy):
     with path.open("a") as output:
-        for name in ("matrix", "redis_matrix"):
+        for name in ("matrix", "redis_matrix", "postgres_matrix"):
             output.write(name + "=" + json.dumps(policy[name], separators=(",", ":")) + "\n")
         fields = {"has_updates": policy["has_updates"], "has_php_updates": bool(policy["matrix"]["include"]),
-                  "has_redis_updates": bool(policy["redis_matrix"]["include"]), "publish": policy["publish"]}
+                  "has_redis_updates": bool(policy["redis_matrix"]["include"]),
+                  "has_postgres_updates": bool(policy["postgres_matrix"]["include"]),
+                  "publish": policy["publish"]}
         for name, value in fields.items():
             output.write(f"{name}={str(value).lower()}\n")
         output.write("release_tag=" + policy["release_tag"] + "\n")
@@ -138,7 +217,7 @@ def main():
     args.output.write_text(json.dumps(policy, indent=2) + "\n")
     if args.github_output:
         write_outputs(args.github_output, policy)
-    print(f"Selected {len(policy['matrix']['include'])} PHP and {len(policy['redis_matrix']['include'])} Redis bundles; publish={policy['publish']}, bypass={policy['bypass']}")
+    print(f"Selected {len(policy['matrix']['include'])} PHP, {len(policy['redis_matrix']['include'])} Redis, and {len(policy['postgres_matrix']['include'])} PostgreSQL bundles; publish={policy['publish']}, bypass={policy['bypass']}")
 
 
 if __name__ == "__main__":

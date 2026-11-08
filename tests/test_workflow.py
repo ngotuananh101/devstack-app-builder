@@ -189,20 +189,22 @@ class WorkflowContracts(unittest.TestCase):
         from test_updates import REPOSITORY
         # Scheduled and default manual runs check public versions; only bypass rebuilds
         # the whole matrix regardless of what is already published.
-        scenarios = (("schedule", False, False, False, 4, 3),
-                     ("schedule", True, False, False, 0, 3),
-                     ("schedule", False, True, False, 4, 0),
-                     ("schedule", True, True, False, 0, 0),
-                     ("workflow_dispatch", True, True, False, 0, 0),
-                     ("workflow_dispatch", False, True, False, 4, 0),
-                     ("workflow_dispatch", True, True, True, 4, 3),
-                     ("workflow_dispatch", False, False, True, 4, 3))
-        for event, php_current, redis_current, bypass, php_count, redis_count in scenarios:
-            with self.subTest(event=event, php_current=php_current, redis_current=redis_current, bypass=bypass), tempfile.TemporaryDirectory() as tmp:
+        scenarios = (("schedule", False, False, False, False, 4, 3, 2),
+                     ("schedule", True, False, False, False, 0, 3, 2),
+                     ("schedule", False, True, False, False, 4, 0, 2),
+                     ("schedule", True, True, False, False, 0, 0, 2),
+                     ("schedule", True, True, True, False, 0, 0, 0),
+                     ("workflow_dispatch", True, True, True, False, 0, 0, 0),
+                     ("workflow_dispatch", False, True, True, False, 4, 0, 0),
+                     ("workflow_dispatch", True, True, True, True, 4, 3, 2),
+                     ("workflow_dispatch", False, False, False, True, 4, 3, 2))
+        for event, php_current, redis_current, postgres_current, bypass, php_count, redis_count, postgres_count in scenarios:
+            with self.subTest(event=event, php_current=php_current, redis_current=redis_current, postgres_current=postgres_current, bypass=bypass), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 output = root / "output"
                 history = {(series, "musl-dynamic", "x86_64"): version for series, version in upstream.items()} if php_current else {}
                 redis_history = {(version, "musl", "x86_64"): version for version in ("8.10.3", "7.4.12", "7.2.17")} if redis_current else {}
+                postgres_history = {(version, "musl-dynamic", "x86_64"): version for version in ("18.6", "17.11")} if postgres_current else {}
                 env = {**os.environ, "PUBLISH": "false", "RELEASE_TAG": "", "BYPASS": str(bypass).lower(),
                        "GITHUB_OUTPUT": str(output), "GITHUB_EVENT_NAME": event, "GITHUB_REPOSITORY": REPOSITORY,
                        "GITHUB_SHA": "a" * 40, "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}
@@ -212,25 +214,34 @@ class WorkflowContracts(unittest.TestCase):
                 argv = args[2:]
                 argv[argv.index("--output") + 1] = str(root / "runtime-update-plan.json")
                 argv[argv.index("--github-output") + 1] = str(output)
-                with patch.dict(os.environ, env, clear=True), patch("sys.argv", argv), patch.object(planner.php, "latest_php", side_effect=upstream.__getitem__), patch.object(planner.php, "published_versions", return_value=history), patch.object(planner, "published_redis", return_value=redis_history):
+                with patch.dict(os.environ, env, clear=True), patch("sys.argv", argv), \
+                     patch.object(planner.php, "latest_php", side_effect=upstream.__getitem__), \
+                     patch.object(planner.php, "published_versions", return_value=history), \
+                     patch.object(planner, "published_redis", return_value=redis_history), \
+                     patch.object(planner, "published_postgresql", return_value=postgres_history):
                     planner.main()
                 policy = json.loads((root / "runtime-update-plan.json").read_text())
                 outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
                 rows = policy["matrix"]["include"]
-                self.assertEqual(outputs["has_updates"], "true" if php_count or redis_count else "false")
+                self.assertEqual(outputs["has_updates"], "true" if php_count or redis_count or postgres_count else "false")
                 self.assertEqual(outputs["has_php_updates"], "true" if php_count else "false")
                 self.assertEqual(outputs["has_redis_updates"], "true" if redis_count else "false")
-                self.assertEqual(outputs["publish"], "true" if event == "schedule" and (php_count or redis_count) else "false")
+                self.assertEqual(outputs["has_postgres_updates"], "true" if postgres_count else "false")
+                self.assertEqual(outputs["publish"], "true" if event == "schedule" and (php_count or redis_count or postgres_count) else "false")
                 self.assertEqual(json.loads(outputs["matrix"]), policy["matrix"])
                 self.assertEqual(json.loads(outputs["redis_matrix"]), policy["redis_matrix"])
+                self.assertEqual(json.loads(outputs["postgres_matrix"]), policy["postgres_matrix"])
                 self.assertEqual(len(rows), php_count)
                 self.assertEqual(len(policy["redis_matrix"]["include"]), redis_count)
+                self.assertEqual(len(policy["postgres_matrix"]["include"]), postgres_count)
                 if rows:
                     self.assertEqual({row["php_version"] for row in rows}, {"8.5.1", "8.4.10", "8.3.2", "8.2.3"})
                     self.assertEqual({row["target"] for row in rows}, {"musl-dynamic"})
                     self.assertTrue(all("profile" not in row for row in rows))
                 if redis_count:
                     self.assertEqual({row["target"] for row in policy["redis_matrix"]["include"]}, {"musl"})
+                if postgres_count:
+                    self.assertEqual({row["target"] for row in policy["postgres_matrix"]["include"]}, {"musl-dynamic"})
 
     def test_noop_matrix_and_publication_are_gated_by_persisted_plan(self):
         workflow = (REPO / ".github/workflows/build.yml").read_text()
