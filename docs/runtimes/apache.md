@@ -29,18 +29,23 @@ prefix, and installed into the bundle's `lib/`.
 
 A download is attempted six times with cumulative backoff (15s, 45s, 1m45s, 3m45s,
 6m45s), because GitHub's `releases/download` surface has answered `504` for every asset
-while its own status page reported all systems operational. A digest that does not match
-its pin is never retried — that is a changed archive, not a flaky connection.
+while its own status page reported all systems operational. A body that does not begin
+like gzip, bzip2 or xz is retried with the rest: an error page served under a normal
+`200` is an interception, not an upstream answer, and a build should not die of one.
+Measured on a CI runner, `zlib.net` answered a pinned tarball with 12193 bytes of
+`text/html`, while the same URL served the pinned digest minutes earlier on the same
+image. A body that *is* a real archive but hashes differently is never retried — that is
+a changed archive, and six backoff attempts would only delay the re-pin message.
 
 Only after all six direct attempts have failed is a GitHub release asset retried through
 `https://gh-proxy.org/`, a read-only release proxy. It is a last resort on purpose: on a
 day when GitHub is healthy the build never touches a third party, and a non-GitHub host
 (`curl.se`, MacPorts, SourceForge, `zlib.net`) is never proxied at all — those outages
 have different causes and a proxy would only obscure them. The proxy is safe for exactly
-one reason: its bytes pass the same SHA-256 check as the origin's, so a proxy that
-rewrites, truncates or serves an error page is refused rather than trusted, and the
-resulting failure still reads `SHA-256 mismatch`. A digest mismatch removes the archive
-and never falls back, so a bad archive cannot wedge the next attempt.
+one reason: its bytes pass the same checks as the origin's — archive magic first, then
+SHA-256 — so a proxy that rewrites, truncates or serves an error page is refused rather
+than trusted, and the failure names what actually arrived. A digest mismatch removes the
+archive and never falls back, so a bad archive cannot wedge the next attempt.
 
 `curl`, `jansson` and `expat` are fetched from their upstream mirrors (`curl.se`,
 MacPorts, SourceForge) rather than from GitHub releases, verified byte-identical at the
