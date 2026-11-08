@@ -8,7 +8,9 @@ from the host means taking whatever release the distribution packages — Ubuntu
 loader is older than the objects linked against it is exactly the mismatch this
 step exists to prevent. So the pinned source is compiled into a private toolchain:
 headers, crt files, libc.so and musl's own `musl-gcc` wrapper. The host only has to
-provide a C compiler.
+provide a C compiler and the kernel UAPI headers, which musl deliberately does not
+ship and whose location differs per distribution; that root is discovered from the
+compiler's own search list and announced to every later step.
 
 The same build produces the shipped loader (musl's `libc.so`, which doubles as the
 dynamic linker) and the compiler every dependency and httpd are built with, so the
@@ -26,6 +28,7 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fetch
+import uapi
 
 LOADER_NAME = "ld-musl-x86_64.so.1"
 # Every linked program requests this interpreter. The bundle's launchers exec the
@@ -171,7 +174,7 @@ def build_toolchain(source, work, compiler, jobs):
     }
 
 
-def probe_toolchain(toolchain, work, version):
+def probe_toolchain(toolchain, work, version, kernel):
     """Compile, link and run a program with the toolchain before anything needs it.
 
     Asking the compiler for its loader (`-print-file-name`) only reports what the
@@ -179,18 +182,24 @@ def probe_toolchain(toolchain, work, version):
     requests the bundle's loader name and runs under this very libc is evidence the
     toolchain works — and that it is the pinned release — forty minutes before the
     last dependency is built.
+
+    The probe includes a kernel header because that is the one thing it takes from
+    the host, and a kernel root that does not resolve <asm/*.h> is what failed the
+    very first CI run of this build.
     """
     source = work / "toolchain-probe.c"
     program = work / "toolchain-probe"
     source.write_text(
         "#include <stdio.h>\n"
+        "#include <linux/mman.h>\n"
         "#include <string.h>\n"
-        "int main(void){char b[8];memset(b,0,sizeof b);puts(\"toolchain-ok\");return b[0];}\n"
+        "int main(void){char b[8];"
+        "memset(b,0,sizeof b);puts(\"toolchain-ok\");return b[0] + (MAP_PRIVATE < 0);}\n"
     )
     # No REALGCC: the wrapper must work as shipped, on the compiler path baked into
     # it, not only when the caller says which compiler to use.
     environment = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
-    compile_and_run([toolchain["cc"], "-O2", "-o", str(program), str(source)],
+    compile_and_run([toolchain["cc"], "-O2", *kernel, "-o", str(program), str(source)],
                     env=environment)
     header = subprocess.check_output(["readelf", "-hW", str(program)], text=True)
     if "ELF64" not in header or "Advanced Micro Devices X86-64" not in header:
@@ -239,13 +248,16 @@ def inspect(libc, version):
 
 def build(pin, work, compiler, jobs):
     source = source_tree(dict(pin, name="musl"), work)
+    # Kept as the root list rather than as flags: every later step renders the
+    # flags from it itself, so there is one place that decides -idirafter.
+    roots = uapi.SEPARATOR.join(uapi.discover(compiler))
     toolchain = build_toolchain(source, work, compiler, jobs)
-    probe_toolchain(toolchain, work, pin["version"])
+    probe_toolchain(toolchain, work, pin["version"], uapi.flags(roots))
     libc = Path(toolchain["libc"])
     record = inspect(libc, pin["version"])
     record["source"] = str(libc)
     record["license"] = {"path": str(source / "COPYRIGHT"), "sha256": digest(source / "COPYRIGHT")}
-    return libc, toolchain, record
+    return libc, dict(toolchain, kernel=roots), record
 
 
 def main():
@@ -268,15 +280,21 @@ def main():
         raise ValueError("The plan must pin exactly one loader source")
     pin = dict(pins[0], name="musl")
     if args.probe_only:
+        # Both of the host's contributions are proved here: the compiler, and the
+        # kernel UAPI include roots musl does not ship. Running it first means an
+        # unusable host stops the run before anything is downloaded.
         print(host_compiler(args.compiler))
+        print(uapi.SEPARATOR.join(uapi.discover(args.compiler)))
         return
     loader, toolchain, record = build(pin, args.work, args.compiler, args.jobs)
     args.metadata.parent.mkdir(parents=True, exist_ok=True)
     args.metadata.write_text(json.dumps(record, indent=2) + "\n")
-    # The compiler path is announced here rather than recomputed by the caller: it
-    # lives inside this build's workspace and only this step knows where.
+    # The compiler path and the kernel include root are announced here rather than
+    # recomputed by the caller: the first lives inside this build's workspace and
+    # only this step knows where, and the second is a property of the host compiler
+    # that every later step must use identically.
     print(json.dumps({"loader": str(loader), "cc": toolchain["cc"],
-                      "version": record["version"]}))
+                      "kernel": toolchain["kernel"], "version": record["version"]}))
 
 
 if __name__ == "__main__":

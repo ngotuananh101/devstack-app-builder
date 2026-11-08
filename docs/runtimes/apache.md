@@ -22,10 +22,10 @@ a version means adding the pin and its checksum first.
 
 ## Vendored dependency set
 
-Nothing comes from the build host except a C compiler. Each dependency is downloaded
-over HTTPS, digest-verified **before** extraction into its own fresh directory, built
-with the pinned musl toolchain into one staging prefix, and installed into the bundle's
-`lib/`.
+Nothing comes from the build host except a C compiler and its kernel UAPI headers.
+Each dependency is downloaded over HTTPS, digest-verified **before** extraction into
+its own fresh directory, built with the pinned musl toolchain into one staging
+prefix, and installed into the bundle's `lib/`.
 
 | Dependency | Version | Role | Needed by |
 |---|---|---|---|
@@ -92,13 +92,23 @@ a bundle whose loader is older than the objects linked against it is precisely t
 ABI mismatch the build must not ship. The host only has to provide a working C
 compiler, which a probe proves before anything is downloaded.
 
+**Kernel UAPI headers do come from the host**, because musl deliberately ships none:
+`<linux/*.h>` and the `<asm/*.h>` they include are the distribution's, and they must
+match the kernel the bundle runs on. Their location is not portable — Fedora keeps
+both under `/usr/include`, while Ubuntu keeps `asm/` under
+`/usr/include/x86_64-linux-gnu` — so `uapi.py` reads the compiler's own include
+search list and uses every directory on it that supplies `linux/` or `asm/`. Both
+must be covered by some directory or the build fails at the probe, and the flags are
+always `-idirafter` (never `-I`) so a musl header of the same name still wins.
+
 The pipeline runs under fresh `.cache/apache/build.*` directories:
 
-1. a host-compiler probe (a compiler that cannot build and run a program fails here,
-   not after 40 minutes),
+1. a host-compiler probe — the compiler must build and run a program, and its search
+   list must supply `linux/` and `asm/`; either failing stops the run here,
 2. `fetch.py` — verify each SHA-256, then extract into `sources/<name>/`,
 3. `loader.py` — build the pinned musl into the toolchain, then compile, link and
-   run a probe program with it; the same `libc.so` becomes the shipped loader,
+   run a probe program with it **including a kernel header**; the same `libc.so`
+   becomes the shipped loader,
 4. `deps.py` — build the 15 dependency pins (every pin except musl) into a staging
    prefix with that toolchain's `musl-gcc`,
 5. `httpd.py` — configure, build, census the modules against `config/modules.json`,
@@ -241,9 +251,10 @@ plan, the builder commit, the manifest and the required program/module set.
 - OpenSSL's compiled-in `OPENSSLDIR`/`MODULESDIR` name the build prefix. The CLI is
   redirected through `OPENSSL_CONF`; the library itself needs no config file to serve TLS.
 - `suexec` is unlaunched (see above). Wiring it up is the consumer's job.
-- libc and the loader are pinned and built from source, but the **host C compiler**
-  that builds that toolchain is not: the recorded compiler version and source digest
-  are provenance, not a reproducible build guarantee.
+- libc and the loader are pinned and built from source, but two things are still the
+  **build host's**: the C compiler that builds that toolchain, and the kernel UAPI
+  headers it compiles against. The recorded compiler version and source digest are
+  provenance, not a reproducible build guarantee.
 
 ## Licensing
 

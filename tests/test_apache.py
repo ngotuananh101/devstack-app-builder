@@ -186,6 +186,92 @@ class ToolchainContracts(unittest.TestCase):
         self.assertNotIn('"-print-file-name="', text)
         self.assertFalse(hasattr(self.loader, "toolchain_loader"))
 
+    def test_the_kernel_uapi_roots_come_from_the_compiler(self):
+        # The second CI failure: musl ships no kernel UAPI headers, and the build
+        # assumed they were all under /usr/include. Fedora has both there; Ubuntu
+        # splits them, so <linux/mman.h> resolved and its <asm/mman.h> did not.
+        # The roots are read from the compiler's own search list instead.
+        text = (SCRIPTS / "loader.py").read_text()
+        self.assertIn("uapi.discover(", text)
+        self.assertNotIn("-idirafter /usr/include", text)
+        for script in ("deps.py", "httpd.py"):
+            self.assertNotIn("-idirafter /usr/include", (SCRIPTS / script).read_text())
+            self.assertIn("uapi.", (SCRIPTS / script).read_text())
+        # The probe includes a kernel header, so a root that cannot resolve it
+        # fails before the dependency build rather than inside OpenSSL.
+        probe = (SCRIPTS / "loader.py").read_text().split("def probe_toolchain", 1)[1]
+        self.assertIn("#include <linux/mman.h>", probe)
+
+    def test_uapi_accepts_split_roots_and_refuses_a_partial_one(self):
+        # Linux/ and asm/ in different directories is the Ubuntu layout; a single
+        # directory holding only linux/ cannot satisfy <linux/mman.h>.
+        uapi = load("uapi")
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            kernel = base / "include"
+            multiarch = base / "x86_64-linux-gnu"
+            (kernel / "linux").mkdir(parents=True)
+            (multiarch / "asm").mkdir(parents=True)
+            split = "%s%s%s" % (kernel, uapi.SEPARATOR, multiarch)
+            # Separate words, not one string: a caller putting the whole string in
+            # argv would pass "-idirafter /usr/include" as a single argument.
+            self.assertEqual(uapi.flags(split),
+                             ["-idirafter", str(kernel), "-idirafter", str(multiarch)])
+            self.assertEqual(uapi.env_flags(split),
+                             "-idirafter %s -idirafter %s" % (kernel, multiarch))
+            with self.assertRaisesRegex(ValueError, "asm/"):
+                uapi.flags(str(kernel))
+            with self.assertRaisesRegex(ValueError, "absolute"):
+                uapi.flags("relative/include")
+            # A root that does not exist is refused rather than silently ignored.
+            with self.assertRaisesRegex(ValueError, "No such kernel include root"):
+                uapi.flags(split + uapi.SEPARATOR + str(base / "absent"))
+
+    def test_discovery_reads_the_compilers_own_search_list(self):
+        # The Ubuntu 24.04 layout, replayed through a fake compiler: linux/ in one
+        # directory and asm/ in the multiarch one. Both must be found, in the
+        # order the compiler searches them, and nothing outside that list counts.
+        uapi = load("uapi")
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            kernel = base / "usr/include"
+            multiarch = base / "usr/include/x86_64-linux-gnu"
+            (kernel / "linux").mkdir(parents=True)
+            (multiarch / "asm").mkdir(parents=True)
+            gcc_private = base / "lib/gcc/include"
+            gcc_private.mkdir(parents=True)
+            compiler = base / "fake-cc"
+            compiler.write_text(
+                "#!/bin/sh\n"
+                "cat >&2 <<'EOF'\n"
+                "ignoring nonexistent directory \"%s\"\n"
+                "#include \"...\" search starts here:\n"
+                "#include <...> search starts here:\n"
+                " %s\n %s\n %s\n"
+                "End of search list.\n"
+                "EOF\n" % (base / "absent", gcc_private, kernel, multiarch))
+            compiler.chmod(0o755)
+            self.assertEqual(uapi.discover(compiler), [str(kernel), str(multiarch)])
+            # The same compiler with only the first directory in its list is
+            # refused: <linux/mman.h> would resolve and <asm/mman.h> would not.
+            del_listed = compiler.with_name("fake-cc-one-root")
+            del_listed.write_text(
+                "#!/bin/sh\n"
+                "cat >&2 <<'EOF'\n"
+                "#include <...> search starts here:\n"
+                " %s\n"
+                "End of search list.\n"
+                "EOF\n" % kernel)
+            del_listed.chmod(0o755)
+            with self.assertRaisesRegex(ValueError, "asm/"):
+                uapi.discover(del_listed)
+            # A compiler that does not report a list at all is refused too.
+            mute = compiler.with_name("fake-cc-mute")
+            mute.write_text("#!/bin/sh\nexit 0\n")
+            mute.chmod(0o755)
+            with self.assertRaisesRegex(ValueError, "include search list"):
+                uapi.discover(mute)
+
     def test_the_wrapper_names_the_host_compiler_that_built_it(self):
         # musl's own wrapper execs a bare `gcc`; a host that only provides `cc`
         # would then fail on every dependency. REALGCC stays overridable.

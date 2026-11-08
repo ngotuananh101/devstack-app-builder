@@ -182,7 +182,8 @@ and `htdocs/index.html` ship as Lounge ships them.
 Every library is downloaded over HTTPS, digest-verified **before** extraction, built
 with the musl toolchain compiled from the pinned musl source into one staging prefix,
 and installed into `<root>/lib`. Exact versions live in `config/sources.json` with
-reviewed SHA-256.
+reviewed SHA-256. The host supplies the C compiler and the kernel UAPI headers musl
+does not ship; nothing else.
 
 | Dependency | Needed by | Notes |
 |---|---|---|
@@ -298,8 +299,13 @@ root and Lounge's `LoadModule` lines say `modules/...`.
   extracts each archive into its own fresh directory.
 - `scripts/loader.py` — compiles the pinned musl into a private toolchain (its own
   `musl-gcc` wrapper and specs, `--syslibdir=/lib`), proves it by compiling and
-  running a program with it, and returns both the loader to ship and the compiler
-  path every later step uses.
+  running a program with it — including a kernel UAPI header, because musl ships
+  none — and returns the loader to ship, the compiler path every later step uses,
+  and the kernel include roots it discovered.
+- `scripts/uapi.py` — reads the host compiler's include search list and returns
+  every directory supplying `linux/` or `asm/`, refusing a set that does not cover
+  both. Fedora keeps them together under `/usr/include`; Ubuntu splits `asm/` into
+  `/usr/include/x86_64-linux-gnu`, which is why a hardcoded root cannot work.
 - `scripts/deps.py` — builds the pinned set into a staging prefix in dependency
   order: zlib → OpenSSL → PCRE2 → brotli → nghttp2 → jansson → expat → libxml2 →
   Lua → OpenLDAP → sqlite3 → unixODBC → curl → APR → APR-util → httpd.
@@ -308,7 +314,8 @@ root and Lounge's `LoadModule` lines say `modules/...`.
   `ranlib`), refuses to replace an existing bundle, then probe → download →
   toolchain → deps → httpd → stage → verify → package. The host provides no musl:
   `loader.py` builds the pinned release into a private toolchain, and `deps.py` and
-  `httpd.py` are handed its compiler path.
+  `httpd.py` are handed its compiler path and the kernel include roots, both as
+  arguments rather than as constants.
 - `scripts/stage.py` — installs httpd into `libexec/bin`, generates launchers from
   one template, moves DSOs to `modules/`, libraries to `lib/`, stages config, htdocs,
   include, licenses, sources, writes `manifest.json`.

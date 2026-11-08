@@ -18,6 +18,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import elf
+import uapi
 
 CONFIG = Path(__file__).resolve().parents[1] / "config"
 
@@ -149,6 +150,8 @@ def main():
     parser.add_argument("install", type=Path, help="httpd install prefix")
     parser.add_argument("--cc", type=Path, required=True,
                         help="musl-gcc built from the pinned musl by loader.py")
+    parser.add_argument("--kernel-headers", required=True,
+                        help="host include roots holding linux/ and asm/, colon-separated as loader.py found them")
     parser.add_argument("--jobs", type=int, default=2)
     args = parser.parse_args()
     build = args.build.resolve()
@@ -157,6 +160,9 @@ def main():
     cc = str(args.cc.resolve())
     if not Path(cc).is_file():
         raise ValueError("The pinned musl compiler is missing: " + cc)
+    # musl has no kernel UAPI headers; which host directories do is a property of
+    # the compiler, so it arrives with the toolchain rather than being assumed.
+    kernel = uapi.env_flags(args.kernel_headers)
     if build.exists():
         raise ValueError("Refusing to reuse a build directory: " + str(build))
     build.mkdir(parents=True)
@@ -169,8 +175,8 @@ def main():
         **{name: value for name, value in os.environ.items()},
         "PATH": prefix + "/bin:" + os.environ["PATH"],
         "CC": cc,
-        "CFLAGS": "-O2 -fPIC -idirafter /usr/include",
-        "CPPFLAGS": "-idirafter /usr/include",
+        "CFLAGS": "-O2 -fPIC " + kernel,
+        "CPPFLAGS": kernel,
         "LDFLAGS": "-L%s/lib -Wl,-rpath-link,%s/lib" % (prefix, prefix),
         "PKG_CONFIG_PATH": prefix + "/lib/pkgconfig",
         "PKG_CONFIG_LIBDIR": prefix + "/lib/pkgconfig",
@@ -185,7 +191,8 @@ def main():
     report["load_order"] = load_order(build)
     # The census is what the request and the manifest are built from, so the exact
     # line that configured the tree travels with it instead of being recomputed.
-    report["configure"] = {"arguments": arguments, "compiler": environment["CC"]}
+    report["configure"] = {"arguments": arguments, "compiler": environment["CC"],
+                           "kernel_headers": kernel}
     run(["make", "-j", str(args.jobs)])
     run(["make", "install"])
     stripped = strip_runpath(Path(install))

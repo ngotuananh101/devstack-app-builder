@@ -331,7 +331,8 @@ def stage_sources(bundle, request):
             {key: entry[key] for key in ("name", "version", "url", "sha256", "license", "role")}
             for entry in request["dependencies"]
         ],
-        "configure": {"arguments": request["configure"], "compiler": request["compiler"]},
+        "configure": {"arguments": request["configure"], "compiler": request["compiler"],
+                      "kernel_headers": request.get("kernel_headers", "")},
     }
     (destination / "sources.json").write_text(json.dumps(payload, indent=2) + "\n")
 
@@ -457,7 +458,8 @@ def main():
             {key: entry[key] for key in ("name", "version", "sha256", "role")}
             for entry in request["dependencies"]
         ],
-        "configure": {"arguments": request["configure"], "compiler": request["compiler"]},
+        "configure": {"arguments": request["configure"], "compiler": request["compiler"],
+                      "kernel_headers": request.get("kernel_headers", "")},
         "builder": builder_record(),
         "build_host": {"system": platform.platform()},
         "verification": "NOT_RUN",

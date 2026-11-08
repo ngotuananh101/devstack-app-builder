@@ -42,6 +42,9 @@ def request(plan, sources, census, loader, install, prefix, mpm):
         "dependencies": plan["dependencies"],
         "configure": census["configure"]["arguments"],
         "compiler": census["configure"]["compiler"],
+        # The host kernel UAPI include flags, recorded because they are the one
+        # thing besides the compiler that the build host contributes.
+        "kernel_headers": census["configure"].get("kernel_headers", ""),
         "target": plan["target"],
         "architecture": plan["architecture"],
         "mpm": mpm,

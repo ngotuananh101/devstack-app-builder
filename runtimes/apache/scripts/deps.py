@@ -15,19 +15,28 @@ import shlex
 import subprocess
 import sys
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import uapi
+
 TARGET = "--build=x86_64-pc-linux-gnu", "--host=x86_64-pc-linux-gnu"
-# musl ships no kernel UAPI headers, so <linux/*.h> resolves from the host. The
-# include comes last, so a musl header of the same name still wins.
-KERNEL_HEADERS = "-idirafter /usr/include"
 
 
-def env_for(prefix, cc):
+def env_for(prefix, cc, kernel):
+    """The environment every dependency recipe builds with.
+
+    musl ships no kernel UAPI headers, so <linux/*.h> and the <asm/*.h> they
+    include come from the host. The roots holding them are discovered by loader.py
+    from the compiler's own search list — one directory on Fedora, two on Ubuntu,
+    which is why they arrive as a root list rather than as a path this file
+    assumes. The flags come last, so a musl header of the same name still wins.
+    """
+    includes = uapi.env_flags(kernel)
     return {
         **os.environ,
         "CC": cc,
-        "CFLAGS": "-O2 -fPIC " + KERNEL_HEADERS,
-        "CXXFLAGS": "-O2 -fPIC " + KERNEL_HEADERS,
-        "CPPFLAGS": "-I%s/include %s" % (prefix, KERNEL_HEADERS),
+        "CFLAGS": "-O2 -fPIC " + includes,
+        "CXXFLAGS": "-O2 -fPIC " + includes,
+        "CPPFLAGS": "-I%s/include %s" % (prefix, includes),
         "LDFLAGS": "-L%s/lib -Wl,-rpath-link,%s/lib" % (prefix, prefix),
         "PKG_CONFIG_PATH": "%s/lib/pkgconfig" % prefix,
         "PKG_CONFIG_LIBDIR": "%s/lib/pkgconfig" % prefix,
@@ -189,6 +198,8 @@ def main():
     parser.add_argument("prefix", type=Path)
     parser.add_argument("--cc", type=Path, required=True,
                         help="musl-gcc built from the pinned musl by loader.py")
+    parser.add_argument("--kernel-headers", required=True,
+                        help="host include roots holding linux/ and asm/, colon-separated as loader.py found them")
     parser.add_argument("--jobs", type=int, default=2)
     parser.add_argument(
         "--from", dest="first", choices=ORDER, default=ORDER[0],
@@ -209,7 +220,9 @@ def main():
     cc = str(Path(args.cc).resolve())
     if not Path(cc).is_file():
         raise ValueError("The pinned musl compiler is missing: " + cc)
-    env = env_for(prefix, cc)
+    # The root list as loader.py discovered it; env_for renders the flags.
+    kernel = uapi.roots(args.kernel_headers)
+    env = env_for(prefix, cc, uapi.SEPARATOR.join(kernel))
     args.prefix.mkdir(parents=True, exist_ok=True)
     for name in ORDER[ORDER.index(args.first):]:
         print("=== %s ===" % name, flush=True)
