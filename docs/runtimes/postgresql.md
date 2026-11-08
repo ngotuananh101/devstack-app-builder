@@ -27,7 +27,7 @@ Arguments accept at most one pinned exact version. Unknown options, profiles, du
   - **ICU** `79.1` (Unicode-3.0, static): `-fPIC` static archive.
   - **util-linux** `2.42.4` (LGPL-2.1-or-later, static `libuuid`): `-fPIC` static archive.
 
-All pinned source archives are fetched over HTTPS (PostgreSQL source URL shape `https://ftp.postgresql.org/pub/source/v<version>/postgresql-<version>.tar.bz2`, with checksum sidecar `.sha256` at the same location). Every dependency archive is SHA-256 verified against `config/sources.json` before extraction into a fresh directory, and built into a fresh staging prefix. `BUILD_JOBS` selects build parallelism (default 2).
+All pinned source archives are fetched over HTTPS (PostgreSQL source URL shape `https://ftp.postgresql.org/pub/source/v<version>/postgresql-<version>.tar.bz2`, with checksum sidecar `.sha256` at the same location). Every dependency archive is SHA-256 verified against `config/sources.json` before extraction into a fresh directory, and built into a fresh staging prefix. A download is attempted up to four times with linear backoff, because GitHub's release CDN answers `504` for a single asset while the rest of the same release serves normally; a digest that does not match its pin is never retried. `BUILD_JOBS` selects build parallelism (default 2).
 
 ### The toolchain names its own loader while the build runs
 

@@ -25,7 +25,10 @@ a version means adding the pin and its checksum first.
 Nothing comes from the build host except a C compiler and its kernel UAPI headers.
 Each dependency is downloaded over HTTPS, digest-verified **before** extraction into
 its own fresh directory, built with the pinned musl toolchain into one staging
-prefix, and installed into the bundle's `lib/`.
+prefix, and installed into the bundle's `lib/`. A download is attempted up to four
+times with linear backoff, because GitHub's release CDN answers `504` for a single
+asset while the rest of the same release serves normally; a digest that does not match
+its pin is never retried.
 
 | Dependency | Version | Role | Needed by |
 |---|---|---|---|
