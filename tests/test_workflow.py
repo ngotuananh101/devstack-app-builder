@@ -57,6 +57,29 @@ class WorkflowContracts(unittest.TestCase):
         self.assertIn("needs.build-apache.result", publish)
         self.assertIn("pattern: runtime-*", publish)
 
+    def test_apache_ci_never_installs_a_host_musl(self):
+        # The Apache job failed this way once: Ubuntu 24.04's musl-tools is 1.2.4
+        # while the pin is 1.2.5, and the build used to refuse the mismatch. The
+        # pinned musl is now compiled by loader.py, so a host musl must not be
+        # installed at all — installing it would only hide a regression in that.
+        workflow = (REPO / ".github/workflows/build.yml").read_text()
+        apache = workflow.split("  build-apache:\n", 1)[1].split("  publish:\n", 1)[0]
+        installation = apache.split("      - name: Install CI-only native build dependencies\n", 1)[1]
+        command = textwrap.dedent(installation.split("        run:", 1)[1].split("      - name:", 1)[0])
+        import shlex
+        packages = []
+        for line in command.splitlines():
+            if line.lstrip().startswith("#") or not line.strip():
+                continue
+            argv = shlex.split(line)
+            if argv[:3] == ["sudo", "apt-get", "install"]:
+                packages += argv[4:]
+        self.assertTrue(packages, "The Apache job must install its build tools")
+        for forbidden in ("musl", "musl-tools", "musl-dev"):
+            self.assertNotIn(forbidden, packages)
+        # A C compiler is still the one thing the host must provide.
+        self.assertIn("build-essential", packages)
+
     def test_bypass_input_is_manual_only_and_defaults_to_version_checks(self):
         workflow = (REPO / ".github/workflows/build.yml").read_text()
         inputs = workflow.split("    inputs:\n", 1)[1].split("\npermissions:", 1)[0]

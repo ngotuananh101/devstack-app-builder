@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -139,6 +140,82 @@ class ExtractionContracts(unittest.TestCase):
             archive = self.write(temporary, data)
             with self.assertRaises(ValueError):
                 self.fetch.extract(archive, Path(temporary) / "out")
+
+
+class ToolchainContracts(unittest.TestCase):
+    """The bundle must not take its musl from the build host's packages.
+
+    Ubuntu 24.04 ships musl 1.2.4 while the pin is 1.2.5, so a host musl-gcc is a
+    host dependency the bundle cannot have: the loader and the objects linked
+    against it must come from the same pinned release, and that release is compiled
+    here. These tests pin the mechanics that make that true.
+    """
+
+    def setUp(self):
+        self.loader = load("loader")
+
+    def test_the_toolchain_is_built_from_the_pinned_source(self):
+        # musl derives musl-gcc and its specs from --prefix, and the install runs
+        # through DESTDIR so it never writes /lib on the build host.
+        text = (SCRIPTS / "loader.py").read_text()
+        self.assertIn('"--prefix=" + str(toolchain)', text)
+        self.assertIn('"--syslibdir=" + str(PurePosixPath(SYSLOADER).parent)', text)
+        self.assertIn('"DESTDIR=" + str(stage)', text)
+        self.assertEqual(self.loader.SYSLOADER, "/lib/ld-musl-x86_64.so.1")
+
+    def test_no_step_compiles_with_the_hosts_musl_gcc(self):
+        # A default of musl-gcc would silently reintroduce the dependency this
+        # change removes, in any one of the three steps.
+        build = (SCRIPTS / "build.sh").read_text()
+        self.assertIn('compiler="${APACHE_CC:-cc}"', build)
+        self.assertIn('--cc "$cc"', build)
+        deps = (SCRIPTS / "deps.py").read_text()
+        httpd = (SCRIPTS / "httpd.py").read_text()
+        for text in (deps, httpd):
+            self.assertNotIn('"musl-gcc"', text)
+            self.assertIn('"--cc"', text)
+        # deps.py may not fall back to a module-level constant either.
+        self.assertNotIn('CC = "musl-gcc"', deps)
+
+    def test_the_probe_compiles_and_runs_with_the_built_toolchain(self):
+        # A probe that only asks the compiler where its loader is reports the
+        # host's musl, which is the dependency being removed. What the toolchain
+        # produces has to be executed instead.
+        text = (SCRIPTS / "loader.py").read_text()
+        self.assertIn('toolchain["libc"], str(program)', text)
+        self.assertNotIn('"-print-file-name="', text)
+        self.assertFalse(hasattr(self.loader, "toolchain_loader"))
+
+    def test_the_wrapper_names_the_host_compiler_that_built_it(self):
+        # musl's own wrapper execs a bare `gcc`; a host that only provides `cc`
+        # would then fail on every dependency. REALGCC stays overridable.
+        with tempfile.TemporaryDirectory() as temporary:
+            toolchain = Path(temporary) / "toolchain"
+            (toolchain / "bin").mkdir(parents=True)
+            (toolchain / "lib").mkdir()
+            (toolchain / "lib/musl-gcc.specs").write_text("*link:\n")
+            real = self.loader.write_wrapper(toolchain, "cc")
+            text = (toolchain / "bin/musl-gcc").read_text()
+            self.assertEqual(real, shutil.which("cc"))
+            self.assertIn('${REALGCC:-%s}' % real, text)
+            self.assertIn(str(toolchain / "lib/musl-gcc.specs"), text)
+            self.assertTrue(os.access(toolchain / "bin/musl-gcc", os.X_OK))
+            # The host compiler named in the wrapper must not be musl-gcc itself.
+            self.assertNotIn("musl-gcc}", text)
+
+    def test_a_loader_without_the_pinned_banner_is_refused(self):
+        # inspect() trusts the banner, so it is the banner that must refuse a
+        # binaries that is not the release the plan pinned.
+        with tempfile.TemporaryDirectory() as temporary:
+            fake = Path(temporary) / "libc.so"
+            fake.write_text("#!/bin/sh\necho 'Version 9.9.9' >&2\n")
+            fake.chmod(0o755)
+            self.assertEqual(self.loader.banner_version(fake), "9.9.9")
+            silent = Path(temporary) / "silent"
+            silent.write_text("#!/bin/sh\nexit 0\n")
+            silent.chmod(0o755)
+            with self.assertRaisesRegex(ValueError, "Not a musl loader"):
+                self.loader.banner_version(silent)
 
 
 class LauncherContracts(unittest.TestCase):

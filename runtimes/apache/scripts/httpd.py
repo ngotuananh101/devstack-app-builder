@@ -147,11 +147,16 @@ def main():
     parser.add_argument("build", type=Path, help="new, empty build directory")
     parser.add_argument("prefix", type=Path, help="staging prefix holding the dependencies")
     parser.add_argument("install", type=Path, help="httpd install prefix")
+    parser.add_argument("--cc", type=Path, required=True,
+                        help="musl-gcc built from the pinned musl by loader.py")
     parser.add_argument("--jobs", type=int, default=2)
     args = parser.parse_args()
     build = args.build.resolve()
     prefix = str(args.prefix.resolve())
     install = str(args.install.resolve())
+    cc = str(args.cc.resolve())
+    if not Path(cc).is_file():
+        raise ValueError("The pinned musl compiler is missing: " + cc)
     if build.exists():
         raise ValueError("Refusing to reuse a build directory: " + str(build))
     build.mkdir(parents=True)
@@ -163,7 +168,7 @@ def main():
     environment = {
         **{name: value for name, value in os.environ.items()},
         "PATH": prefix + "/bin:" + os.environ["PATH"],
-        "CC": "musl-gcc",
+        "CC": cc,
         "CFLAGS": "-O2 -fPIC -idirafter /usr/include",
         "CPPFLAGS": "-idirafter /usr/include",
         "LDFLAGS": "-L%s/lib -Wl,-rpath-link,%s/lib" % (prefix, prefix),

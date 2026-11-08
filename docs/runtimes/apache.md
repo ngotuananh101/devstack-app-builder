@@ -22,13 +22,14 @@ a version means adding the pin and its checksum first.
 
 ## Vendored dependency set
 
-Nothing comes from the build host except the toolchain. Each dependency is downloaded
+Nothing comes from the build host except a C compiler. Each dependency is downloaded
 over HTTPS, digest-verified **before** extraction into its own fresh directory, built
-with `musl-gcc` into one staging prefix, and installed into the bundle's `lib/`.
+with the pinned musl toolchain into one staging prefix, and installed into the bundle's
+`lib/`.
 
 | Dependency | Version | Role | Needed by |
 |---|---|---|---|
-| musl | 1.2.5 | loader | the bundle's own libc |
+| musl | 1.2.5 | loader + toolchain | the bundle's own libc |
 | zlib | 1.3.2 | link | `deflate`, curl, libxml2 |
 | OpenSSL | 3.0.22 | link | `ssl`, `md`, `http2`, `session_crypto`, LDAP TLS |
 | PCRE2 | 10.49 | link | httpd core (`pcre2-config` must report `10.*`) |
@@ -78,17 +79,28 @@ present and exercised by the verifier.
 
 ## Build dependencies
 
-Checked, never installed: `musl-gcc`, `make`, `perl`, `pkg-config`, `cmake`, `curl`,
-`readelf`, `strip`, `ar`, `ranlib`, `tar`, plus HTTPS access to the pinned upstream
-hosts. `APACHE_CC` selects an installed compiler (default `musl-gcc`); `BUILD_JOBS`
+Checked, never installed: a C compiler (`gcc` or `cc`; `APACHE_CC` selects one,
+default `cc`), `make`, `perl`, `pkg-config`, `cmake`, `curl`, `readelf`, `strip`,
+`ar`, `ranlib`, `tar`, plus HTTPS access to the pinned upstream hosts. `BUILD_JOBS`
 selects a positive job count (default 2); `APACHE_MPM` selects the default MPM.
+
+**musl is not taken from the host.** The pinned 1.2.5 source is compiled into a
+private toolchain inside the build workspace — headers, crt files, `libc.so` and
+musl's own `musl-gcc` wrapper — and every dependency and httpd are built with that
+wrapper. This is not an aesthetic choice: Ubuntu 24.04's `musl-tools` is 1.2.4, and
+a bundle whose loader is older than the objects linked against it is precisely the
+ABI mismatch the build must not ship. The host only has to provide a working C
+compiler, which a probe proves before anything is downloaded.
 
 The pipeline runs under fresh `.cache/apache/build.*` directories:
 
-1. a toolchain probe (a `musl-gcc` that is not musl fails here, not after 40 minutes),
+1. a host-compiler probe (a compiler that cannot build and run a program fails here,
+   not after 40 minutes),
 2. `fetch.py` — verify each SHA-256, then extract into `sources/<name>/`,
-3. `loader.py` — build musl and prove its exports and version banner,
-4. `deps.py` — build the 16 pinned dependencies into a staging prefix,
+3. `loader.py` — build the pinned musl into the toolchain, then compile, link and
+   run a probe program with it; the same `libc.so` becomes the shipped loader,
+4. `deps.py` — build the 15 dependency pins (every pin except musl) into a staging
+   prefix with that toolchain's `musl-gcc`,
 5. `httpd.py` — configure, build, census the modules against `config/modules.json`,
    strip the generated rpaths and the debug symbols,
 6. `request.py` / `stage.py` — assemble the bundle and its manifest,
@@ -198,6 +210,10 @@ The manifest records the actual httpd version, loader provenance, the module cen
 DBD drivers, DBM type, every binary's `NEEDED` set and hash, builder commit/source digest
 and the verification results. Only a `PASSED` bundle can be packaged.
 
+The same pinned musl build that produces the loader is what compiles every vendored
+library and httpd, so the recorded loader digest is also the ABI every object in the
+bundle was linked against — not merely a loader that happens to sit beside them.
+
 ## Assets and publication
 
 ```text
@@ -225,8 +241,9 @@ plan, the builder commit, the manifest and the required program/module set.
 - OpenSSL's compiled-in `OPENSSLDIR`/`MODULESDIR` name the build prefix. The CLI is
   redirected through `OPENSSL_CONF`; the library itself needs no config file to serve TLS.
 - `suexec` is unlaunched (see above). Wiring it up is the consumer's job.
-- System toolchain packages are not reproducibly pinned. The recorded compiler version
-  and source digest are provenance, not a reproducible build guarantee.
+- libc and the loader are pinned and built from source, but the **host C compiler**
+  that builds that toolchain is not: the recorded compiler version and source digest
+  are provenance, not a reproducible build guarantee.
 
 ## Licensing
 

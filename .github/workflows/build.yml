@@ -155,11 +155,14 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install CI-only native build dependencies
         run: |
-          # Only the toolchain lives on the host: every library httpd links is
-          # built from a pinned, digest-verified source into the staging prefix, so
-          # no -dev package for any dependency is installed here on purpose.
+          # Only the C compiler, binutils and the build tools live on the host.
+          # musl itself is compiled from its pinned source by loader.py, so the
+          # runner's musl-tools (1.2.4 on Ubuntu 24.04) is neither installed nor
+          # wanted: the bundle's loader and its objects must be the pinned 1.2.5.
+          # Every library httpd links is built from a pinned, digest-verified
+          # source into the staging prefix, so no -dev package is installed here.
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential binutils curl musl-tools perl cmake pkg-config
+          sudo apt-get install -y --no-install-recommends build-essential binutils curl perl cmake pkg-config
       - name: Build every vendored dependency, verify the running server, and package
         env:
           BUILD_VERSION: ${{ matrix.apache_version }}

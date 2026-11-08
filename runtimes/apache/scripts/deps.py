@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Build every vendored dependency into one staging prefix with musl-gcc.
+"""Build every vendored dependency into one staging prefix with the pinned musl.
 
 Each step is a small explicit recipe. Nothing is linked from the build host: the
 pkg-config search path points at the staging prefix only, and every configure run
-sees the staging prefix first in its include and library paths.
+sees the staging prefix first in its include and library paths. The compiler is
+the one loader.py built from the pinned musl, not the host's musl-gcc, so the
+objects and the loader that ships with them come from the same release.
 """
 import argparse
 import json
@@ -13,17 +15,16 @@ import shlex
 import subprocess
 import sys
 
-CC = "musl-gcc"
 TARGET = "--build=x86_64-pc-linux-gnu", "--host=x86_64-pc-linux-gnu"
 # musl ships no kernel UAPI headers, so <linux/*.h> resolves from the host. The
 # include comes last, so a musl header of the same name still wins.
 KERNEL_HEADERS = "-idirafter /usr/include"
 
 
-def env_for(prefix):
+def env_for(prefix, cc):
     return {
         **os.environ,
-        "CC": CC,
+        "CC": cc,
         "CFLAGS": "-O2 -fPIC " + KERNEL_HEADERS,
         "CXXFLAGS": "-O2 -fPIC " + KERNEL_HEADERS,
         "CPPFLAGS": "-I%s/include %s" % (prefix, KERNEL_HEADERS),
@@ -79,7 +80,7 @@ def brotli(source, prefix, jobs, env):
     build.mkdir(parents=True, exist_ok=False)
     run(
         ["cmake", source, "-DCMAKE_BUILD_TYPE=Release",
-         "-DCMAKE_C_COMPILER=" + CC, "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+         "-DCMAKE_C_COMPILER=" + env["CC"], "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
          "-DBUILD_SHARED_LIBS=ON", "-DCMAKE_INSTALL_PREFIX=" + prefix,
          "-DCMAKE_INSTALL_LIBDIR=lib", "-DBROTLI_DISABLE_TESTS=ON"],
         cwd=build, env=env,
@@ -101,7 +102,7 @@ def lua(source, prefix, jobs, env):
     includedir = Path(prefix) / "include" / "lua5.4"
     libdir.mkdir(parents=True, exist_ok=True)
     includedir.mkdir(parents=True, exist_ok=True)
-    run([CC, "-shared", "-O2", "-fPIC", "-DLUA_USE_LINUX",
+    run([env["CC"], "-shared", "-O2", "-fPIC", "-DLUA_USE_LINUX",
          "-Wl,-soname,liblua5.4.so", "-o", libdir / "liblua5.4.so",
          *(source / "src" / name for name in (
              "lapi.c", "lcode.c", "lctype.c", "ldebug.c", "ldo.c", "ldump.c",
@@ -186,6 +187,8 @@ def main():
     parser.add_argument("sources", type=Path,
                         help="sources.json map written by fetch.py: name -> extracted root")
     parser.add_argument("prefix", type=Path)
+    parser.add_argument("--cc", type=Path, required=True,
+                        help="musl-gcc built from the pinned musl by loader.py")
     parser.add_argument("--jobs", type=int, default=2)
     parser.add_argument(
         "--from", dest="first", choices=ORDER, default=ORDER[0],
@@ -203,7 +206,10 @@ def main():
         if not Path(roots[name]).is_dir():
             raise ValueError("Extracted source is missing for " + name)
     prefix = str(args.prefix.resolve())
-    env = env_for(prefix)
+    cc = str(Path(args.cc).resolve())
+    if not Path(cc).is_file():
+        raise ValueError("The pinned musl compiler is missing: " + cc)
+    env = env_for(prefix, cc)
     args.prefix.mkdir(parents=True, exist_ok=True)
     for name in ORDER[ORDER.index(args.first):]:
         print("=== %s ===" % name, flush=True)

@@ -1,23 +1,37 @@
 #!/usr/bin/env python3
-"""Build the pinned musl loader that a musl-dynamic httpd bundle ships.
+"""Build the pinned musl release into the toolchain that everything else is built with.
 
-The loader is also libc, so it must be built from the exact musl release the
-compiler targets. The pinned source's version and the version the toolchain's own
-loader reports are compared before anything is compiled; a mismatch fails instead
-of shipping a loader whose ABI may not match every object built with musl-gcc.
+A musl-dynamic bundle needs two things that must come from the same release: the
+loader it ships and the libc every object in it was compiled against. Taking them
+from the host means taking whatever release the distribution packages — Ubuntu
+24.04, for one, ships musl 1.2.4 while the pin here is 1.2.5, and a bundle whose
+loader is older than the objects linked against it is exactly the mismatch this
+step exists to prevent. So the pinned source is compiled into a private toolchain:
+headers, crt files, libc.so and musl's own `musl-gcc` wrapper. The host only has to
+provide a C compiler.
+
+The same build produces the shipped loader (musl's `libc.so`, which doubles as the
+dynamic linker) and the compiler every dependency and httpd are built with, so the
+pin is satisfied by construction rather than compared against the host.
 """
 import argparse
 import hashlib
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fetch
 
 LOADER_NAME = "ld-musl-x86_64.so.1"
+# Every linked program requests this interpreter. The bundle's launchers exec the
+# bundled loader themselves, so the kernel never resolves it; keeping the name
+# rather than the build prefix out of PT_INTERP is what makes the ELF portable.
+SYSLOADER = "/lib/" + LOADER_NAME
 
 
 def digest(path):
@@ -33,54 +47,31 @@ def banner_version(path):
     return match[1]
 
 
-def toolchain_loader(compiler):
-    """Ask the compiler for the loader it links every binary against."""
-    path = subprocess.check_output(
-        [compiler, "-print-file-name=" + LOADER_NAME], text=True
-    ).strip()
-    if not Path(path).is_file():
-        raise ValueError("The " + compiler + " toolchain ships no loader: " + path)
-    return Path(path)
+def compile_and_run(command, cwd=None, env=None):
+    result = subprocess.run(command, cwd=cwd, env=env, text=True, capture_output=True)
+    if result.returncode != 0:
+        raise ValueError("%s failed:\n%s%s" % (
+            command[0], result.stdout[-4000:], result.stderr[-4000:]))
+    return result
 
 
-def compile_loader(source, build, compiler):
-    build.mkdir(parents=True, exist_ok=False)
-    environment = {"PATH": "/usr/bin:/bin", "CC": compiler, "LC_ALL": "C", "SOURCE_DATE_EPOCH": "0"}
-    for command in (["sh", str(source / "configure"), "--prefix=/nonexistent",
-                     "--disable-static", "--enable-shared"], ["make", "-j", "2"]):
-        result = subprocess.run(command, cwd=build, env=environment,
-                                text=True, capture_output=True)
-        if result.returncode != 0:
-            raise ValueError("%s failed:\n%s%s" % (
-                command[0], result.stdout[-4000:], result.stderr[-4000:]))
-    libc = build / "lib/libc.so"
-    if not libc.is_file():
-        raise ValueError("musl build did not produce lib/libc.so")
-    return libc
+def host_compiler(compiler):
+    """Prove the host's C compiler links and runs before anything is downloaded.
 
-
-def inspect(libc, version):
-    header = subprocess.check_output(["readelf", "-hW", str(libc)], text=True)
-    if "ELF64" not in header or "Advanced Micro Devices X86-64" not in header:
-        raise ValueError("musl loader is not a Linux x86_64 ELF64 object")
-    if "DYN (Shared object file)" not in header:
-        raise ValueError("musl loader is not a shared object")
-    dynamic = subprocess.check_output(["readelf", "-dW", str(libc)], text=True)
-    if re.search(r"\((?:NEEDED|RPATH|RUNPATH)\)", dynamic):
-        raise ValueError("musl loader must not have dependencies or search paths")
-    symbols = subprocess.check_output(["readelf", "--dyn-syms", "-W", str(libc)], text=True)
-    exported = {line.split()[-1] for line in symbols.splitlines()
-                if len(line.split()) >= 8 and line.split()[6] != "UND"}
-    missing = {"memcpy", "memset", "__stack_chk_fail", "__libc_start_main", "_dlstart"} - exported
-    if missing:
-        raise ValueError("musl loader is missing required exports: " + ", ".join(sorted(missing)))
-    actual = banner_version(libc)
-    if actual != version:
-        raise ValueError("musl loader reports %s, pinned %s" % (actual, version))
-    # musl links its loader without -soname: the loader matches the reserved libc
-    # names (libc.so and friends) to itself in ldso/dynlink.c.
-    return {"path": "lib/musl/" + LOADER_NAME, "sha256": digest(libc), "version": version,
-            "satisfies": ["libc.so"], "entry": "_dlstart", "soname": None}
+    musl is compiled from its pinned source, so the compiler's own libc is never in
+    the bundle; it still has to work, and a broken or missing one must fail here
+    rather than after the dependency build has started.
+    """
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        source = directory / "probe.c"
+        program = directory / "probe"
+        source.write_text("#include <stdio.h>\nint main(void){puts(\"ok\");return 0;}\n")
+        compile_and_run([compiler, "-O2", "-o", str(program), str(source)])
+        result = subprocess.run([str(program)], text=True, capture_output=True)
+        if result.returncode != 0 or result.stdout.strip() != "ok":
+            raise ValueError("The host compiler builds programs that cannot run")
+    return subprocess.check_output([compiler, "--version"], text=True).splitlines()[0]
 
 
 def source_tree(pin, work):
@@ -112,19 +103,149 @@ def source_tree(pin, work):
     return fetch.extract(download, extracted)
 
 
-def build(pin, work, compiler):
-    toolchain = banner_version(toolchain_loader(compiler))
-    if toolchain != pin["version"]:
-        raise ValueError(
-            "Toolchain musl %s differs from the pinned loader %s; the bundle's loader "
-            "and its compiled objects must come from the same release"
-            % (toolchain, pin["version"]))
+def write_wrapper(toolchain, compiler):
+    """Point musl's `musl-gcc` at the compiler that built the toolchain.
+
+    musl's own wrapper execs a bare `gcc`, which a host that only provides `cc`
+    does not have. REALGCC still overrides it, as in upstream's wrapper.
+
+    Both paths are escaped for a double-quoted shell word rather than quoted by
+    shlex: a single-quoted value inside "${REALGCC:-...}" would keep its quotes as
+    characters. The toolchain lives under the build workspace, which may contain
+    spaces.
+    """
+    real = shutil.which(compiler)
+    if not real:
+        raise ValueError("No such compiler: " + compiler)
+
+    def quoted(value):
+        return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$")
+
+    wrapper = toolchain / "bin/musl-gcc"
+    wrapper.write_text(
+        '#!/bin/sh\nexec "${REALGCC:-%s}" "$@" -specs "%s"\n'
+        % (quoted(real), quoted(toolchain / "lib/musl-gcc.specs")))
+    wrapper.chmod(0o755)
+    return real
+
+
+def build_toolchain(source, work, compiler, jobs):
+    """Compile the pinned musl into a private `musl-gcc` and the libc it targets.
+
+    musl derives the wrapper and its specs from --prefix, so the install runs
+    through DESTDIR: the wrapper must name where the toolchain really lives, while
+    `make install` would otherwise try to create /lib/ld-musl-x86_64.so.1 on the
+    build host. The staged tree is moved into place afterwards.
+    """
+    toolchain = work / "toolchain"
+    stage = work / "toolchain-stage"
+    build = work / "musl-build"
+    for path in (toolchain, stage, build):
+        if path.exists():
+            raise ValueError("Refusing to reuse " + str(path))
+    build.mkdir(parents=True)
+    environment = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "SOURCE_DATE_EPOCH": "0"}
+    steps = (
+        (["sh", str(source / "configure"), "--prefix=" + str(toolchain),
+          "--syslibdir=" + str(PurePosixPath(SYSLOADER).parent),
+          "--disable-static", "--enable-shared"],
+         dict(environment, CC=shutil.which(compiler) or compiler)),
+        (["make", "-j", str(jobs)], environment),
+        (["make", "install", "DESTDIR=" + str(stage)], environment),
+    )
+    for command, env in steps:
+        compile_and_run(command, cwd=build, env=env)
+    staged = stage / toolchain.relative_to("/")
+    if staged != toolchain:
+        staged.rename(toolchain)
+    shutil.rmtree(stage)
+    for path in ("bin/musl-gcc", "lib/musl-gcc.specs", "lib/libc.so", "include/stdio.h"):
+        if not (toolchain / path).exists():
+            raise ValueError("The musl toolchain is missing " + path)
+    write_wrapper(toolchain, compiler)
+    return {
+        "cc": str(toolchain / "bin/musl-gcc"),
+        "libc": str(toolchain / "lib/libc.so"),
+        "prefix": str(toolchain),
+        "source": str(source),
+    }
+
+
+def probe_toolchain(toolchain, work, version):
+    """Compile, link and run a program with the toolchain before anything needs it.
+
+    Asking the compiler for its loader (`-print-file-name`) only reports what the
+    host ships, which is the dependency this step removes. A program that links,
+    requests the bundle's loader name and runs under this very libc is evidence the
+    toolchain works — and that it is the pinned release — forty minutes before the
+    last dependency is built.
+    """
+    source = work / "toolchain-probe.c"
+    program = work / "toolchain-probe"
+    source.write_text(
+        "#include <stdio.h>\n"
+        "#include <string.h>\n"
+        "int main(void){char b[8];memset(b,0,sizeof b);puts(\"toolchain-ok\");return b[0];}\n"
+    )
+    # No REALGCC: the wrapper must work as shipped, on the compiler path baked into
+    # it, not only when the caller says which compiler to use.
+    environment = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+    compile_and_run([toolchain["cc"], "-O2", "-o", str(program), str(source)],
+                    env=environment)
+    header = subprocess.check_output(["readelf", "-hW", str(program)], text=True)
+    if "ELF64" not in header or "Advanced Micro Devices X86-64" not in header:
+        raise ValueError("The musl toolchain does not produce Linux x86_64 ELF64 objects")
+    dynamic = subprocess.check_output(["readelf", "-dW", str(program)], text=True)
+    if re.search(r"\((?:RPATH|RUNPATH)\)", dynamic):
+        raise ValueError("The musl toolchain adds a search path to every object")
+    interpreter = re.search(r"Requesting program interpreter: \[?([^\]\n]+)\]?",
+                            subprocess.check_output(["readelf", "-lW", str(program)], text=True))
+    if not interpreter or interpreter[1] != SYSLOADER:
+        raise ValueError("The toolchain requests %s instead of %s"
+                         % (interpreter[1] if interpreter else "no interpreter", SYSLOADER))
+    # The bundled loader is executed the way the launchers execute it: as the
+    # program's interpreter, named explicitly. PT_INTERP above is a name only.
+    result = subprocess.run([toolchain["libc"], str(program)], text=True, capture_output=True)
+    if result.returncode != 0 or result.stdout.strip() != "toolchain-ok":
+        raise ValueError("A program built with the toolchain does not run:\n" + result.stderr)
+    actual = banner_version(toolchain["libc"])
+    if actual != version:
+        raise ValueError("Toolchain musl %s is not the pinned %s" % (actual, version))
+
+
+def inspect(libc, version):
+    header = subprocess.check_output(["readelf", "-hW", str(libc)], text=True)
+    if "ELF64" not in header or "Advanced Micro Devices X86-64" not in header:
+        raise ValueError("musl loader is not a Linux x86_64 ELF64 object")
+    if "DYN (Shared object file)" not in header:
+        raise ValueError("musl loader is not a shared object")
+    dynamic = subprocess.check_output(["readelf", "-dW", str(libc)], text=True)
+    if re.search(r"\((?:NEEDED|RPATH|RUNPATH)\)", dynamic):
+        raise ValueError("musl loader must not have dependencies or search paths")
+    symbols = subprocess.check_output(["readelf", "--dyn-syms", "-W", str(libc)], text=True)
+    exported = {line.split()[-1] for line in symbols.splitlines()
+                if len(line.split()) >= 8 and line.split()[6] != "UND"}
+    missing = {"memcpy", "memset", "__stack_chk_fail", "__libc_start_main", "_dlstart"} - exported
+    if missing:
+        raise ValueError("musl loader is missing required exports: " + ", ".join(sorted(missing)))
+    actual = banner_version(libc)
+    if actual != version:
+        raise ValueError("musl loader reports %s, pinned %s" % (actual, version))
+    # musl links its loader without -soname: the loader matches the reserved libc
+    # names (libc.so and friends) to itself in ldso/dynlink.c.
+    return {"path": "lib/musl/" + LOADER_NAME, "sha256": digest(libc), "version": version,
+            "satisfies": ["libc.so"], "entry": "_dlstart", "soname": None}
+
+
+def build(pin, work, compiler, jobs):
     source = source_tree(dict(pin, name="musl"), work)
-    libc = compile_loader(source, work / "musl-build", compiler)
+    toolchain = build_toolchain(source, work, compiler, jobs)
+    probe_toolchain(toolchain, work, pin["version"])
+    libc = Path(toolchain["libc"])
     record = inspect(libc, pin["version"])
     record["source"] = str(libc)
     record["license"] = {"path": str(source / "COPYRIGHT"), "sha256": digest(source / "COPYRIGHT")}
-    return libc, record
+    return libc, toolchain, record
 
 
 def main():
@@ -132,12 +253,14 @@ def main():
     parser.add_argument("request", type=Path, help="plan JSON printed by source.py")
     parser.add_argument("work", type=Path, help="build workspace, already holding downloads/")
     parser.add_argument("metadata", type=Path)
-    parser.add_argument("--compiler", default="cc")
+    parser.add_argument("--compiler", default="cc",
+                        help="host C compiler that builds the pinned musl toolchain")
+    parser.add_argument("--jobs", type=int, default=2)
     parser.add_argument("--probe-only", action="store_true",
-                        help="check the toolchain against the pin and stop")
+                        help="check the host compiler and stop")
     args = parser.parse_args()
-    # compile_loader runs configure with cwd set to the build directory, so a
-    # relative workspace would be re-resolved from there and find nothing.
+    # Every build step runs with cwd set elsewhere, so a relative workspace would
+    # be re-resolved from there and find nothing.
     args.work = args.work.resolve()
     request = json.loads(args.request.read_text())
     pins = [entry for entry in request["dependencies"] if entry["role"] == "loader"]
@@ -145,19 +268,19 @@ def main():
         raise ValueError("The plan must pin exactly one loader source")
     pin = dict(pins[0], name="musl")
     if args.probe_only:
-        actual = banner_version(toolchain_loader(args.compiler))
-        if actual != pin["version"]:
-            raise ValueError("Toolchain musl %s is not the pinned %s" % (actual, pin["version"]))
-        print(actual)
+        print(host_compiler(args.compiler))
         return
-    loader, record = build(pin, args.work, args.compiler)
+    loader, toolchain, record = build(pin, args.work, args.compiler, args.jobs)
     args.metadata.parent.mkdir(parents=True, exist_ok=True)
     args.metadata.write_text(json.dumps(record, indent=2) + "\n")
-    print(loader)
+    # The compiler path is announced here rather than recomputed by the caller: it
+    # lives inside this build's workspace and only this step knows where.
+    print(json.dumps({"loader": str(loader), "cc": toolchain["cc"],
+                      "version": record["version"]}))
 
 
 if __name__ == "__main__":
     try:
         main()
     except (ValueError, OSError, subprocess.CalledProcessError) as exc:
-        sys.exit("musl loader build failed: %s\n" % exc)
+        sys.exit("musl toolchain build failed: %s\n" % exc)

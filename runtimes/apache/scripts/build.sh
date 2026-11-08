@@ -47,7 +47,9 @@ if [[ "$(uname -s)" != Linux || "$(uname -m)" != x86_64 ]]; then
   exit 1
 fi
 
-compiler="${APACHE_CC:-musl-gcc}"
+compiler="${APACHE_CC:-cc}"
+# The host provides only a C compiler. musl itself is compiled from the pinned
+# source by loader.py, so the distro's musl-tools version never reaches the bundle.
 # mod_md and mod_proxy_html need a working curl/perl toolchain at build time;
 # pkg-config is how every child configure finds the staging prefix.
 for tool in "$compiler" make perl pkg-config cmake curl readelf strip ar ranlib tar; do
@@ -72,22 +74,24 @@ work="$(mktemp -d "$REPO_ROOT/.cache/apache/build.XXXXXXXX")"
 printf 'Apache build workspace: %s\n' "$work"
 printf '%s\n' "$plan" > "$work/plan.json"
 
-# The toolchain probe runs before anything is downloaded: a musl-gcc that is not
-# musl, or a loader whose version disagrees with the pinned source, must fail here
-# rather than after forty minutes of compiling.
+# The host-compiler probe runs before anything is downloaded: a compiler that
+# cannot build and run a program must fail here rather than after forty minutes.
 python3 -I "$SCRIPTS/loader.py" "$work/plan.json" "$work" "$work/loader.json" \
   --compiler "$compiler" --probe-only >/dev/null
 python3 -I "$SCRIPTS/fetch.py" "$work" "$work/plan.json" > "$work/sources.json"
-# The loader is built before the dependencies so an ABI mismatch stops the run
-# before the expensive part; it reuses fetch.py's verified musl extraction.
-python3 -I "$SCRIPTS/loader.py" "$work/plan.json" "$work" "$work/loader.json" \
-  --compiler "$compiler" >/dev/null
-python3 -I "$SCRIPTS/deps.py" "$work/sources.json" "$work/prefix" --jobs "$jobs"
+# The pinned musl toolchain is built before the dependencies so an unusable
+# compiler stops the run before the expensive part; it reuses fetch.py's verified
+# musl extraction and reports the compiler path every later step must use.
+toolchain="$(python3 -I "$SCRIPTS/loader.py" "$work/plan.json" "$work" "$work/loader.json" \
+  --compiler "$compiler" --jobs "$jobs")"
+cc="$(python3 -I -c 'import json,sys; print(json.load(sys.stdin)["cc"])' <<< "$toolchain")"
+printf 'Pinned musl toolchain: %s\n' "$cc"
+python3 -I "$SCRIPTS/deps.py" "$work/sources.json" "$work/prefix" --cc "$cc" --jobs "$jobs"
 # fetch.py reports the archive root inside each extraction directory, so every
 # later step takes the resolved tree from the map rather than the wrapper.
 httpd_source="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["httpd"])' "$work/sources.json")"
 python3 -I "$SCRIPTS/httpd.py" "$httpd_source" "$work/build" "$work/prefix" "$work/install" \
-  --jobs "$jobs" > "$work/census.log"
+  --cc "$cc" --jobs "$jobs" > "$work/census.log"
 python3 -I "$SCRIPTS/request.py" "$work/plan.json" "$work/sources.json" "$work/build/apache-census.json" \
   "$work/loader.json" "$work/install" "$work/prefix" "$work/request.json" --mpm "$mpm" >/dev/null
 python3 -I "$SCRIPTS/stage.py" "$work/request.json" "$bundle"

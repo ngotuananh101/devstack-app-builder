@@ -180,12 +180,13 @@ and `htdocs/index.html` ship as Lounge ships them.
 ### Vendored dependency set
 
 Every library is downloaded over HTTPS, digest-verified **before** extraction, built
-with `musl-gcc` into one staging prefix, and installed into `<root>/lib`. Exact
-versions live in `config/sources.json` with reviewed SHA-256.
+with the musl toolchain compiled from the pinned musl source into one staging prefix,
+and installed into `<root>/lib`. Exact versions live in `config/sources.json` with
+reviewed SHA-256.
 
 | Dependency | Needed by | Notes |
 |---|---|---|
-| musl | loader | same pin as `runtimes/php/config/musl.json` |
+| musl | loader + toolchain | same pin as `runtimes/php/config/musl.json`; compiled into the build's own `musl-gcc` |
 | APR 1.7.6 | core | |
 | APR-util 1.6.6 | core | `--with-expat --with-openssl --with-ldap --with-sqlite3 --with-odbc --enable-util-dso` |
 | httpd 2.4.70 | — | no rpath |
@@ -295,13 +296,19 @@ root and Lounge's `LoadModule` lines say `modules/...`.
 - `scripts/source.py` — validates one exact version against `config/sources.json`,
   resolves the dependency graph, emits `--print-plan`, downloads, verifies and
   extracts each archive into its own fresh directory.
+- `scripts/loader.py` — compiles the pinned musl into a private toolchain (its own
+  `musl-gcc` wrapper and specs, `--syslibdir=/lib`), proves it by compiling and
+  running a program with it, and returns both the loader to ship and the compiler
+  path every later step uses.
 - `scripts/deps.py` — builds the pinned set into a staging prefix in dependency
   order: zlib → OpenSSL → PCRE2 → brotli → nghttp2 → jansson → expat → libxml2 →
   Lua → OpenLDAP → sqlite3 → unixODBC → curl → APR → APR-util → httpd.
 - `scripts/build.sh` — Redis's shape: arg validation, `--print-plan`, host/tool
-  checks (`musl-gcc`, `make`, `perl`, `pkg-config`, `readelf`, `strip`, `curl`, `ar`,
-  `ranlib`), refuses to replace an existing bundle, then probe → download → deps →
-  httpd → stage → verify → package.
+  checks (`cc`, `make`, `perl`, `pkg-config`, `readelf`, `strip`, `curl`, `ar`,
+  `ranlib`), refuses to replace an existing bundle, then probe → download →
+  toolchain → deps → httpd → stage → verify → package. The host provides no musl:
+  `loader.py` builds the pinned release into a private toolchain, and `deps.py` and
+  `httpd.py` are handed its compiler path.
 - `scripts/stage.py` — installs httpd into `libexec/bin`, generates launchers from
   one template, moves DSOs to `modules/`, libraries to `lib/`, stages config, htdocs,
   include, licenses, sources, writes `manifest.json`.
