@@ -139,7 +139,8 @@ def _fetch(pin, downloads):
         if attempt:
             time.sleep(FETCH_RETRY_DELAYS[attempt - 1])
         result = subprocess.run(
-            ["curl", "--fail", "--location", "--proto", "=https", "--proto-redir", "=https",
+            ["curl", "--fail", "--silent", "--show-error", "--location",
+             "--proto", "=https", "--proto-redir", "=https",
              "--max-time", "600", "--output", str(temporary), pin["url"]],
             text=True, capture_output=True,
         )
