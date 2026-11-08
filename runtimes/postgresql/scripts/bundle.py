@@ -408,7 +408,9 @@ def portable_interpreters(output):
     by name rather than staged into a bundle that cannot launch it.
     """
     output = Path(output)
-    commands = {output / "bin" / name for name in launchers.commands(output)}
+    # Compared as tree-relative names so the check does not depend on how the
+    # caller spelled `output` (absolute, relative, or through a symlink).
+    commands = {f"bin/{name}" for name in launchers.commands(output)}
     changed = 0
     for path in sorted(output.rglob("*")):
         if path.is_symlink() or not path.is_file():
@@ -418,7 +420,8 @@ def portable_interpreters(output):
         with path.open("rb") as stream:
             if stream.read(4) != b"\x7fELF":
                 continue
-        if program_interpreter(path) is None and path not in commands:
+        relative = path.relative_to(output).as_posix()
+        if program_interpreter(path) is None and relative not in commands:
             continue
         changed += bool(portable_interpreter(path))
     return changed
