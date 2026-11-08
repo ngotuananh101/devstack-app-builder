@@ -71,5 +71,9 @@ printf 'Staged bundle: %s\n' "$bundle"
 # musl loader masked away. A failure here leaves the tree in place — it is the
 # only evidence of what went wrong — and must never reach packaging.
 python3 -I "$RUNTIME_DIR/scripts/bundle.py" verify "$bundle"
+# Packaging names the assets after the manifest's own identity and refuses to
+# replace any of them, so a rerun of a version that already shipped stops here
+# rather than silently overwriting a published archive.
+python3 -I "$RUNTIME_DIR/scripts/bundle.py" package "$bundle" "$REPO_ROOT/dist/assets"
 printf 'Verified bundle: %s\n' "$bundle"
 printf 'PostgreSQL build workspace: %s\n' "$work"

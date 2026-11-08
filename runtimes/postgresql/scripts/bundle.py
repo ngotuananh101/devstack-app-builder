@@ -1152,19 +1152,27 @@ def _icu(root, manifest, env):
     """Prove ICU is linked and used, or that it is absent, as a checked fact."""
     psql = root / "bin/psql"
     if any(row["name"] == "icu" for row in manifest["libraries"]):
+        # The comparison collation is "C", never a locale-derived name. A fresh
+        # cluster only knows a name such as "C.utf8" because initdb ran
+        # pg_import_system_collations, which enumerates the host's `locale -a`
+        # (src/backend/commands/collationcmds.c). Naming one of those would make
+        # this proof fail on a host whose catalogue lacks it, turning a
+        # host-independent verification into a host-dependent one. "C" is byte
+        # order, exists in every major without consulting the host, and keeps
+        # the discriminator intact — see the assertion below.
         script = ("CREATE COLLATION verify_icu (provider = icu, locale = 'en-US');\n"
                   "SELECT ('B' < 'a' COLLATE verify_icu) AS icu_order,\n"
-                  "       ('B' < 'a' COLLATE \"C.utf8\") AS builtin_order;\n")
+                  "       ('B' < 'a' COLLATE \"C\") AS builtin_order;\n")
         try:
             output = _psql(psql, ["-f", "-"], env, stdin=script)
         except ValueError as exc:
             raise ValueError(f"ICU is recorded as linked but its collation failed: {exc}") from exc
         # ICU compares letters before case, so 'B' < 'a' is false there, while
-        # the builtin C.utf8 collation is byte order and makes it true. A module
-        # that fell back to the builtin ordering would print t for both, which
-        # is exactly what this rejects. (The builtin collation's name really is
-        # "C.utf8" — not the C.UTF-8 locale name initdb was given.) Unaligned
-        # mode separates the two columns with a pipe, hence the split on both.
+        # the C collation is byte order, where 'B' (0x42) precedes 'a' (0x61)
+        # and the comparison is true. A module that fell back to byte order
+        # would print t for both, which is exactly what this rejects.
+        # Unaligned mode separates the two columns with a pipe, hence the
+        # split on both.
         orders = output.strip().replace("|", " ").split()
         if orders != ["f", "t"]:
             raise ValueError("ICU collation did not order differently from the builtin one "
@@ -1337,6 +1345,58 @@ def verify(bundle):
     return {"checks": names, "strategy": strategy}
 
 
+def package(bundle, output):
+    """Write the three named assets for a bundle whose verification passed.
+
+    The name is the identity the caller downloads by, so every part is checked
+    against a conservative character class before anything is created: a
+    build_id carrying a slash or a newline would otherwise choose the path.
+
+    Nothing gathered here is inferred from the filesystem: `verification` is
+    read from the manifest verify() wrote, so an unverified or half-verified
+    tree cannot be packaged by mistake. Redis's reservation order is kept
+    deliberately — all three paths are claimed with exclusive opens first, and
+    only paths this call created are ever unlinked, so a collision leaves the
+    directory exactly as it was found.
+    """
+    bundle = Path(bundle)
+    output = Path(output)
+    manifest = json.loads((bundle / "manifest.json").read_text())
+    if manifest.get("runtime") != "postgresql" or manifest.get("verification") != "PASSED":
+        raise ValueError("Real PostgreSQL verification must pass before packaging")
+    parts = [manifest["postgresql"]["version"], manifest["target"],
+             manifest["architecture"], manifest["build_id"]]
+    if any(not re.fullmatch(r"[a-zA-Z0-9_.-]+", str(part)) for part in parts):
+        raise ValueError("Invalid PostgreSQL archive identity")
+    name = "postgresql-" + "-".join(parts)
+    output.mkdir(parents=True, exist_ok=True)
+    archive = output / (name + ".tar.gz")
+    checksum = output / (name + ".tar.gz.sha256")
+    sidecar = output / (name + ".manifest.json")
+    paths = (archive, checksum, sidecar)
+    if any(path.exists() or path.is_symlink() for path in paths):
+        raise FileExistsError("Refusing to replace PostgreSQL assets: " + name)
+    created = []
+    try:
+        # Reserve the entire asset set exclusively; unwind only paths we created.
+        with archive.open("xb") as stream:
+            created.append(archive)
+            with checksum.open("x") as sums:
+                created.append(checksum)
+                with sidecar.open("x") as metadata:
+                    created.append(sidecar)
+                    with tarfile.open(fileobj=stream, mode="w:gz") as tar:
+                        tar.add(bundle, arcname=name)
+                    stream.flush()
+                    sums.write(digest(archive) + "  " + archive.name + "\n")
+                    metadata.write(json.dumps(manifest, indent=2) + "\n")
+    except Exception:
+        for path in created:
+            path.unlink()
+        raise
+    return archive
+
+
 def _main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1348,6 +1408,9 @@ def _main():
     stage_command.add_argument("repo_root", type=Path)
     verify_command = sub.add_parser("verify", help="Prove a staged bundle is a working server")
     verify_command.add_argument("bundle", type=Path)
+    package_command = sub.add_parser("package", help="Write the publishable assets")
+    package_command.add_argument("bundle", type=Path)
+    package_command.add_argument("output", type=Path)
     args = parser.parse_args()
     if args.command == "stage":
         stage(args.install_root, args.output,
@@ -1359,6 +1422,8 @@ def _main():
         for name in result["checks"]:
             print(name)
         print(f"verification strategy: {result['strategy']}")
+    else:
+        print(package(args.bundle, args.output))
 
 
 if __name__ == "__main__":
