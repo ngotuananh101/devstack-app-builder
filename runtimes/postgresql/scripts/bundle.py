@@ -846,6 +846,24 @@ def _mask_arguments(workspace):
     return arguments
 
 
+# bwrap's own wording when the kernel refuses it the user namespace. Ubuntu
+# 24.04 ships `kernel.apparmor_restrict_unprivileged_userns=1`, which denies the
+# uid map to every unconfined binary, and the resulting "Permission denied" is
+# indistinguishable from an ordinary permission bug unless it is named.
+USER_NAMESPACE_REFUSAL = "setting up uid map"
+
+# What actually lifts that refusal without weakening the host: an AppArmor
+# profile granting `userns` to /usr/bin/bwrap. Verified on a GitHub-hosted
+# ubuntu-24.04 runner (2026-11-08): with the profile loaded the mask creates
+# and a zero-byte file really does make the host loader unusable, while the
+# sysctl stays at its secure default. Turning the sysctl down would do the same
+# job for the whole machine, which is why it is not the recommendation.
+APPARMOR_ADVICE = (
+    "this is Ubuntu 24.04's kernel.apparmor_restrict_unprivileged_userns, not a "
+    "bundle fault; load an AppArmor profile granting `userns` to /usr/bin/bwrap "
+    "(see the bubblewrap step in .github/workflows/build.yml)")
+
+
 def _bwrap_diagnosis():
     """Whether bwrap can mask right now, and why not when it cannot.
 
@@ -871,7 +889,12 @@ def _bwrap_diagnosis():
     if result.returncode == 0:
         return True, "bwrap created the mask"
     detail = (result.stderr.strip() or result.stdout.strip()).splitlines()
-    return False, f"bwrap exit {result.returncode}: {detail[-1] if detail else 'no output'}"
+    reason = f"bwrap exit {result.returncode}: {detail[-1] if detail else 'no output'}"
+    # Tie the advice to the symptom it explains. A blanket hint on every failure
+    # would send an operator chasing AppArmor for a missing mount point.
+    if USER_NAMESPACE_REFUSAL in "\n".join(detail):
+        reason += f" ({APPARMOR_ADVICE})"
+    return False, reason
 
 
 def _bwrap_usable():

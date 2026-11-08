@@ -183,7 +183,18 @@ Real check counts recorded in `manifest.json`: **124 checks** for 17.11 and **13
 
 **Only a `bwrap` verification is publishable.** `publish.py` rejects a PostgreSQL bundle whose `verification_strategy` is `"poison-file"`, because that probe proves strictly less: it shows the bundle's commands resolve every vendored library through the launcher's `--library-path`, but it never enters a sandbox where the host's own loader is unusable. The fallback is a build-host convenience, not publication evidence.
 
-**A GitHub-hosted `ubuntu-24.04` runner does not produce a publishable PostgreSQL bundle.** It installs bubblewrap, but `bwrap` there does not create the user namespace the mask needs, so `verify` takes the poison fallback and prints the reason it read from `bwrap`. The CI build therefore proves the bundle builds, stages and runs a real cluster; publication has to run on a host where `bwrap` works (a self-hosted runner or a workstation), where the same `./build.sh postgresql <version>` records `verification_strategy: "bwrap"`.
+**A GitHub-hosted `ubuntu-24.04` runner *can* produce a publishable bundle, but only once bwrap is allowed a user namespace.** The image sets `kernel.apparmor_restrict_unprivileged_userns=1`, so an unconfined `bwrap` gets `bwrap: setting up uid map: Permission denied` and verification falls back to `poison-file` — which is exactly the failure a `publish=true` run hits at `validate_assets` with `Invalid archive identity`. The fix is an AppArmor profile granting `userns` to `/usr/bin/bwrap` alone:
+
+```
+abi <abi/4.0>,
+include <tunables/global>
+profile bwrap-userns-restrict /usr/bin/bwrap flags=(unconfined) {
+  userns,
+  include if exists <local/bwrap-userns-restrict>
+}
+```
+
+`sudo apparmor_parser -r` after writing it to `/etc/apparmor.d/`; the `build-postgresql` job does this in its own step and then runs one bare `bwrap --dev-bind / /` to fail early rather than forty minutes into the build. Measured on the image (2026-11-08): with the profile loaded and the sysctl still at `1`, `bwrap --dev-bind / /` exits `0`, and masking a real host file with a zero-byte mount makes `/bin/sh` exit `127` — the mask is genuinely effective, not merely permitted. Do **not** reach for `sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` instead: it loosens the whole machine to verify one bundle, and it is not needed. `unshare -Ur` still fails with the profile in place, which is expected — the permission is granted to that one binary, not to the shell.
 
 ### Assets and the never-overwrite rule
 

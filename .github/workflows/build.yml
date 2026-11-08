@@ -160,15 +160,39 @@ jobs:
         run: |
           # Zig, OpenSSL, zlib, libxml2, ICU and util-linux are fetched and
           # digest-verified by the build script; only these host tools are apt's.
-          # bubblewrap is not a build dependency: it is how verification hides
-          # every host musl loader before starting a server, and publication
-          # accepts only a bundle verified that way. On this image bwrap does not
-          # create the user namespace the mask needs, so verify takes the
-          # poison-file fallback and prints bwrap's own reason; the bundle is then
-          # not publishable from here. The job still proves the bundle builds,
-          # stages and runs a real cluster; publication runs where bwrap works.
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends bison flex perl build-essential binutils curl bubblewrap
+      - name: Let bwrap create the user namespace verification needs
+        run: |
+          # bubblewrap is not a build dependency: it is how verification hides
+          # every host musl loader before starting a server, and publication
+          # accepts only a bundle verified that way. Ubuntu 24.04 ships
+          # kernel.apparmor_restrict_unprivileged_userns=1, which denies an
+          # unconfined binary the uid map, so bwrap dies with "setting up uid
+          # map: Permission denied" and verify would fall back to the poison
+          # probe that publish.py refuses.
+          #
+          # A profile granting `userns` to /usr/bin/bwrap fixes that for this
+          # binary alone. The alternative — sysctl -w
+          # kernel.apparmor_restrict_unprivileged_userns=0 — would loosen the
+          # whole machine to verify one bundle, and this profile is the
+          # documented upstream workaround. Measured on this image 2026-11-08:
+          # with the profile loaded the mask creates and a zero-byte file over
+          # the host loader really does stop /bin/sh from running, while the
+          # sysctl keeps its secure default.
+          sudo tee /etc/apparmor.d/bwrap-userns-restrict >/dev/null <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+          profile bwrap-userns-restrict /usr/bin/bwrap flags=(unconfined) {
+            userns,
+            include if exists <local/bwrap-userns-restrict>
+          }
+          PROFILE
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+          # Fail here, not forty minutes later inside verification, if the mask
+          # still cannot be created.
+          bwrap --dev-bind / / -- /bin/true
+          echo "bwrap can create its user namespace"
       - name: Build, verify a real server lifecycle, and package
         env:
           BUILD_VERSION: ${{ matrix.postgresql_version }}

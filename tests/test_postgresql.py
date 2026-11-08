@@ -2715,6 +2715,45 @@ class PostgreSQLVerifyTests(unittest.TestCase):
             self.assertEqual(self.bundle._bwrap_diagnosis(),
                              (False, "bwrap is not installed"))
 
+    def test_the_diagnosis_says_what_permission_denied_on_the_uid_map_means(self):
+        # Ubuntu 24.04 ships `kernel.apparmor_restrict_unprivileged_userns=1`, so
+        # bwrap dies with "setting up uid map: Permission denied" and bare
+        # "Permission denied" reads as a bug in the bundle rather than as the
+        # kernel policy it is. The runner fixes it by loading an AppArmor
+        # profile that grants `userns` to /usr/bin/bwrap; naming that is what
+        # turns a failed publish into an action.
+        with mock.patch.object(self.bundle.shutil, "which", return_value="/usr/bin/bwrap"), \
+                mock.patch.object(self.bundle, "_mask_arguments", return_value=[]), \
+                mock.patch.object(self.bundle, "_workspace", return_value=Path("/tmp/pg-x")), \
+                mock.patch.object(self.bundle.shutil, "rmtree"), \
+                mock.patch.object(self.bundle.subprocess, "run",
+                                  return_value=subprocess.CompletedProcess(
+                                      [], 1, "",
+                                      "bwrap: setting up uid map: Permission denied\n")):
+            usable, reason = self.bundle._bwrap_diagnosis()
+        self.assertFalse(usable)
+        self.assertIn("setting up uid map", reason)
+        self.assertIn("apparmor_restrict_unprivileged_userns", reason)
+        self.assertIn("userns", reason)
+
+    def test_an_unrelated_bwrap_failure_gets_no_apparmor_advice(self):
+        # The advice must be tied to the symptom it explains. A missing mount
+        # point or a bad argument would be misdiagnosed by a blanket hint, and a
+        # wrong hint is worse than none: it sends the operator to a fix that
+        # cannot work.
+        with mock.patch.object(self.bundle.shutil, "which", return_value="/usr/bin/bwrap"), \
+                mock.patch.object(self.bundle, "_mask_arguments", return_value=[]), \
+                mock.patch.object(self.bundle, "_workspace", return_value=Path("/tmp/pg-x")), \
+                mock.patch.object(self.bundle.shutil, "rmtree"), \
+                mock.patch.object(self.bundle.subprocess, "run",
+                                  return_value=subprocess.CompletedProcess(
+                                      [], 1, "",
+                                      "bwrap: Can't find source path /nope\n")):
+            usable, reason = self.bundle._bwrap_diagnosis()
+        self.assertFalse(usable)
+        self.assertIn("Can't find source path", reason)
+        self.assertNotIn("apparmor_restrict_unprivileged_userns", reason)
+
     def test_a_poison_fallback_states_its_reason_and_that_it_publishes_nothing(self):
         # The fallback must be visible where the conclusion is printed. Silence
         # here is how a runner with a broken mask reads as a clean verification.
