@@ -333,6 +333,11 @@ def program_interpreter(path):
     blob = Path(path).read_bytes()
     if blob[:4] != b"\x7fELF":
         return None
+    # A file that claims to be an ELF but cannot hold the header is not a
+    # program. Saying so beats a struct.error from deep inside the unpack,
+    # which names no file and no cause.
+    if len(blob) < EHDR.size:
+        return None
     header = EHDR.unpack_from(blob)
     phoff, phentsize, phnum = header[5], header[9], header[10]
     for index in range(phnum):
@@ -1438,6 +1443,35 @@ def pg_config_paths(root, strategy="bwrap"):
     return dict(zip(("bindir", "sharedir", "libdir", "pkglibdir"), values))
 
 
+def _check_program_interpreters(bundle):
+    """Every staged program names the portable loader, not a build path.
+
+    `_verify_binaries` reads the manifest, and the manifest lists `libexec/bin`
+    only. A build-workspace interpreter left in ``lib/pgxs``'s three programs
+    (`pg_regress`, `pg_isolation_regress`, `isolationtester`) would therefore
+    appear in no record and pass verification, while a relocated bundle could
+    not run them. The tree is walked instead, the same way `stage()` walks it.
+
+    A file with no PT_INTERP is a shared object or plain data and is skipped;
+    this check asks only that a program which *does* name an interpreter names
+    the one the bundle ships.
+    """
+    bundle = Path(bundle)
+    wrong = []
+    for path in sorted(bundle.rglob("*")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        with path.open("rb") as stream:
+            if stream.read(4) != b"\x7fELF":
+                continue
+        current = program_interpreter(path)
+        if current is not None and current != INTERPRETER:
+            wrong.append(f"{path.relative_to(bundle).as_posix()} asks for {current!r}")
+    if wrong:
+        raise ValueError("Staged programs name the wrong interpreter instead of "
+                         f"{INTERPRETER}: " + "; ".join(wrong))
+
+
 def _check_launchers(bundle):
     """bin/ is exactly one shell launcher per raw binary, and never a raw ELF.
 
@@ -1557,6 +1591,10 @@ def verify(bundle):
     _verify_manifest(bundle, manifest)
     _verify_binaries(bundle, manifest)
     _check_launchers(bundle)
+    # The tree, not the manifest: the manifest records libexec/bin, and a
+    # build-workspace interpreter in one of the unlaunched lib/pgxs programs
+    # never reaches it.
+    _check_program_interpreters(bundle)
     # The bundle goes in: on a host where bwrap cannot create namespaces the
     # poison probe is the only proof available, and it needs a bundle to probe.
     # Without this argument that branch is unreachable and every such host

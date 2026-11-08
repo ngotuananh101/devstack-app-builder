@@ -2473,6 +2473,42 @@ class PostgreSQLVerifyTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "postgres-real"):
                 self.bundle._check_launchers(bundle)
 
+    def test_verify_refuses_a_program_that_still_names_the_build_loader(self):
+        # stage() rewrites every program's PT_INTERP, and this proves it without
+        # trusting the walk that did it. A manifest-only check cannot: the three
+        # programs under lib/pgxs run without a launcher and appear in no
+        # manifest entry, so a bundle carrying a build-workspace loader path in
+        # pg_regress would report PASSED and then fail on every other machine.
+        if not shutil.which("cc") or not shutil.which("readelf"):
+            self.skipTest("ELF fixture compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = self.staged(root)
+            program = bundle / "lib/pgxs/src/test/regress/pg_regress"
+            program.parent.mkdir(parents=True)
+            # A NEEDED library is what makes the linker keep a PT_INTERP; with
+            # nothing to resolve the program links without one and says nothing.
+            build_library(bundle / "lib/libpq.so.5", "libpq.so.5")
+            build_elf(root, program, needed=("libpq.so.5",), search=bundle / "lib",
+                      interpreter=str(root / "work/loader.so"))
+            program.chmod(0o755)
+            self.assertEqual(self.bundle.program_interpreter(program),
+                             str(root / "work/loader.so"))
+            with self.assertRaisesRegex(ValueError, "pg_regress"):
+                self.bundle._check_program_interpreters(bundle)
+            self.bundle.set_interpreter(program, self.bundle.INTERPRETER)
+            self.bundle._check_program_interpreters(bundle)
+
+    def test_verify_leaves_shared_objects_out_of_the_interpreter_check(self):
+        # A staged .so has no PT_INTERP; the check must skip it rather than
+        # refuse a bundle over a file that legitimately asks for nothing.
+        if not shutil.which("cc"):
+            self.skipTest("C compiler is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            bundle = Path(temp) / "bundle"
+            build_library(bundle / "lib/libpq.so.5", "libpq.so.5")
+            self.bundle._check_program_interpreters(bundle)
+
     def test_verify_refuses_a_launcher_with_no_raw_binary(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

@@ -166,10 +166,11 @@ Because `builtin` with `C.UTF-8` requires UTF-8 encoding, `initdb` must always b
 
 The `verify` subcommand is the sole writer of the `verification` field in `manifest.json`. Verification performs:
 1. Re-hashes every file recorded in the manifest against its recorded SHA-256.
-2. Runs a complete cluster lifecycle (`initdb` -> postmaster startup -> client connection via `psql` -> clean shutdown) entirely through the `bin/` launchers.
-3. Relocation test: repeats the complete cluster lifecycle from a copy relocated to a temporary path containing spaces and a `#` character.
-4. Host loader masking: isolates the test environment to prove that the bundle relies on no host musl files. The primary isolation strategy uses `bwrap` (Bubblewrap) with `--dev-bind / /` and zero-byte mounts over host loader locations (`/lib`, `/lib64`, `/usr/lib`, `/usr/lib64` loader names and musl-dev trees), recorded as `verification_strategy: "bwrap"`. If user namespaces cannot be created, it falls back to a poison-file probe. If neither isolation method is available, verification fails.
-5. Per-kind module exercises:
+2. Walks the whole bundle tree and refuses any ELF whose `PT_INTERP` is not `/lib/ld-musl-x86_64.so.1`. This cannot be read off the manifest: the manifest records `libexec/bin`, while `install-world-bin` also puts `pg_regress`, `pg_isolation_regress` and `isolationtester` under `lib/pgxs`, which no launcher wraps and no manifest entry names. A build-workspace loader left in one of those would pass every other check and then fail on any machine but the build host.
+3. Runs a complete cluster lifecycle (`initdb` -> postmaster startup -> client connection via `psql` -> clean shutdown) entirely through the `bin/` launchers.
+4. Relocation test: repeats the complete cluster lifecycle from a copy relocated to a temporary path containing spaces and a `#` character.
+5. Host loader masking: isolates the test environment to prove that the bundle relies on no host musl files. The primary isolation strategy uses `bwrap` (Bubblewrap) with `--dev-bind / /` and zero-byte mounts over host loader locations (`/lib`, `/lib64`, `/usr/lib`, `/usr/lib64` loader names and musl-dev trees), recorded as `verification_strategy: "bwrap"`. If user namespaces cannot be created, it falls back to a poison-file probe. If neither isolation method is available, verification fails.
+6. Per-kind module exercises:
    - `sql`: executes `CREATE EXTENSION <name>;`.
    - `shared`: executes `CREATE EXTENSION <name>;` followed by a SQL query that invokes internal C functions to ensure DSO symbols resolved.
    - `preload`: starts a dedicated postmaster with `shared_preload_libraries` set to the exact list of preloaded modules.
