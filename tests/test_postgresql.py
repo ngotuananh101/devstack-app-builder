@@ -1826,7 +1826,8 @@ class PostgreSQLVerifyTests(unittest.TestCase):
             if any("version()" in str(argument) for argument in arguments):
                 return f"PostgreSQL {version} on x86_64-pc-linux-gnu\n"
             if stdin and "COLLATE" in stdin:
-                # What the real bundle prints: ICU orders B before a, builtin C.utf8 does not.
+                # What the real bundle prints: ICU orders B before a, byte order
+                # (COLLATE "C") does not, so the pair is f then t.
                 return "f|t\n"
             return "t\n"
         return respond
