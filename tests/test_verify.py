@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import unittest.mock
 from test_build import load, REPO
 
 
@@ -218,11 +219,25 @@ class VerifyContracts(unittest.TestCase):
             self.assertEqual(report["extension_dir"], str(root / "lib/php/extensions"))
             self.assertEqual(report["probed_module"], "opcache")
             # Without the exported root the same INI must fail loudly, not fall
-            # back to the compile-time directory.
-            (root / "libexec/launch.sh").write_text("#!/bin/sh\nexport PHPRC=\"$ROOT/etc/php.ini\"\n")
+            # back to the compile-time directory. Drop exactly that variable and
+            # keep the rest of the launcher: a scan dir this process inherits
+            # (setup-php sets one) would otherwise break the child at startup for
+            # a reason unrelated to the root, hiding the defect under test.
+            (root / "libexec/launch.sh").write_text(
+                "#!/bin/sh\n"
+                "PHPRC=\"$ROOT/etc/php.ini\"\n"
+                "case ${0##*/} in\n"
+                "    php-fpm) PHP_INI_SCAN_DIR=\"$ROOT/etc/fpm/conf.d\" ;;\n"
+                "    *) PHP_INI_SCAN_DIR=\"$ROOT/etc/cli/conf.d\" ;;\n"
+                "esac\n"
+                "unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT\n"
+                "export PHPRC PHP_INI_SCAN_DIR\n"
+            )
+            env = {key: value for key, value in os.environ.items()
+                   if key not in ("DEVSTACK_PHP_ROOT", "PHPRC", "PHP_INI_SCAN_DIR")}
             with self.assertRaisesRegex(ValueError, "extension_dir"):
-                module.check_spawned_child_environment(root, [])
-
+                with unittest.mock.patch.dict(os.environ, env, clear=True):
+                    module.check_spawned_child_environment(root, [])
     @unittest.skipUnless(Path("/opt/remi/php84/root/usr/sbin/php-fpm").is_file() and os.getuid() != 0, "preinstalled non-root FPM is unavailable")
     def test_real_fpm_serves_request_as_caller(self):
         module = load("verify")
