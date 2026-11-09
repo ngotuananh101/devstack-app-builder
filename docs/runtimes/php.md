@@ -104,7 +104,7 @@ Launchers `exec` the bundled loader:
 exec "$ROOT/lib/musl/ld-musl-x86_64.so.1" --library-path "$ROOT/lib/musl" "$ROOT/libexec/php" "$@"
 ```
 
-Use the executable paths in `manifest.paths`, not `libexec` directly. Launchers resolve the current installed root from their own path, unset inherited `LD_PRELOAD`/`LD_LIBRARY_PATH`/`LD_AUDIT`, set `PHPRC`, force a bundle-local per-SAPI `PHP_INI_SCAN_DIR`, pass base `-c` and resolved `extension_dir`, then preserve user arguments exactly. Explicit `-n`, `-c`, or `-d` arguments still have normal PHP semantics. Do not put global symlinks outside the bundle pointing directly to a launcher; call its actual installed path. Installation folders may contain spaces, and execution does not depend on the current directory. Standard Linux `/bin/sh` and core utilities are assumed.
+Use the executable paths in `manifest.paths`, not `libexec` directly. Launchers resolve the current installed root from their own path, following any symlink chain a PATH shim puts in front of them (so `~/.ponta/bin/php -> <bundle>/bin/php` works), unset inherited `LD_PRELOAD`/`LD_LIBRARY_PATH`/`LD_AUDIT`, set `PHPRC`, force a bundle-local per-SAPI `PHP_INI_SCAN_DIR`, pass base `-c` and resolved `extension_dir`, then preserve user arguments exactly. Explicit `-n`, `-c`, or `-d` arguments still have normal PHP semantics. Installation folders may contain spaces, and execution does not depend on the current directory. Standard Linux `/bin/sh` and core utilities are assumed.
 
 ## CLI and optional modules
 

@@ -2,8 +2,20 @@
 # Generated launcher: one per program in libexec/bin.
 set -eu
 # Resolve from the executable, never from the caller's current directory: the same
-# launcher has to work from any working directory and after the tree is moved.
-ROOT=$(CDPATH='' cd -P -- "$(dirname -- "$0")/.." && pwd)
+# launcher has to work from any working directory and after the tree is moved. A
+# PATH shim outside the bundle names the shim, so follow its link chain first.
+self=$0
+n=0
+while [ -L "$self" ] && [ "$n" -lt 40 ]; do
+    target=$(readlink -- "$self")
+    case $target in
+        /*) self=$target ;;
+        *) self=$(CDPATH='' cd -P -- "$(dirname -- "$self")" && pwd)/$target ;;
+    esac
+    n=$((n+1))
+done
+[ "$n" -lt 40 ] || { printf '%s\n' 'Symlink chain too deep to resolve.' >&2; exit 1; }
+ROOT=$(CDPATH='' cd -P -- "$(dirname -- "$self")/.." && pwd)
 . "$ROOT/libexec/launch.sh"
 # The trailing placeholder expands to the program's own fixed leading arguments,
 # if it needs any; most programs get nothing.

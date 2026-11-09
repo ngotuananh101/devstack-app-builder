@@ -190,7 +190,8 @@ root and every `LoadModule` line says `modules/mod_x.so`.
 ### Launchers and relocation
 
 `bin/` holds generated POSIX `sh` launchers; the real ELFs live in `libexec/bin/` and are
-never executed by the kernel. A launcher resolves its own root, sources
+never executed by the kernel. A launcher follows its own symlink chain — so a PATH shim
+outside the bundle still resolves to the bundle — resolves its own root, sources
 `libexec/launch.sh`, and `exec`s the bundled loader with `--library-path` and `--argv0`:
 
 ```sh

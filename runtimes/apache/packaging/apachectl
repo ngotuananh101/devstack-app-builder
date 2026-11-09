@@ -1,9 +1,21 @@
 #!/bin/sh
 # Apache control script for a bundled httpd: resolves its own root, then hands
 # everything to bin/httpd. The paths upstream's script bakes at configure time
-# are exactly what relocation breaks, so this one derives them at run time.
+# are exactly what relocation breaks, so this one derives them at run time. A
+# PATH shim outside the bundle names the shim, so follow its link chain first.
 set -eu
-ROOT=$(CDPATH='' cd -P -- "$(dirname -- "$0")/.." && pwd)
+self=$0
+n=0
+while [ -L "$self" ] && [ "$n" -lt 40 ]; do
+    target=$(readlink -- "$self")
+    case $target in
+        /*) self=$target ;;
+        *) self=$(CDPATH='' cd -P -- "$(dirname -- "$self")" && pwd)/$target ;;
+    esac
+    n=$((n+1))
+done
+[ "$n" -lt 40 ] || { printf '%s\n' 'Symlink chain too deep to resolve.' >&2; exit 1; }
+ROOT=$(CDPATH='' cd -P -- "$(dirname -- "$self")/.." && pwd)
 . "$ROOT/libexec/launch.sh"
 
 # Raise the soft descriptor limit the way upstream does; ignore hosts that refuse.

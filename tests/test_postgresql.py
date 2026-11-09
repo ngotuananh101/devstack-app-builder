@@ -212,10 +212,15 @@ class PostgreSQLLauncherTests(unittest.TestCase):
 
     def test_launcher_isolates_the_environment_and_resolves_spaces(self):
         text = self.launchers.render("pg_ctl")
-        self.assertIn('ROOT=$(CDPATH=\'\' cd -P -- "$(dirname -- "$0")/.." && pwd)', text)
+        self.assertIn('ROOT=$(CDPATH=\'\' cd -P -- "$(dirname -- "$self")/.." && pwd)', text)
         self.assertIn('. "$ROOT/libexec/launch.sh"', text)
         self.assertIn("#!/bin/sh\nset -eu\n", text)
-        self.assertIn("$(dirname -- \"$0\")/..", text, "ROOT must come from the launcher's own path")
+        self.assertIn("$(dirname -- \"$self\")/..", text, "ROOT must come from the launcher's own path")
+        # The launcher's own path is reached after following any PATH shim, so a
+        # symlink outside the bundle cannot move ROOT out of the bundle.
+        self.assertIn('while [ -L "$self" ]', text)
+        self.assertIn('readlink -- "$self"', text)
+        self.assertNotIn('"$(dirname -- "$0")/.."', text, "an unresolved $0 is not the launcher's location")
         # The environment scrub lives in the sourced file, exactly as PHP's does.
         shared = (SCRIPTS.parent / "packaging/launch.sh").read_text()
         for variable in ("LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT"):

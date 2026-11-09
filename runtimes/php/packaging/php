@@ -1,6 +1,19 @@
 #!/bin/sh
 set -eu
-# Resolve from the executable, never from the caller's current directory.
-ROOT=$(CDPATH='' cd -P -- "$(dirname -- "$0")/.." && pwd)
+# Resolve from the executable, never from the caller's current directory, and
+# follow any symlink the caller reached us through: a PATH shim outside the
+# bundle names the shim, not this file.
+self=$0
+n=0
+while [ -L "$self" ] && [ "$n" -lt 40 ]; do
+    target=$(readlink -- "$self")
+    case $target in
+        /*) self=$target ;;
+        *) self=$(CDPATH='' cd -P -- "$(dirname -- "$self")" && pwd)/$target ;;
+    esac
+    n=$((n+1))
+done
+[ "$n" -lt 40 ] || { printf '%s\n' 'Symlink chain too deep to resolve.' >&2; exit 1; }
+ROOT=$(CDPATH='' cd -P -- "$(dirname -- "$self")/.." && pwd)
 . "$ROOT/libexec/launch.sh"
 exec "$ROOT/libexec/php" -c "$ROOT/etc/php.ini" -d "extension_dir=$ROOT/lib/php/extensions" "$@"
