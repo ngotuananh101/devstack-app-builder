@@ -9,6 +9,46 @@ import unittest
 from test_build import load, REPO
 
 
+def host_php_with_a_shared_module():
+    """Return (php binary, module path) from the host, or (None, None).
+
+    The spawn fixture needs any real PHP CLI that can load a module from a
+    directory, not a musl bundle: it exercises the launcher/INI contract. Ask
+    the binary where it lives and where its extensions live instead of
+    hardcoding a distro path, so the contract runs on Fedora, Debian and the CI
+    runner alike. Setup-php on CI puts a shim on PATH, so resolve through
+    PHP_BINARY rather than assuming the PATH entry is the interpreter.
+    """
+    entry = shutil.which("php")
+    if entry is None:
+        return None, None
+    try:
+        binary = subprocess.run([entry, "-n", "-r", "echo PHP_BINARY;"],
+                                text=True, capture_output=True, check=True, timeout=120).stdout.strip()
+        with open(binary, "rb") as handle:
+            if handle.read(4) != b"\x7fELF":
+                return None, None
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+    # Distros disagree on whether the compile-time default or the packaged INI
+    # names the module directory, and a PATH shim's INI is invisible to a bare
+    # ELF, so try both binaries with and without INI loading.
+    for command in (entry, binary):
+        for extra in ([], ["-n"]):
+            try:
+                probed = subprocess.run([command, *extra, "-r", "echo ini_get('extension_dir');"],
+                                        text=True, capture_output=True, check=True, timeout=120)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            module = Path(probed.stdout.strip()) / "opcache.so"
+            if module.is_file():
+                return binary, module
+    return None, None
+
+
+HOST_PHP, HOST_PHP_MODULE = host_php_with_a_shared_module()
+
+
 class VerifyContracts(unittest.TestCase):
     def test_builtin_modules_are_always_expected_present(self):
         module = load("verify")
@@ -150,6 +190,38 @@ class VerifyContracts(unittest.TestCase):
                 subprocess.run([str(root / "bin/php-ext"), action, "opcache", "all"], check=True)
                 self.assertEqual(module.cli_modules(root, names), {"opcache": enabled})
                 self.assertEqual(module.fpm_probe(root, names, Path(tmp))["modules"], {"opcache": enabled})
+
+    @unittest.skipUnless(HOST_PHP and HOST_PHP_MODULE, "host PHP CLI with a shared module is unavailable")
+    def test_spawned_child_inherits_the_bundle_extension_dir(self):
+        """The INI, not the launcher's argv, must locate extensions for children.
+
+        A framework resolves PHP through `PHP_BINARY` (the real ELF) and inherits
+        only the environment, so a bundle that relies on `-d` alone loses every
+        shared module one process down.
+        """
+        module = load("verify")
+        self.assertIsNotNone(module, "runtime verifier is not implemented")
+        packaging = REPO / "runtimes/php/packaging"
+        with tempfile.TemporaryDirectory(prefix="spawn probe ") as tmp:
+            root = Path(tmp) / "runtime with spaces"
+            for directory in ("bin", "libexec", "etc/cli/conf.d", "etc/fpm/conf.d", "lib/php/extensions"):
+                (root / directory).mkdir(parents=True, exist_ok=True)
+            shutil.copy2(HOST_PHP, root / "libexec/php")
+            shutil.copy2(packaging / "php", root / "bin/php")
+            (root / "bin/php").chmod(0o755)
+            shutil.copy2(packaging / "launch.sh", root / "libexec/launch.sh")
+            source = (REPO / "runtimes/php/config/php.ini").read_text()
+            (root / "etc/php.ini").write_text(source)
+            shutil.copy2(HOST_PHP_MODULE, root / "lib/php/extensions/opcache.so")
+            shared = [{"name": "opcache", "directive": "zend_extension", "path": "lib/php/extensions/opcache.so"}]
+            report = module.check_spawned_child_environment(root, shared)
+            self.assertEqual(report["extension_dir"], str(root / "lib/php/extensions"))
+            self.assertEqual(report["probed_module"], "opcache")
+            # Without the exported root the same INI must fail loudly, not fall
+            # back to the compile-time directory.
+            (root / "libexec/launch.sh").write_text("#!/bin/sh\nexport PHPRC=\"$ROOT/etc/php.ini\"\n")
+            with self.assertRaisesRegex(ValueError, "extension_dir"):
+                module.check_spawned_child_environment(root, [])
 
     @unittest.skipUnless(Path("/opt/remi/php84/root/usr/sbin/php-fpm").is_file() and os.getuid() != 0, "preinstalled non-root FPM is unavailable")
     def test_real_fpm_serves_request_as_caller(self):

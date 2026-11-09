@@ -27,7 +27,7 @@ class LauncherContracts(unittest.TestCase):
         (self.root / "etc/shared-modules.tsv").write_text("redis\textension\tredis.so\nopcache\tzend_extension\topcache.so\n")
         for name in ("redis", "opcache"):
             (self.root / f"lib/php/extensions/{name}.so").touch()
-        recorder = '#!/bin/sh\nprintf "SCAN=%s\\nPHPRC=%s\\n" "$PHP_INI_SCAN_DIR" "$PHPRC"\nfor arg do printf "ARG=%s\\n" "$arg"; done\n'
+        recorder = '#!/bin/sh\nprintf "SCAN=%s\\nPHPRC=%s\\nROOT=%s\\n" "$PHP_INI_SCAN_DIR" "$PHPRC" "$DEVSTACK_PHP_ROOT"\nfor arg do printf "ARG=%s\\n" "$arg"; done\n'
         for name in ("php", "php-fpm"):
             (self.root / "libexec" / name).write_text(recorder)
             (self.root / "libexec" / name).chmod(0o755)
@@ -43,6 +43,32 @@ class LauncherContracts(unittest.TestCase):
         self.assertIn(f"PHPRC={self.root}/etc/php.ini\n", result.stdout)
         self.assertIn(f"ARG=extension_dir={self.root}/lib/php/extensions\n", result.stdout)
         self.assertIn('ARG=echo "a b";\nARG=--\nARG=argument with spaces\n', result.stdout)
+
+    def test_launcher_environment_survives_a_child_that_ignores_argv(self):
+        """`PHP_BINARY`-spawned children get no `-c`/`-d`; they inherit env only.
+
+        Laravel resolves the PHP binary through `PhpExecutableFinder`, which
+        returns `PHP_BINARY` — the real ELF at `libexec/php`, never the launcher.
+        Anything the launcher only passed on its own command line is lost there,
+        so the environment has to carry the root on its own.
+        """
+        result = self.run_bin("php", "-r", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            f"ROOT={self.root}",
+            result.stdout,
+            "launcher must export the bundle root for PHP_BINARY-spawned children",
+        )
+
+    def test_php_ini_resolves_extension_dir_without_launcher_argv(self):
+        """The shipped INI alone must locate extension_dir, given the exported root."""
+        ini = (PACKAGING.parent / "config/php.ini").read_text()
+        self.assertIn(
+            "extension_dir",
+            ini,
+            "etc/php.ini must resolve extension_dir; a child never sees the launcher's -d",
+        )
+        self.assertIn("${DEVSTACK_PHP_ROOT}", ini)
 
     def test_relocated_second_bundle_is_isolated(self):
         self.assertTrue(self.available, "installed launchers have not been implemented")

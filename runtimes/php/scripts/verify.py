@@ -206,6 +206,65 @@ def cli_modules(bundle, names, no_ini=False):
     return json.loads(output.stdout)
 
 
+def check_spawned_child_environment(bundle, shared):
+    """A child started the way a host app starts PHP must find the same modules.
+
+    Consumers resolve the interpreter through PHP_BINARY, which is the real ELF
+    at libexec/php: the child inherits the launcher's environment but none of its
+    argv, so `-c`/`-d` are gone. The probe runs *inside* the launcher's PHP
+    process and spawns PHP_BINARY from there, which is exactly the hop a
+    framework makes, and it catches a bundle whose INI only works while the
+    launcher's own command line is still intact.
+    """
+    expected_dir = str(bundle / "lib/php/extensions")
+    module = shared[0] if shared else None
+    child_args = ["-r", 'echo ini_get("extension_dir");']
+    if module:
+        child_args = ["-d", module["directive"] + "=" + module["path"].rsplit("/", 1)[-1],
+                      "-r", 'echo (int)extension_loaded($argv[1]), "|", ini_get("extension_dir");',
+                      MODULE_RUNTIME_NAMES.get(module["name"], module["name"])]
+    with tempfile.TemporaryDirectory(prefix="ds-spawn-") as tmp:
+        plan = Path(tmp) / "child.json"
+        plan.write_text(json.dumps(child_args))
+        probe = Path(tmp) / "probe.php"
+        probe.write_text(
+            "<?php\n"
+            "if (!function_exists('proc_open')) { echo json_encode(['error' => 'proc_open unavailable']); exit(2); }\n"
+            "$args = json_decode(file_get_contents($argv[1]), true);\n"
+            "$process = proc_open(array_merge([PHP_BINARY], $args),\n"
+            "    [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);\n"
+            "$out = stream_get_contents($pipes[1]);\n"
+            "$err = stream_get_contents($pipes[2]);\n"
+            "fclose($pipes[1]); fclose($pipes[2]); $status = proc_close($process);\n"
+            "echo json_encode(['binary' => PHP_BINARY, 'child' => $out, 'child_err' => $err,\n"
+            "                  'child_status' => $status]);\n"
+        )
+        launcher = subprocess.run([str(bundle / "bin/php"), str(probe), str(plan)],
+                                  text=True, capture_output=True)
+    if launcher.returncode != 0 or launcher.stderr:
+        raise ValueError(f"Launcher could not spawn a PHP_BINARY child: {launcher.stderr.strip() or launcher.stdout.strip()}")
+    try:
+        reported = json.loads(launcher.stdout)
+    except ValueError as error:
+        raise ValueError(f"Child probe produced no report: {launcher.stdout.strip()}") from error
+    if "error" in reported:
+        raise ValueError(f"Child probe could not run: {reported['error']}")
+    loaded, _, child_dir = reported["child"].partition("|") if module else ("", "", reported["child"])
+    if child_dir != expected_dir:
+        raise ValueError(f"PHP_BINARY child resolved extension_dir {child_dir!r}, not {expected_dir!r}")
+    # A warning about a module the child loaded twice is not an environment
+    # failure: the extension is resolved, which is what this check asserts.
+    complaints = [line for line in reported["child_err"].splitlines()
+                  if line.strip() and "already loaded" not in line]
+    if reported["child_status"] != 0 or complaints:
+        raise ValueError(f"PHP_BINARY child could not start cleanly: "
+                         f"{('\n'.join(complaints) or reported['child']).strip()}")
+    if module and loaded != "1":
+        raise ValueError(f"PHP_BINARY child could not load {module['name']} from that directory")
+    return {"binary": reported["binary"], "extension_dir": child_dir,
+            "probed_module": module["name"] if module else None}
+
+
 def check_loader_integrity(bundle, record):
     """The shipped loader must be the recorded bytes and must satisfy PHP at run time."""
     import hashlib
@@ -281,12 +340,14 @@ def verify(bundle):
             raise ValueError("FPM disable failed")
     manifest["elf_inventory"] = inventory
     manifest["loader_check"] = check_loader_integrity(bundle, loader)
+    manifest["spawned_child_check"] = check_spawned_child_environment(bundle, shared)
     manifest["verification"] = "PASSED"
     manifest["verification_checks"] = ["musl_interpreter", "musl_dependency_closure", "no_glibc_abi_tokens",
                                        "bundled_loader_execution", "cli_baseline", "cli_toggle", "fpm_config",
                                        "fpm_request_toggle", "non_root_fpm", "relocation_spaces",
                                        "installation_isolation", "no_host_shared_objects",
-                                       "loader_digest", "loader_version", "hostile_ld_env"]
+                                       "loader_digest", "loader_version", "hostile_ld_env",
+                                       "php_binary_child_extension_dir"]
     (bundle / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return manifest
 
